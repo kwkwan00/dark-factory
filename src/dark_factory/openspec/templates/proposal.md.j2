@@ -1,0 +1,22 @@
+## Why
+{{ description }}
+
+## What Changes
+{% for spec in specs %}
+- {{ spec.title }}: {{ spec.description | truncate(120) }}
+{% endfor %}
+
+## Capabilities
+
+### New Capabilities
+{% for spec in specs %}
+- {{ spec.capability or spec.title | lower | replace(' ', '-') }}
+{% endfor %}
+
+### Modified Capabilities
+<!-- List existing capabilities with changed requirements -->
+
+## Impact
+{% for spec in specs %}
+- {{ spec.title }}: {{ spec.acceptance_criteria | length }} acceptance criteria, {{ spec.scenarios | length }} scenarios
+{% endfor %}

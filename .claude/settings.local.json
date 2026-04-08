@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /Users/kquon/ai-dark-factory/.*)",
+      "Bash(ls -la /Users/kquon/ai-dark-factory/*)",
+      "Bash(pip3 --version)",
+      "Bash(uv --version)",
+      "Bash(git init:*)",
+      "Bash(uv sync:*)",
+      "Bash(uv run:*)",
+      "Bash(uv remove:*)",
+      "Bash(uv add:*)",
+      "WebFetch(domain:reference.langchain.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "mcp__claude_ai_Context7__resolve-library-id",
+      "WebFetch(domain:deepeval.com)"
+    ]
+  }
+}

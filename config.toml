@@ -1,0 +1,33 @@
+[neo4j]
+uri = "bolt://localhost:7687"
+database = "neo4j"
+
+[llm]
+provider = "anthropic"         # "anthropic" | "langchain" | "claude-agent" (via Claude Agent SDK)
+model = "claude-sonnet-4-6"
+
+[pipeline]
+output_dir = "./output"
+max_parallel_features = 4
+
+[openspec]
+root_dir = "./openspec"
+
+[memory]
+database = "memory"
+enabled = true
+
+[qdrant]
+url = "http://localhost:6333"
+collection_prefix = "dark_factory"
+embedding_model = "text-embedding-3-large"
+enabled = true
+
+[evaluation]
+base_threshold = 0.5
+adaptive = true
+decay_factor = 0.95
+
+[logging]
+level = "INFO"
+format = "console"

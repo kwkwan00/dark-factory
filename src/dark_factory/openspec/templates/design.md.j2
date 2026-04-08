@@ -1,0 +1,22 @@
+## Context
+This change introduces {{ specs | length }} specification(s) derived from project requirements.
+
+## Goals / Non-Goals
+
+### Goals
+{% for spec in specs %}
+- {{ spec.title }}: {{ spec.description | truncate(100) }}
+{% endfor %}
+
+### Non-Goals
+<!-- What is explicitly out of scope -->
+
+## Decisions
+{% for spec in specs %}
+{% if spec.dependencies %}
+- {{ spec.title }} depends on: {{ spec.dependencies | join(', ') }}
+{% endif %}
+{% endfor %}
+
+## Risks / Trade-offs
+<!-- Known risks and trade-offs -->

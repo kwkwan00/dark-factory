@@ -1,0 +1,44 @@
+[project]
+name = "ai-dark-factory"
+version = "0.1.0"
+description = "Code generator that converts requirements into specs, populates a Neo4j knowledge graph, and generates application code with evaluation tests."
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.1",
+    "pydantic>=2.0",
+    "neo4j>=5.0",
+    "anthropic>=0.50",
+    "structlog>=24.0",
+    "jinja2>=3.1",
+    "claude-agent-sdk>=0.1.0",
+    "langchain>=0.3",
+    "langchain-anthropic>=0.3",
+    "langgraph>=0.3",
+    "langgraph-swarm>=0.1",
+    "deepeval>=2.0",
+    "qdrant-client>=1.9",
+    "openai>=1.0",
+]
+
+[project.scripts]
+dark-factory = "dark_factory.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dark_factory"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+src = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.15.9",
+]
