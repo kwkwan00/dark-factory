@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import structlog
 from neo4j import GraphDatabase
 
 from dark_factory.config import Neo4jConfig
+
+log = structlog.get_logger()
 
 
 class Neo4jClient:
@@ -12,10 +15,13 @@ class Neo4jClient:
 
     def __init__(self, config: Neo4jConfig) -> None:
         self.config = config
+        # L14: password is SecretStr — extract before passing to the driver
+        password = config.password.get_secret_value() if hasattr(config.password, "get_secret_value") else config.password
         self._driver = GraphDatabase.driver(
             config.uri,
-            auth=(config.user, config.password),
+            auth=(config.user, password),
         )
+        log.info("neo4j_client_created", uri=config.uri, database=config.database)
 
     def verify(self) -> None:
         """Verify connectivity to Neo4j."""

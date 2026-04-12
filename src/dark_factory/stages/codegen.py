@@ -66,8 +66,11 @@ class CodegenStage(Stage):
             )
             artifacts.append(artifact)
 
-            # Write generated code to disk
-            out_path = self.output_dir / artifact.file_path
+            # Write generated code to disk (C5 fix: validate path stays in output dir)
+            out_path = (self.output_dir / artifact.file_path).resolve()
+            if not out_path.is_relative_to(self.output_dir.resolve()):
+                log.warning("codegen_path_traversal_blocked", path=artifact.file_path)
+                continue
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(artifact.content)
             log.info("wrote_code", path=str(out_path))

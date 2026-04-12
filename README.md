@@ -1,53 +1,137 @@
 # AI Dark Factory
 
-An autonomous code generator that converts requirements into specs, populates a knowledge graph, and generates application code with evaluation tests using a per-feature swarm of AI agents. Features cross-session procedural memory, adaptive eval thresholds, real-time strategy adjustment, semantic vector search, and parallel feature execution.
+**Author:** Kevin Quon &lt;[kquon@nvisia.com](mailto:kquon@nvisia.com)&gt;
+
+An autonomous code generation platform that converts requirements into specs, populates a knowledge graph, and generates production-quality application code through a multi-agent swarm pipeline with cross-feature reconciliation, procedural memory, and real-time observability.
+
+Built as a **FastAPI backend + React SPA** with the [AG-UI protocol](https://docs.ag-ui.com) for real-time agent event streaming.
+
+---
 
 ## Architecture
 
 ```
-Requirements  -->  Specs  -->  Knowledge Graph  -->  Code  -->  Tests
-     |               |              |                  |           |
-   ingest        spec + eval      graph           swarm agents   eval
-                                                 (per feature,
-                                                  parallel)
+┌──────────────────────────────────────────────────────────────────────┐
+│                          React SPA (Vite)                            │
+│  Manufacture · Agent Logs · Metrics · Gap Finder · Memory · Settings │
+└──────────────────────┬───────────────────────────────────────────────┘
+                       │  AG-UI SSE events  +  REST
+┌──────────────────────▼───────────────────────────────────────────────┐
+│                  FastAPI (dark_factory.api.app)                      │
+│  /api/agent/run  /api/agent/events  /api/agent/cancel                │
+│  /api/history  /api/metrics/*  /api/graph/gaps  /api/settings        │
+└──────────────────────┬───────────────────────────────────────────────┘
+                       │
+     ┌─────────────────┼─────────────────────────────────────────┐
+     │                 │                                          │
+     ▼                 ▼                                          ▼
+┌────────────────┐    ┌────────────────────────────┐    ┌──────────────┐
+│ Phase 1        │    │ Phase 2: Spec (decompose + │    │  Phase 5:    │
+│ Ingest + doc-  │──▶ │  refine swarm + evaluate)  │─┐  │ Reconcile    │
+│ extract +      │    └────────────────────────────┘ │  │ (Claude SDK) │
+│ semantic dedup │                                    ▼  └──────┬───────┘
+└────────────────┘                              ┌───────────┐   │
+                                                 │  Phase 3  │   │
+                                                 │   Graph   │   │
+                                                 └─────┬─────┘   │
+                                                       ▼         ▼
+                            ┌─────────────────────────────────────────┐
+                            │  Phase 4: Per-feature LangGraph swarms  │
+                            │  Planner ↔ Coder ↔ Reviewer ↔ Tester    │
+                            │  (parallel within dependency layers)    │
+                            └─────────────────────────────────────────┘
+                                                  │
+                                                  ▼
+                            ┌─────────────────────────────────────────┐
+                            │  Phase 6: E2E Validation (Playwright)   │
+                            │  chromium · firefox · webkit smoke      │
+                            │  tests against the reconciled output    │
+                            └─────────────────────────────────────────┘
 
-Neo4j (structured)              Qdrant (semantic)
-├── Spec/Requirement nodes      ├── Memory embeddings
-├── DEPENDS_ON/IMPLEMENTS       ├── Spec embeddings
-├── Procedural memory           ├── Code artifact embeddings
-├── EvalResult/Run history      └── Hybrid RRF search
-└── Feature groups + topo sort
+  Neo4j (graph + memory)   Qdrant (vectors)   Postgres (metrics)
+  Prometheus + Grafana     Claude Agent SDK   DeepEval (GPT judge)
 ```
+
+---
 
 ## Prerequisites
 
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/)
-- Neo4j (local or remote)
-- Qdrant (local or cloud, optional -- graceful fallback to Neo4j)
-- Anthropic API key (code generation)
-- OpenAI API key (evaluation + embeddings)
+- **Python 3.12+** with [uv](https://docs.astral.sh/uv/)
+- **Node.js 20+** with npm (for the frontend)
+- **Docker + Docker Compose** (recommended) or local Neo4j + Qdrant
+- **Anthropic API key** — code generation, reconciliation agent, Phase 6 E2E agent
+- **OpenAI API key** — evaluation judge + embeddings (also powers semantic requirement dedup)
 
-## Setup
+---
+
+## Quick Start (Docker Compose)
+
+The fastest way to get a full stack running:
 
 ```bash
-# Install dependencies
-uv sync
-
-# Copy and fill in environment variables
+# 1. Configure environment
 cp .env.example .env
-# Edit .env with your credentials
+# Fill in ANTHROPIC_API_KEY, OPENAI_API_KEY, NEO4J_PASSWORD, ...
 
-# Source the env (or use direnv / dotenv)
-export $(cat .env | xargs)
+# 2. Bring up the stack
+docker compose up -d
 
-# Initialize the Neo4j schema
-dark-factory graph init
+# 3. Open the app
+open http://localhost:8000
 ```
+
+The first `docker compose up` (or `make build && make up`) takes
+roughly 5–10 minutes because the Dockerfile installs Python 3.12
+(Debian bookworm), Node 20, uv, and `@playwright/test` with all three
+browser engines (chromium, firefox, webkit) for the Phase 6 E2E
+validation stage. Subsequent builds are fast — Docker caches the
+Playwright layer until the pinned version changes.
+
+This starts seven services:
+
+| Service       | Port          | Purpose                                        |
+|---------------|---------------|------------------------------------------------|
+| `dark-factory`| 8000          | FastAPI + React SPA (single container)         |
+| `neo4j`       | 7474, 7687    | Knowledge graph + procedural memory            |
+| `qdrant`      | 6333          | Vector database for semantic search            |
+| `postgres`    | 5432          | Forensic metrics store (optional)              |
+| `adminer`     | 8080          | Web UI for browsing / troubleshooting Postgres |
+| `prometheus`  | 9090          | In-process metrics scrape                      |
+| `grafana`     | 3000          | Dashboards (default `admin` / `admin`)         |
+
+Check `GET http://localhost:8000/api/health` to verify all dependencies are healthy.
+
+To troubleshoot the Postgres metrics store, open [http://localhost:8080](http://localhost:8080) and log in with system `PostgreSQL`, server `postgres` (pre-filled), and the `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` values from your `.env`.
+
+---
+
+## Local Development
+
+Run the backend and frontend as separate processes for hot-reload:
+
+```bash
+# Backend
+uv sync
+uv run uvicorn dark_factory.api.app:app --host 0.0.0.0 --port 8000 --reload
+
+# Frontend (separate terminal)
+cd frontend
+npm install
+npm run dev          # Vite dev server on :5173, proxies /api to :8000
+```
+
+For a production frontend build served from FastAPI:
+
+```bash
+cd frontend && npm run build
+# Build output is copied into src/dark_factory/api/static/ and served at /
+```
+
+---
 
 ## Configuration
 
-Edit `config.toml`:
+Settings are loaded from `config.toml` with environment variable overrides. Most fields are also mutable at runtime via `PATCH /api/settings` (Settings tab in the UI).
 
 ```toml
 [neo4j]
@@ -60,10 +144,26 @@ model = "claude-sonnet-4-6"
 
 [pipeline]
 output_dir = "./output"
-max_parallel_features = 4     # concurrent features per dependency layer
+max_parallel_specs = 4             # spec generation workers
+max_parallel_features = 4          # codegen swarm workers per layer
+max_spec_handoffs = 5              # generate → evaluate → refine iterations
+max_codegen_handoffs = 50          # planner↔coder↔reviewer↔tester transitions
+max_specs_per_requirement = 16     # hard cap on planner output
+enable_spec_decomposition = true
+reuse_existing_specs = true
+spec_eval_threshold = 0.75
+max_reconciliation_turns = 50      # Phase 5 SDK max_turns
+reconciliation_timeout_seconds = 1800
+requirement_dedup_threshold = 0.90 # cosine similarity for semantic dedup
+enable_e2e_validation = true       # Phase 6 Playwright cross-browser tests
+max_e2e_turns = 40
+e2e_timeout_seconds = 1200
+e2e_browsers = ["chromium", "firefox", "webkit"]
 
-[openspec]
-root_dir = "./openspec"
+[evaluation]
+eval_model = "gpt-5.4"
+base_threshold = 0.5
+adaptive = true
 
 [qdrant]
 url = "http://localhost:6333"
@@ -75,192 +175,337 @@ enabled = true
 database = "memory"
 enabled = true
 
-[evaluation]
-base_threshold = 0.5
-adaptive = true               # thresholds adjust based on score trends
-decay_factor = 0.95           # memory relevance decays each run
+[postgres]
+enabled = false                    # turn on for forensic metrics store
+url = "postgresql://..."
+
+[watch]
+enabled = false
+paths = ["./openspec/specs"]
+debounce_seconds = 5
+auto_run = false
 
 [logging]
 level = "INFO"
 format = "console"
 ```
 
-## Usage
+All pipeline fields can be tuned live from the Settings tab without a restart.
 
-### Run the pipeline
+---
 
-```bash
-dark-factory run requirements/
-dark-factory run openspec/
-```
+## Pipeline Phases
 
-### OpenSpec workflow
+The pipeline runs in six phases, streamed to the frontend as AG-UI events.
 
-```bash
-dark-factory openspec init
-dark-factory openspec propose "Add user authentication"
-dark-factory openspec apply --change <change-name>
-dark-factory openspec archive <change-name>
-```
+### Phase 1 — Ingest
 
-### Graph and memory management
+`IngestStage` parses a requirements directory/file into `Requirement` models. Two tiers of input are supported:
 
-```bash
-dark-factory graph init    # Create schema constraints and indexes
-dark-factory graph clear   # Delete all graph data
-dark-factory memory clear  # Wipe all procedural memory
-```
+1. **Native formats** (`.md`, `.txt`, `.json`, `.yaml`, `.yml`, OpenSpec `specs/` tree) — parsed directly. Large text documents go through an LLM splitter that extracts each discrete testable requirement as its own entry. OpenSpec directories are auto-detected and WHEN/THEN scenarios extracted.
+2. **Rich business documents** (`.docx`, `.xlsx`, `.pptx`, `.pdf`, `.rtf`, `.html`, `.htm`, `.xml`, `.csv`, `.vtt`, `.srt`, `.log`) — each file is routed through a **clean-context Claude Agent SDK invocation** that reads the document via the appropriate Python library (`python-docx`, `openpyxl`, `pypdf`, `beautifulsoup4`, `striprtf`, `lxml`), extracts discrete testable requirements, and writes a staging JSON file that's loaded back into `Requirement` models. Each document gets its own fresh agent context so raw meeting-transcript noise never pollutes the main pipeline. See `src/dark_factory/stages/doc_extraction.py`.
 
-## How It Works
+After all files are parsed, the stage runs a **semantic deduplication pass** (`src/dark_factory/stages/dedup.py`). A real corpus assembled from multiple uploaded documents (meeting notes + Word brief + spreadsheet) routinely contains the same underlying requirement expressed multiple ways. The dedup pass embeds each requirement with `text-embedding-3-large`, clusters near-duplicates at cosine similarity ≥ `requirement_dedup_threshold` (default 0.90), and collapses each cluster into a single canonical entry — preferring the highest-priority + most-detailed member and unioning tags across all merged requirements so no source-document attribution is lost. Dedup failures (transient OpenAI outages) fall back to the un-deduped list rather than blocking the pipeline.
 
-When you run `dark-factory run <path>`, the pipeline goes through two phases:
+### Phase 2 — Spec Generation
 
-### Phase 1: Planning (requirements to swarm-ready features)
+`SpecStage` converts each requirement into one or more `Spec` objects:
 
-1. **Ingest** -- Parses raw input into `Requirement` models. Supports `.json` (structured), `.md`/`.txt` (one requirement per file), and OpenSpec `specs/` directories (auto-detected, extracts WHEN/THEN scenarios).
+1. **Preflight skip** — if `reuse_existing_specs=true`, specs whose target id already exists in Neo4j are passed through unchanged (free re-runs).
+2. **Decomposition** — an LLM planner optionally splits each requirement into multiple granular sub-specs.
+3. **Refinement swarm** — each sub-spec runs through a generate → evaluate → refine loop (capped by `max_spec_handoffs`).
+4. **Evaluation** — DeepEval GEval metrics (GPT judge) score every spec on Correctness, Coherence, Instruction Following, and Safety.
+5. **Auto-index** — all passing specs are upserted into Qdrant for semantic retrieval by downstream agents.
 
-2. **Spec** -- An LLM converts each Requirement into a `Spec` with capability, scenarios, acceptance criteria, and dependencies. Each spec is evaluated by deepeval (GPT-5.4 as judge) for correctness, coherence, instruction following, and safety/ethics. Specs are auto-indexed in Qdrant for semantic retrieval.
+### Phase 3 — Knowledge Graph
 
-3. **Graph** -- Persists specs and requirements to Neo4j with `IMPLEMENTS` and `DEPENDS_ON` relationships.
+`GraphStage` persists specs + requirements to Neo4j with `IMPLEMENTS` and `DEPENDS_ON` relationships. The orchestrator later uses this graph to group specs into features and compute a cycle-tolerant topological execution order (via Tarjan's SCC).
 
-### Phase 2: Execution (per-feature swarm orchestration)
+### Phase 4 — Per-feature Swarms
 
-4. **Orchestrator** -- Queries the knowledge graph, groups specs by `capability`, computes topological execution order. Decays all memory relevance scores (0.95x) and creates a Run tracking node.
+`run_orchestrator()` groups specs by `capability`, layers them by dependency order, then dispatches features in **parallel within each layer** (bounded by `max_parallel_features`). Each feature runs an isolated LangGraph swarm with four agents rotating via `create_swarm` handoffs:
 
-5. **Feature swarms** -- Each feature gets its own isolated swarm with a fresh 50-handoff budget. Features in the same dependency layer run **in parallel** (configurable via `max_parallel_features`). Four agents rotate:
-   - **Planner** evaluates the spec, queries eval history for past performance, recalls strategies from memory, picks the next spec
-   - **Coder** searches for similar specs/code via Qdrant RAG, recalls patterns and past mistakes, generates code (directly or via Claude Agent SDK)
-   - **Reviewer** evaluates code with deepeval, compares against past eval scores, records mistakes and solutions
-   - **Tester** writes tests, evaluates them for correctness/coherence/completeness, records failures
+- **Planner** — evaluates the spec, queries eval history, recalls strategies, picks the next action
+- **Coder** — searches for similar specs/code via Qdrant RAG, recalls patterns and past mistakes, generates code directly or delegates to the Claude Agent SDK
+- **Reviewer** — runs DeepEval on the generated code, compares against historical scores, records mistakes/solutions
+- **Tester** — writes tests, evaluates them, records failures, hands back to Planner
 
-6. **Cross-feature learning** -- After each feature completes, its patterns/mistakes/solutions are briefed to subsequent features in the same run. Agents don't wait for the next run to benefit from new learnings.
+Cross-feature learning: after each feature completes, its patterns/mistakes/solutions are briefed to subsequent features in the same run. If the layer pass rate drops below threshold, the orchestrator forces subsequent coders onto the SDK path and tightens the handoff budget — when performance recovers, overrides relax.
 
-7. **Strategy adjustment** -- After each dependency layer, the orchestrator reviews the pass rate. If performance drops below threshold, it forces the Coder to use `claude_agent_codegen` for all remaining specs and reduces the handoff budget. When performance recovers, overrides relax.
+### Phase 5 — Reconciliation
 
-8. **Aggregate** -- Merges all artifacts and tests, computes pass rate, mean eval scores, identifies worst-performing features. Completes the Run node with final stats.
+`ReconciliationStage` runs a **single extended Claude Agent SDK invocation** over the full run output directory with file I/O tools (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`). It follows a six-step checklist:
 
-## AI Evaluation (deepeval + GPT-5.4)
+1. **Inventory** the generated tree
+2. **Review** for cross-feature issues (broken imports, inconsistent APIs, missing glue, security)
+3. **Fix** with minimal targeted edits
+4. **Validate** via language-appropriate commands (`py_compile`, `tsc --noEmit`, `pytest`, `npm test`, ...)
+5. **Iterate** on validation failures (bounded by `max_reconciliation_turns` and `reconciliation_timeout_seconds`)
+6. **Report** to `RECONCILIATION_REPORT.md` at the output root
 
-All generated artifacts are evaluated using deepeval GEval metrics with OpenAI GPT-5.4 as the LLM judge:
+This phase is **best-effort**: failures, timeouts, or crashes never fail the pipeline — the feature output is still delivered as-is. The report is surfaced in the Run Detail popup's Output screen.
 
-### Spec evaluation
+### Phase 6 — End-to-End Validation
 
-| Metric | What it checks |
-|--------|---------------|
-| **Spec Correctness** | Accurately captures the requirement's intent |
-| **Spec Coherence** | Well-structured, unambiguous, internally consistent |
-| **Spec Instruction Following** | Follows OpenSpec format with all required fields |
-| **Spec Safety & Ethics** | No unsafe/unethical functionality, includes security considerations |
+`E2EValidationStage` runs a second clean-context Claude Agent SDK invocation after reconciliation returns anything other than `error`. Its job is to verify the generated application actually runs in a real browser across a matrix of engines. The agent follows another six-step checklist:
 
-### Test evaluation
+1. **Detect** whether the output is a web app (package manifests, Dockerfile ports, HTML entry points, framework markers). If not, write `Overall status: skipped` and stop.
+2. **Install** `@playwright/test`. Browser binaries for `chromium`, `firefox`, and `webkit` are **pre-installed in the Docker image** at `/ms-playwright`, so no browser download is needed at runtime.
+3. **Plan** 3–8 user-facing acceptance criteria from the specs that are reachable through the UI.
+4. **Write** `e2e/smoke.spec.ts` and a `playwright.config.ts` that enables every browser in `settings.pipeline.e2e_browsers` (default all three).
+5. **Run** the server in the background with a shell trap for clean teardown, poll the health endpoint for readiness, then `npx playwright test --reporter=line,html` across the matrix.
+6. **Report** to `E2E_REPORT.md` at the output root with a per-test / per-browser result table, failure reasons, and an `Overall status` of `pass`, `partial`, or `broken`. The Playwright HTML report lands at `e2e_artifacts/html-report/` and any failure screenshots under `e2e_artifacts/`.
 
-| Metric | What it checks |
-|--------|---------------|
-| **Test Correctness** | Tests validate the right conditions against acceptance criteria |
-| **Test Coherence** | Well-structured, readable, follows testing conventions |
-| **Test Completeness** | Covers all acceptance criteria from the spec |
+Per-browser test counts are fanned out to `dark_factory_e2e_tests_total{browser, status}` so Grafana dashboards can answer "is WebKit the flaky one?". Phase 6 inherits the same best-effort policy as reconciliation — agent crashes, timeouts, server startup failures, and flaky tests are all logged, recorded as incidents, and then swallowed. A broken E2E pass never fails the run.
 
-Eval results are auto-persisted to the memory graph. Recalled memories are boosted when evals pass and demoted when they fail. Thresholds adapt based on score trends across runs.
+---
 
-## Procedural Memory (Neo4j)
+## Frontend Tabs
 
-Agents learn from past runs via a separate Neo4j database. Memory is auto-initialized on startup and persists across sessions.
+| Tab              | What it shows                                                      |
+|------------------|--------------------------------------------------------------------|
+| **Manufacture**  | Run launcher (path input or drag-and-drop), cancel button, run history sidebar, per-run detail popup (Metrics / Output / Evaluations) |
+| **Agent Logs**   | Real-time ring buffer of ~2000 AG-UI progress events, color-coded by layer / feature / agent / decision / handoff / tool call |
+| **Metrics**      | 15 dashboards: summary KPIs, eval trends, LLM cost breakdown, per-run stats, quality, throughput, incidents, tool calls, memory activity, decomposition, artifacts, background loop sampler |
+| **Gap Finder**   | Neo4j-powered gap detection — unplanned requirements, stale specs, specs without artifacts, failing evaluations, with priority badges |
+| **Agent Memory** | Browse procedural memory (Pattern / Mistake / Solution / Strategy) with search + filters |
+| **Settings**     | Live-mutable pipeline config — parallelism, handoff limits, reconciliation, spec decomposition, model selection + API key overrides, service health, file watcher control, danger-zone clear-all |
 
-| Memory type | Written by | Used by | Semantic search |
-|-------------|-----------|---------|-----------------|
-| **Pattern** | Coder | Coder | Qdrant embeddings |
-| **Mistake** | Reviewer, Tester | All agents | Qdrant embeddings |
-| **Solution** | Reviewer, Tester | All agents | Qdrant embeddings |
-| **Strategy** | Planner | Planner | Qdrant embeddings |
+---
 
-**Feedback loop**: eval pass → boost recalled memories; eval fail → demote recalled memories. Memory decays 5% each run. Cross-feature learnings are briefed to subsequent features within the same run.
+## REST API
 
-**Run history**: each pipeline run is tracked with pass rate, mean eval scores, worst features, and duration.
+### Agent pipeline
 
-## Vector Search (Qdrant)
+| Method | Path                  | Purpose                                           |
+|--------|-----------------------|---------------------------------------------------|
+| POST   | `/api/agent/run`      | Start a pipeline run (requirements path + optional key overrides) |
+| POST   | `/api/agent/cancel`   | Cooperative cancel — sets the kill-switch event   |
+| GET    | `/api/agent/events`   | SSE stream of AG-UI events for an active run     |
 
-Qdrant provides semantic search where Neo4j keyword matching falls short. Three collections:
+### Dashboard
 
-| Collection | Contents | Used by |
-|-----------|---------|---------|
-| `dark_factory_memories` | Pattern/Mistake/Solution/Strategy embeddings | `recall_memories` (hybrid RRF merge with Neo4j) |
-| `dark_factory_specs` | Spec description embeddings | `search_similar_specs` (RAG for Coder) |
-| `dark_factory_code` | Code artifact embeddings | `search_similar_code` (RAG for Coder) |
+| Method | Path                     | Purpose                                           |
+|--------|--------------------------|---------------------------------------------------|
+| GET    | `/api/health`            | Service liveness (Neo4j + Qdrant + Postgres)     |
+| GET    | `/api/history`           | Paginated run history                             |
+| GET    | `/api/memory/list`       | Browse procedural memories                        |
+| GET    | `/api/memory/search`     | Hybrid RRF search over Neo4j + Qdrant             |
+| GET    | `/api/eval`              | All spec evaluations                              |
+| GET    | `/api/eval/{spec_id}`    | Eval history for a single spec                    |
+| GET    | `/api/graph/gaps`        | Gap finder output                                 |
+| GET    | `/api/settings`          | Current pipeline settings                         |
+| PATCH  | `/api/settings`          | Update pipeline settings at runtime               |
+| POST   | `/api/watch/start|stop`  | File watcher controls                             |
+| GET    | `/api/watch/events`      | SSE stream of file system events                  |
+| POST   | `/api/upload`            | Drag-and-drop file upload — native + rich formats, 25 MB/file, 150 MB/upload, 24h TTL |
 
-Embeddings generated via OpenAI `text-embedding-3-large` (3072 dims). All Qdrant operations gracefully degrade to Neo4j if unavailable.
+### Metrics
 
-## Swarm Architecture
+15 endpoints under `/api/metrics/` covering summary KPIs, eval trends, LLM usage + cost, swarm features, quality, throughput, incidents, agent stats, tool calls, memory activity, decomposition, artifacts, and the background loop sampler.
 
-```
-Orchestrator
-  |-- plan: query graph -> group by capability -> topo-sort by deps
-  |-- execute_layer (parallel within layer):
-  |     |-- [cross-feature briefing from prior features]
-  |     |-- Planner: evaluate spec, query eval history, recall strategies
-  |     |-- Coder: RAG similar specs/code, recall patterns, generate code
-  |     |-- Reviewer: evaluate code, query eval history, approve/reject
-  |     |-- Tester: write tests, evaluate tests, hand back to Planner
-  |     `-- (up to 50 handoffs per feature)
-  |-- adjust_strategy: review layer pass rate, adjust Coder strategy if needed
-  `-- aggregate: merge artifacts + tests, compute scores, complete Run
-```
+### Runs
+
+| Method | Path                          | Purpose                                    |
+|--------|-------------------------------|--------------------------------------------|
+| GET    | `/api/runs/{run_id}/files`    | File tree of the run's output directory   |
+| GET    | `/api/runs/{run_id}/file`     | Fetch a single file by path query          |
+
+### Admin
+
+| Method | Path                   | Purpose                                            |
+|--------|------------------------|----------------------------------------------------|
+| POST   | `/api/admin/clear-all` | Wipe Neo4j + Qdrant + Postgres + output dir (requires `?confirm=yes` and no active run) |
+
+---
+
+## Environment Variables
+
+Required:
+
+- `ANTHROPIC_API_KEY` — code generation + Phase 5 reconciliation
+- `OPENAI_API_KEY` — DeepEval judge + embeddings
+- `NEO4J_PASSWORD` — graph + memory auth
+
+Optional:
+
+- `QDRANT_URL`, `QDRANT_API_KEY` — vector database (fallback to Neo4j if unreachable)
+- `POSTGRES_ENABLED`, `POSTGRES_URL`, `POSTGRES_PASSWORD` — forensic metrics store
+- `PROMETHEUS_ENABLED` — in-process metrics (default on)
+- `GRAFANA_USER`, `GRAFANA_PASSWORD` — dashboard auth (change from admin/admin in production)
+- `DEEP_AGENT_TIMEOUT_SECONDS` — default ceiling for Claude Agent SDK calls (default 600s)
+- `MAX_PARALLEL_FEATURES`, `MAX_PARALLEL_SPECS`, `MAX_SPEC_HANDOFFS`, `MAX_CODEGEN_HANDOFFS`, `SPEC_EVAL_THRESHOLD`, `ENABLE_SPEC_DECOMPOSITION`, `MAX_SPECS_PER_REQUIREMENT`, `MAX_RECONCILIATION_TURNS`, `RECONCILIATION_TIMEOUT_SECONDS`, `REQUIREMENT_DEDUP_THRESHOLD`, `ENABLE_E2E_VALIDATION`, `MAX_E2E_TURNS`, `E2E_TIMEOUT_SECONDS`, `E2E_BROWSERS`, `ENABLE_EPISODIC_MEMORY`, `MEMORY_DEDUP_THRESHOLD` — pipeline tuning overrides
+
+See `.env.example` for the full list.
+
+---
+
+## Key Features
+
+### Rich-document ingestion
+
+Drop any mix of **Markdown, JSON, YAML, OpenSpec, Word, Excel, PowerPoint, PDF, HTML, XML, RTF, CSV, or transcript files** (`.vtt` / `.srt` / `.log`) into the upload dropzone. Native formats parse directly; business documents are routed through a **clean-context Claude Agent SDK invocation** per file that reads the document via the appropriate Python library (`python-docx`, `openpyxl`, `pypdf`, `beautifulsoup4`, `striprtf`, `lxml`) and extracts discrete testable requirements. Each document gets its own fresh agent context so raw meeting-transcript noise never pollutes the main swarm. Per-file size limit is 25 MB; per-upload total is 150 MB; uploads auto-expire after 24h.
+
+### Semantic requirement dedup
+
+After all input files are parsed, `IngestStage` runs a **semantic deduplication pass** before the Spec stage sees anything. Each requirement is embedded with `text-embedding-3-large`; near-duplicates (cosine similarity ≥ `requirement_dedup_threshold`, default 0.90) are clustered and collapsed into a single canonical entry. Canonical selection prefers the highest-priority member, breaking ties by description length then original position. Tags from every merged requirement are unioned onto the canonical so source-document attribution isn't lost. Merges are surfaced in the Agent Logs tab (`• kept X (merged: Y, Z)`) and recorded as a `requirements_deduped` progress event. Embedding-service outages fall back to the un-deduped list — dedup is a correctness guarantee but never a hard blocker.
+
+### Cross-browser E2E validation (Phase 6)
+
+After reconciliation finishes cleanly, `E2EValidationStage` spawns a dedicated Claude Agent SDK session that runs **Playwright smoke tests across `chromium`, `firefox`, and `webkit`** by default. The agent detects whether the run produced a web app, generates minimal tests from the specs' acceptance criteria, starts the server in the background, runs the suite across the full browser matrix, and writes `E2E_REPORT.md` plus a browsable Playwright HTML report + failure screenshots under `e2e_artifacts/`. Browser binaries are **bundled in the Docker image** (via `npx playwright install --with-deps chromium firefox webkit`) so no runtime download is needed. Per-browser test counts feed the `dark_factory_e2e_tests_total{browser, status}` Prometheus counter for precise flake attribution. Like reconciliation, E2E is best-effort — crashes are recorded as incidents and swallowed.
+
+### Procedural memory (Neo4j + Qdrant)
+
+Agents learn from past runs via a dedicated memory database with both **semantic** and **episodic** tiers:
+
+| Type         | Tier      | Written by         | Used by     | Encodes                                |
+|--------------|-----------|--------------------|-------------|----------------------------------------|
+| **Pattern**  | semantic  | Coder              | Coder       | "use this code structure"              |
+| **Mistake**  | semantic  | Reviewer, Tester   | All agents  | "this failure mode + root cause"       |
+| **Solution** | semantic  | Reviewer, Tester   | All agents  | "this fix resolved the mistake"        |
+| **Strategy** | semantic  | Planner            | Planner     | "this planning approach worked"        |
+| **Episode**  | episodic  | Orchestrator (auto) | Planner    | "what happened last time for feature X" |
+
+**Semantic memory** (Pattern / Mistake / Solution / Strategy) answers *"what should I do?"* with generalised lessons. Feedback loop: eval pass → boost recalled memories; eval fail → demote. Relevance decays 5% each run. Cross-feature learnings are briefed to subsequent features **within the same run**.
+
+**Episodic memory** answers *"what happened last time I was in this exact situation?"* After every feature swarm completes, the orchestrator spins up a small LLM call to synthesise a 200-word narrative summary plus 3–8 key turning-point events, embeds the result with `text-embedding-3-large`, and writes it to both Neo4j (`Episode` node with `PRODUCED_IN` edge to its Run) and Qdrant (`dark_factory_episodes` collection). Planners call `recall_episodes` at the start of every feature to retrieve ranked past trajectories — if an earlier run succeeded with a specific approach, the current run biases toward it; if it failed a particular way, the current run avoids the same mode. Hybrid RRF merge between Neo4j keyword match and Qdrant vector match mirrors the existing `recall_memories` architecture. Episodes are surfaced in the Run Detail popup's Episodes tab alongside Metrics / Evaluations / Output.
+
+Episodic memory costs ~1k LLM tokens per feature for the summarisation pass — toggle off via `enable_episodic_memory` if you're running single-shot features that never recur.
+
+#### Memory hygiene (Tier A)
+
+Three improvements keep the memory graph clean and the recall path sharp:
+
+1. **Write-time dedup** — before creating a new Pattern / Mistake / Solution / Strategy, the repository embeds the candidate text and cosine-matches against existing same-type same-feature memories. Matches above `memory_dedup_threshold` (default 0.92) get their `relevance_score` boosted and their `times_applied` counter bumped instead of being duplicated. A Coder that learns "use parameterised queries for SQL" across five features ends up with one high-relevance Pattern instead of five near-identical low-relevance ones. Set to `0.0` to disable.
+2. **Relevance-weighted RRF recall** — the hybrid Neo4j + Qdrant merge now multiplies each rank contribution by the memory's relevance_score. Memories boosted by successful eval feedback outrank memories at the same semantic similarity that have been demoted by failures. The floor (0.1) keeps fully-demoted memories visible for cleanup but pushes them to the back.
+3. **Memory observability dashboard** — the Metrics tab now has a "Memory graph" section showing per-type node counts, relevance distribution histograms, the 10 most-recalled memories (with their `times_recalled` counter), and 7-day boost/demote effectiveness. Powered by `GET /api/metrics/memory` and backed by new `MemoryRepository.get_memory_stats()`, `get_top_recalled_memories()`, and `get_recall_effectiveness()` methods. Can't improve what you can't measure.
+
+### Observability
+
+- **Prometheus** counters/histograms for every phase, tool call, LLM invocation, reconciliation status, incident, and the BackgroundLoop sampler — always-on and zero-cost.
+- **Postgres** (optional) forensic rows for LLM calls, eval results, tool calls, incidents, and progress events — high-cardinality debugging.
+- **Grafana** ships with provisioned datasources and dashboards for pipeline throughput, cost rollups, and error budgets.
+- **Incident table** surfaces errors, warnings, and reconciliation issues in the Run Detail popup with stack traces.
+
+### Cooperative cancellation
+
+A module-level `threading.Event` is polled at hot-path checkpoints across all five phases. `POST /api/agent/cancel` sets the flag; the pipeline raises `PipelineCancelled` at the next checkpoint, runs the `finally` cleanup, and emits a clean `cancelled` status (not a generic error). The flag auto-resets at the start of every run to prevent bleed.
+
+### File watcher
+
+Optional: monitors `./openspec/specs` (configurable) and emits SSE events to the Monitor UI. With `auto_run=true` it will kick off a pipeline run on debounced file changes.
+
+### Adaptive evaluation
+
+DeepEval thresholds adjust automatically based on score trends across runs. Strategy overrides kick in mid-layer when performance drops below a floor and relax when it recovers.
+
+### AG-UI protocol
+
+All pipeline progress is streamed using [AG-UI](https://docs.ag-ui.com): `RunStartedEvent`, `StepStartedEvent`/`StepFinishedEvent` per phase (including nested per-feature steps in Phase 4), `TextMessageContentEvent` for progress text, `StateSnapshotEvent` after each layer, and `RunFinishedEvent` with the final payload.
+
+---
 
 ## Project Structure
 
 ```
 src/dark_factory/
-  cli.py                    # Click CLI entry point
-  config.py                 # Settings from config.toml + env vars
-  models/domain.py          # Pydantic models (Requirement, Spec, Scenario, etc.)
-  stages/                   # Pipeline stages (ingest, spec, graph, codegen, testgen)
-  llm/                      # LLM clients (Anthropic, LangChain, Claude Agent SDK)
-  graph/                    # Neo4j client, schema, repository
-  agents/
-    swarm.py                # Per-feature swarm (Planner/Coder/Reviewer/Tester)
-    orchestrator.py         # Parent orchestrator (topo-sort, parallel dispatch, strategy)
-    tools.py                # LangChain tools (graph, file, OpenSpec, memory, eval, RAG)
-  evaluation/
-    metrics.py              # DeepEval GEval metrics (GPT-5.4 judge)
-    adaptive.py             # Adaptive threshold computation from score trends
-  memory/
-    schema.py               # Memory + EvalResult + Run graph schema
-    repository.py           # MemoryRepository (CRUD, search, eval history, run tracking)
-  vector/
-    client.py               # Qdrant client wrapper
-    embeddings.py           # OpenAI text-embedding-3-large service
-    collections.py          # Collection creation and indexing
-    repository.py           # VectorRepository (upsert/search memories, specs, code)
-    merge.py                # Reciprocal Rank Fusion for hybrid search
-  openspec/
-    parser.py               # Parse OpenSpec spec.md files
-    writer.py               # Write OpenSpec artifacts via Jinja2
-    templates/              # Jinja2 templates (spec, proposal, design, tasks)
+├── api/                   # FastAPI app + 7 route modules + AG-UI bridge
+│   ├── app.py             # FastAPI application + static SPA mount
+│   ├── ag_ui_bridge.py    # Pipeline → AG-UI event stream adapter
+│   ├── routes_agent.py    # /api/agent/{run,cancel,events}
+│   ├── routes_dashboard.py
+│   ├── routes_metrics.py
+│   ├── routes_runs.py
+│   ├── routes_admin.py
+│   ├── routes_models.py
+│   └── routes_upload.py
+├── stages/                # Pipeline phases
+│   ├── ingest.py          # Phase 1 — native + rich parsing, dedup dispatch
+│   ├── doc_extraction.py  # Rich-doc deep-agent extractor (.docx/.xlsx/.pdf/...)
+│   ├── dedup.py           # Semantic requirement dedup (cosine similarity)
+│   ├── spec.py            # Phase 2
+│   ├── graph.py           # Phase 3
+│   ├── reconciliation.py  # Phase 5
+│   └── e2e_validation.py  # Phase 6 — Playwright cross-browser smoke tests
+├── agents/
+│   ├── orchestrator.py    # Parent: layer dispatch + strategy adjustment
+│   ├── swarm.py           # Per-feature LangGraph swarm
+│   ├── tools.py           # LangChain tools (file, graph, memory, RAG, SDK)
+│   ├── background_loop.py # Singleton daemon asyncio loop for SDK calls
+│   └── progress.py        # ProgressBroker for AG-UI event fan-out
+├── graph/                 # Neo4j client, schema, repository
+├── memory/                # Procedural memory schema + repository
+│   ├── schema.py          # Neo4j constraints + indexes (Pattern / Mistake / Solution / Strategy / Episode)
+│   ├── repository.py      # MemoryRepository: CRUD + recall + eval feedback + stats
+│   ├── dedup_writer.py    # Tier A: write-time dedup via cosine similarity
+│   └── episodes.py        # Episodic memory: synthesizer + EpisodeWriter
+├── vector/                # Qdrant client, embeddings, hybrid RRF merge
+├── metrics/               # Prometheus + Postgres recorder + helpers
+├── evaluation/            # DeepEval GEval metrics + adaptive thresholds
+├── llm/                   # Anthropic / OpenAI / LangChain clients
+├── models/domain.py       # Pydantic domain models
+├── openspec/              # OpenSpec parser + Jinja2 writer
+├── config.py              # Settings (TOML + env overrides)
+└── log.py                 # Structlog setup
+
+frontend/
+├── src/
+│   ├── App.tsx            # Tab routing + layout
+│   ├── api/client.ts      # AG-UI HttpAgent + REST client
+│   ├── components/*Tab.tsx
+│   ├── hooks/             # useAgentRun, useDashboard, ...
+│   └── main.tsx
+└── vite.config.ts
+
+tests/                      # 595 tests across 36 files
 ```
+
+---
+
+## Development
+
+```bash
+# Run the full test suite (595 tests)
+uv run pytest tests/ -v
+
+# Fast subset (skip integration + slow tests)
+uv run pytest tests/ -m "not integration and not slow"
+
+# Lint + format
+uv run ruff check src/ tests/
+uv run ruff format src/ tests/
+
+# TypeScript check
+cd frontend && npx tsc --noEmit
+```
+
+Pytest markers:
+
+- `@pytest.mark.slow` — > 1s
+- `@pytest.mark.integration` — requires external services (Neo4j, Qdrant, Postgres)
+
+---
 
 ## Agentic Behavior Level
 
 This system operates at **L4 (Fully Autonomous / Explorer)** on the [Vellum agentic behavior scale](https://www.vellum.ai/blog/levels-of-agentic-behavior):
 
-| L4 Trait | Implementation |
-|----------|---------------|
-| **Persist state across sessions** | Neo4j procedural memory + Qdrant embeddings + eval/run history |
-| **Refine execution based on feedback** | Eval→memory feedback loop, adaptive thresholds, cross-feature learning, mid-run strategy adjustment |
-| **Parallel execution** | Concurrent feature swarms within dependency layers |
-| **Real-time adaptation** | Strategy overrides triggered by layer pass rate; cross-feature briefing within same run |
+| L4 Trait                             | Implementation                                                         |
+|--------------------------------------|------------------------------------------------------------------------|
+| Persist state across sessions        | Neo4j procedural memory + Qdrant embeddings + eval/run history         |
+| Refine execution based on feedback   | Eval → memory feedback loop, adaptive thresholds, cross-feature learning, mid-run strategy adjustment |
+| Parallel execution                   | Concurrent feature swarms within dependency layers                     |
+| Real-time adaptation                 | Strategy overrides triggered by layer pass rate; cross-feature briefing within same run |
+| Cross-feature reconciliation         | Phase 5 extended Claude Agent SDK pass over the full run output        |
 
-## Development
+---
 
-```bash
-# Run tests (98 tests)
-uv run pytest tests/ -v
+## Author
 
-# Lint
-uv run ruff check src/ tests/
+**Kevin Quon** &lt;[kquon@nvisia.com](mailto:kquon@nvisia.com)&gt;
 
-# Format
-uv run ruff format src/ tests/
-```
+---
 
 ## License
 
-Proprietary.
+Proprietary. © Kevin Quon.

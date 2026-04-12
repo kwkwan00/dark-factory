@@ -1,17 +1,67 @@
+# ── Python ────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
 *.egg-info/
-dist/
-build/
-.eggs/
 *.egg
+.eggs/
+build/
+dist/
+.python-version
+
+# ── Virtualenvs ───────────────────────────────────────────────────────────
 .venv/
 venv/
-.env
-output/
+env/
+
+# ── Tooling caches ────────────────────────────────────────────────────────
 .ruff_cache/
 .mypy_cache/
 .pytest_cache/
-*.so
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# ── Environment / secrets ─────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Runtime / data directories ────────────────────────────────────────────
+# Pipeline output directory — generated code per run.
+output/
+# Drag-and-drop requirement uploads staged under uploads/<uuid>/.
+# Transient (24h TTL) and can contain private business documents —
+# never commit. See src/dark_factory/api/routes_upload.py.
+uploads/
+# Requirements drop-in directory (local-only examples).
+inputs/
+# DeepEval cache + state directories created wherever the evaluator runs.
+.deepeval/
+
+# ── Frontend (Node / Vite) ────────────────────────────────────────────────
+# node_modules is massive — never commit.
+node_modules/
+# Vite dev/build caches — matched case-insensitively by some FSes.
+.vite/
+# Vite build output is covered by the top-level `dist/` rule above,
+# but we also install the built SPA into the backend's static dir at
+# deploy time. That's a build artifact, not source.
+src/dark_factory/api/static/
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── IDE / editor ──────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS junk ───────────────────────────────────────────────────────────────
 .DS_Store
+Thumbs.db

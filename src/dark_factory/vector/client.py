@@ -16,8 +16,9 @@ class QdrantClientWrapper:
     def __init__(self, config: QdrantConfig) -> None:
         self.config = config
         kwargs: dict = {"url": config.url}
-        if config.api_key:
-            kwargs["api_key"] = config.api_key
+        api_key_val = config.api_key.get_secret_value() if config.api_key else ""
+        if api_key_val:
+            kwargs["api_key"] = api_key_val
         self._client = QdrantClient(**kwargs)
 
     @property

@@ -6,6 +6,10 @@ import hashlib
 import re
 from pathlib import Path
 
+import structlog
+
+log = structlog.get_logger()
+
 from dark_factory.models.domain import Requirement, Scenario, Spec
 
 
@@ -23,6 +27,7 @@ def parse_openspec_dir(root: Path) -> list[Requirement]:
         if spec_file.exists():
             reqs = parse_spec_md(spec_file, capability=capability_dir.name)
             requirements.extend(reqs)
+    log.info("openspec_parsed", root=str(root), requirements=len(requirements))
     return requirements
 
 
@@ -33,7 +38,7 @@ def parse_spec_md(path: Path, capability: str) -> list[Requirement]:
     Scenario WHEN/THEN pairs are included in the description so downstream
     LLM stages have full context.
     """
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     requirements: list[Requirement] = []
 
     # Split on requirement headers
@@ -48,7 +53,7 @@ def parse_spec_md(path: Path, capability: str) -> list[Requirement]:
         scenarios = _extract_scenarios(body)
         description = _build_description(body, scenarios)
 
-        req_id = hashlib.sha256(f"{capability}/{name}".encode()).hexdigest()[:12]
+        req_id = hashlib.sha256(f"{capability}/{name}".encode()).hexdigest()[:16]
         requirements.append(
             Requirement(
                 id=req_id,
@@ -76,7 +81,7 @@ def parse_openspec_specs(root: Path) -> list[Spec]:
             continue
 
         capability = capability_dir.name
-        text = spec_file.read_text()
+        text = spec_file.read_text(encoding="utf-8")
         req_pattern = re.compile(r"^### Requirement:\s*(.+)$", re.MULTILINE)
         req_splits = req_pattern.split(text)
 
@@ -90,7 +95,7 @@ def parse_openspec_specs(root: Path) -> list[Spec]:
                 r"####\s+Scenario:.*?(?=####|\Z)", "", body, flags=re.DOTALL
             ).strip()
 
-            spec_id = hashlib.sha256(f"{capability}/{name}".encode()).hexdigest()[:12]
+            spec_id = hashlib.sha256(f"{capability}/{name}".encode()).hexdigest()[:16]
             spec = Spec(
                 id=f"spec-{spec_id}",
                 title=name,

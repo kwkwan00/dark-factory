@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import structlog
+
 from dark_factory.graph.client import Neo4jClient
+
+log = structlog.get_logger()
 
 MEMORY_SCHEMA_STATEMENTS = [
     # Uniqueness constraints
@@ -27,6 +31,18 @@ MEMORY_SCHEMA_STATEMENTS = [
     "CREATE INDEX eval_result_run IF NOT EXISTS FOR (e:EvalResult) ON (e.run_id)",
     "CREATE INDEX eval_result_type IF NOT EXISTS FOR (e:EvalResult) ON (e.eval_type)",
     "CREATE INDEX run_timestamp IF NOT EXISTS FOR (r:Run) ON (r.timestamp)",
+    # Episodic memory. An Episode is the autobiographical record of one
+    # feature swarm running to completion (or failure) — it captures
+    # the narrative trajectory in addition to whatever Pattern/
+    # Mistake/Solution/Strategy notes were recorded along the way.
+    # Queried by the Planner at the start of a feature via
+    # ``recall_episodes`` so past decisions bias future strategy
+    # selection.
+    "CREATE CONSTRAINT episode_id IF NOT EXISTS FOR (ep:Episode) REQUIRE ep.id IS UNIQUE",
+    "CREATE INDEX episode_feature IF NOT EXISTS FOR (ep:Episode) ON (ep.feature)",
+    "CREATE INDEX episode_run IF NOT EXISTS FOR (ep:Episode) ON (ep.run_id)",
+    "CREATE INDEX episode_outcome IF NOT EXISTS FOR (ep:Episode) ON (ep.outcome)",
+    "CREATE INDEX episode_started_at IF NOT EXISTS FOR (ep:Episode) ON (ep.started_at)",
 ]
 
 
@@ -35,9 +51,13 @@ def init_memory_schema(client: Neo4jClient) -> None:
     with client.session() as session:
         for stmt in MEMORY_SCHEMA_STATEMENTS:
             session.run(stmt)
+    log.info("memory_schema_initialized", statements=len(MEMORY_SCHEMA_STATEMENTS))
 
 
-def clear_memory(client: Neo4jClient) -> None:
+def clear_memory(client: Neo4jClient, *, confirm: bool = True) -> None:
     """Delete all nodes and relationships in the memory database."""
+    if not confirm:
+        raise ValueError("clear_memory requires confirm=True")
     with client.session() as session:
         session.run("MATCH (n) DETACH DELETE n")
+    log.warning("memory_cleared")

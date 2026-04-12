@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import structlog
+
+log = structlog.get_logger()
+
 
 def compute_adaptive_threshold(
     *,
@@ -38,4 +42,7 @@ def compute_adaptive_threshold(
     else:
         threshold = base_threshold
 
-    return max(threshold_min, min(threshold, threshold_max))
+    result = max(threshold_min, min(threshold, threshold_max))
+    if result != base_threshold:
+        log.info("adaptive_threshold", base=base_threshold, adjusted=result, scores=len(recent_scores))
+    return result

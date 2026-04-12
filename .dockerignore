@@ -1,0 +1,23 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.claude
+.deepeval/
+output/
+uploads/
+openspec/archive/
+.env
+.env.*
+!.env.example
+# Frontend build artefacts + node_modules — regenerated inside the
+# frontend-build stage from package.json / package-lock.json.
+frontend/node_modules
+frontend/dist
+# The copy-into-static target dir; the main Dockerfile repopulates
+# this from the frontend-build stage so we don't want a stale copy
+# from a local build sneaking into the image.
+src/dark_factory/api/static

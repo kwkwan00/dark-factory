@@ -2,26 +2,54 @@
 name = "ai-dark-factory"
 version = "0.1.0"
 description = "Code generator that converts requirements into specs, populates a Neo4j knowledge graph, and generates application code with evaluation tests."
+authors = [
+    { name = "Kevin Quon", email = "kquon@nvisia.com" },
+]
 requires-python = ">=3.12"
 dependencies = [
-    "click>=8.1",
-    "pydantic>=2.0",
-    "neo4j>=5.0",
-    "anthropic>=0.50",
+    # H3 fix: tighter pins on the LLM/agent stack to avoid surprise
+    # breaking changes at minor/major bumps. Other libraries get looser
+    # pins since they follow semver more reliably.
+    "fastapi>=0.115,<1.0",
+    "uvicorn>=0.30,<1.0",
+    "python-multipart>=0.0.9",
+    "ag-ui-protocol>=0.1",
+    "sse-starlette>=2.0",
+    "pydantic>=2.0,<3.0",
+    "neo4j>=5.0,<7.0",
+    "anthropic>=0.50,<1.0",
     "structlog>=24.0",
     "jinja2>=3.1",
     "claude-agent-sdk>=0.1.0",
-    "langchain>=0.3",
-    "langchain-anthropic>=0.3",
-    "langgraph>=0.3",
-    "langgraph-swarm>=0.1",
-    "deepeval>=2.0",
-    "qdrant-client>=1.9",
-    "openai>=1.0",
+    # LangChain stack: `langgraph-swarm>=0.1` pulls langchain 1.x and
+    # langgraph 1.x, so langchain/langgraph are pinned to the same major.
+    # langchain-anthropic is still on 0.x at the time of writing.
+    "langchain>=1.0,<2.0",
+    "langchain-anthropic>=0.3,<2.0",
+    "langgraph>=1.0,<2.0",
+    "langgraph-swarm>=0.1,<1.0",
+    "deepeval>=2.0,<4.0",
+    "qdrant-client>=1.9,<2.0",
+    "openai>=1.0,<3.0",
+    "watchdog>=4.0,<7.0",
+    # PostgreSQL for metrics/telemetry (swarm, eval, LLM calls, runs).
+    # [binary] ships precompiled libpq, [pool] enables ConnectionPool.
+    "psycopg[binary,pool]>=3.2,<4.0",
+    # Prometheus counters/histograms/gauges for aggregate metrics
+    # (alerting, dashboards, rate-over queries). Postgres remains the
+    # source of truth for high-cardinality forensic rows.
+    "prometheus-client>=0.20,<1.0",
+    # Document extractors used by the clean-context deep agent that
+    # parses business-requirements uploads (Word, Excel, PDF, HTML,
+    # RTF, XML, ...). Each library is thin and has no heavy native
+    # dependencies beyond libxml2 (via lxml).
+    "python-docx>=1.1,<2.0",  # .docx
+    "openpyxl>=3.1,<4.0",  # .xlsx
+    "pypdf>=4.3,<7.0",  # .pdf
+    "beautifulsoup4>=4.12,<5.0",  # .html / .htm
+    "lxml>=5.2,<7.0",  # .xml (also used by python-docx)
+    "striprtf>=0.0.26,<1.0",  # .rtf
 ]
-
-[project.scripts]
-dark-factory = "dark_factory.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -32,6 +60,10 @@ packages = ["src/dark_factory"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: tests that take more than a second",
+    "integration: tests that require external services (Neo4j, Qdrant, LLM APIs)",
+]
 
 [tool.ruff]
 target-version = "py312"
@@ -40,5 +72,7 @@ src = ["src"]
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "pytest-asyncio>=0.24",
+    "pytest-mock>=3.12",
     "ruff>=0.15.9",
 ]

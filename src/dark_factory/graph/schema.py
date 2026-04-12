@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import structlog
+
 from dark_factory.graph.client import Neo4jClient
+
+log = structlog.get_logger()
 
 SCHEMA_STATEMENTS = [
     "CREATE CONSTRAINT req_id IF NOT EXISTS FOR (r:Requirement) REQUIRE r.id IS UNIQUE",
@@ -19,9 +23,13 @@ def init_schema(client: Neo4jClient) -> None:
     with client.session() as session:
         for stmt in SCHEMA_STATEMENTS:
             session.run(stmt)
+    log.info("graph_schema_initialized", statements=len(SCHEMA_STATEMENTS))
 
 
-def clear_graph(client: Neo4jClient) -> None:
-    """Delete all nodes and relationships. Use with caution."""
+def clear_graph(client: Neo4jClient, *, confirm: bool = False) -> None:
+    """Delete all nodes and relationships. Requires confirm=True to execute."""
+    if not confirm:
+        raise ValueError("clear_graph requires confirm=True to prevent accidental data loss")
     with client.session() as session:
         session.run("MATCH (n) DETACH DELETE n")
+    log.warning("graph_cleared")

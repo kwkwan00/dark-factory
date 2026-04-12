@@ -1,3 +1,10 @@
+# config.toml holds development defaults. In docker-compose the values
+# in this file are overridden by env vars (NEO4J_URI, QDRANT_URL, etc.)
+# that point at service names on the compose network. If you're running
+# the app directly against service containers on host networking, set
+# those env vars yourself — this file's localhost URIs will not resolve
+# to docker-compose services.
+
 [neo4j]
 uri = "bolt://localhost:7687"
 database = "neo4j"
@@ -9,13 +16,26 @@ model = "claude-sonnet-4-6"
 [pipeline]
 output_dir = "./output"
 max_parallel_features = 4
+max_parallel_specs = 4
+max_spec_handoffs = 5
+spec_eval_threshold = 0.8
 
 [openspec]
 root_dir = "./openspec"
 
 [memory]
-database = "memory"
+# Uses the same Neo4j database as the graph — Community Edition only supports
+# one database. Labels (:Pattern, :Mistake, :Solution, :Strategy) keep memory
+# nodes separate from graph nodes (:Spec, :Requirement).
+# Override to "memory" if using Neo4j Enterprise with multi-database support.
+database = "neo4j"
 enabled = true
+
+[watch]
+enabled = false
+paths = ["./openspec/specs"]
+debounce_seconds = 5
+auto_run = true
 
 [qdrant]
 url = "http://localhost:6333"

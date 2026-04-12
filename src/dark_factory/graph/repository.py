@@ -76,6 +76,91 @@ class GraphRepository:
                 dep_id=dep_id,
             )
 
+    def existing_spec_ids(self, ids: list[str]) -> set[str]:
+        """Return the subset of ``ids`` that already exist as ``:Spec`` nodes.
+
+        Used by :meth:`SpecStage.run` to skip the full refinement loop for
+        targets that are already persisted — preventing the spec
+        generation swarm from redoing work on re-runs of the same
+        requirements directory. Empty input returns an empty set without
+        opening a session.
+        """
+        if not ids:
+            return set()
+        with self.client.session() as session:
+            result = session.run(
+                "MATCH (s:Spec) WHERE s.id IN $ids RETURN s.id AS id",
+                ids=list(ids),
+            )
+            return {r["id"] for r in result}
+
+    def get_specs(self, ids: list[str]) -> list[Spec]:
+        """Reconstruct Spec domain models from Neo4j for the given ids.
+
+        Used by the preflight skip path: we need the existing Specs to
+        continue flowing through ``context.specs`` into the downstream
+        graph / codegen / testgen stages without re-running the
+        refinement loop. Scenarios are stored as a JSON string on the
+        node (see :meth:`upsert_spec`) and decoded here. Nodes that
+        don't exist are silently dropped — the caller is expected to
+        intersect with :meth:`existing_spec_ids` first.
+        """
+        if not ids:
+            return []
+
+        from dark_factory.models.domain import Scenario
+
+        with self.client.session() as session:
+            result = session.run(
+                """
+                MATCH (s:Spec) WHERE s.id IN $ids
+                OPTIONAL MATCH (s)-[:IMPLEMENTS]->(r:Requirement)
+                OPTIONAL MATCH (s)-[:DEPENDS_ON]->(d:Spec)
+                RETURN s,
+                       collect(DISTINCT r.id) AS req_ids,
+                       collect(DISTINCT d.id) AS dep_ids
+                """,
+                ids=list(ids),
+            )
+            specs: list[Spec] = []
+            for record in result:
+                node = record["s"]
+                if node is None:
+                    continue
+                props = dict(node)
+
+                # Scenarios are JSON-encoded on write; tolerate bad data
+                # by falling back to an empty list so a corrupt row
+                # can't take out the entire preflight pass.
+                raw_scenarios = props.get("scenarios", "[]")
+                scenarios: list[Scenario] = []
+                if isinstance(raw_scenarios, str) and raw_scenarios:
+                    try:
+                        scenarios_data = json.loads(raw_scenarios)
+                        if isinstance(scenarios_data, list):
+                            for item in scenarios_data:
+                                if isinstance(item, dict):
+                                    try:
+                                        scenarios.append(Scenario(**item))
+                                    except Exception:
+                                        continue
+                    except json.JSONDecodeError:
+                        pass
+
+                specs.append(
+                    Spec(
+                        id=props["id"],
+                        title=props.get("title") or "",
+                        description=props.get("description") or "",
+                        requirement_ids=[r for r in (record["req_ids"] or []) if r],
+                        acceptance_criteria=list(props.get("acceptance_criteria") or []),
+                        dependencies=[d for d in (record["dep_ids"] or []) if d],
+                        scenarios=scenarios,
+                        capability=props.get("capability") or "",
+                    )
+                )
+            return specs
+
     def get_spec_with_context(self, spec_id: str) -> str | None:
         """Get a spec and its dependency tree as a formatted string for LLM context."""
         with self.client.session() as session:

@@ -9,6 +9,59 @@ from dark_factory.vector.merge import hybrid_merge
 # ── Config tests ─────────────────────────────────────────────────────
 
 
+def test_to_point_id_returns_valid_uuid() -> None:
+    """Qdrant rejects non-UUID/non-int IDs — _to_point_id must return a parseable UUID."""
+    import uuid
+
+    from dark_factory.vector.repository import VectorRepository
+
+    point_id = VectorRepository._to_point_id("mistake-b6d011d5")
+    # Must be parseable as a UUID — raises if not
+    parsed = uuid.UUID(point_id)
+    assert str(parsed) == point_id
+
+
+def test_to_point_id_is_deterministic() -> None:
+    """The same node ID must always map to the same point ID (idempotent upserts)."""
+    from dark_factory.vector.repository import VectorRepository
+
+    a = VectorRepository._to_point_id("mistake-b6d011d5")
+    b = VectorRepository._to_point_id("mistake-b6d011d5")
+    assert a == b
+
+
+def test_to_point_id_distinct_for_distinct_inputs() -> None:
+    """Different node IDs must map to different point IDs."""
+    from dark_factory.vector.repository import VectorRepository
+
+    ids = [
+        VectorRepository._to_point_id("mistake-1"),
+        VectorRepository._to_point_id("mistake-2"),
+        VectorRepository._to_point_id("pattern-1"),
+        VectorRepository._to_point_id("spec-abc"),
+    ]
+    assert len(set(ids)) == 4
+
+
+def test_to_point_id_handles_special_chars() -> None:
+    """Node IDs with hyphens, underscores, and numbers all work."""
+    import uuid
+
+    from dark_factory.vector.repository import VectorRepository
+
+    inputs = [
+        "mistake-b6d011d5",
+        "pattern_abc_123",
+        "spec-ec318244339064a1",
+        "Solution.with.dots",
+        "Strategy/with/slashes",
+    ]
+    for inp in inputs:
+        result = VectorRepository._to_point_id(inp)
+        # Each result must be a valid UUID
+        uuid.UUID(result)
+
+
 def test_qdrant_config_defaults() -> None:
     config = QdrantConfig()
     assert config.url == "http://localhost:6333"
@@ -85,7 +138,8 @@ def test_recall_memories_works_without_vector() -> None:
     mock_memory = MagicMock()
     mock_memory.get_related_memories.return_value = [{"id": "pattern-abc", "description": "test"}]
     tools_mod._memory_repo = mock_memory
-    tools_mod._recalled_memory_ids = []
+    # L6 fix: recalled memory IDs are stored in _thread_local, not a module attr
+    tools_mod._thread_local.recalled_memory_ids = []
 
     try:
         result = tools_mod.recall_memories.invoke({"feature_name": "auth"})

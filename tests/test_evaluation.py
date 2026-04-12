@@ -5,14 +5,20 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from dark_factory.evaluation.metrics import (
-    EVAL_MODEL,
     build_spec_test_case,
     build_test_case,
+    get_eval_model,
 )
 
 
-def test_eval_model_is_gpt54() -> None:
-    assert EVAL_MODEL == "gpt-5.4"
+def test_eval_model_defaults_to_gpt54() -> None:
+    """get_eval_model() defaults to gpt-5.4 but can be overridden via
+    the EVAL_MODEL env var (read at module import time) or via
+    ``set_eval_model`` / the Settings-tab PATCH at runtime."""
+    assert get_eval_model()  # non-empty
+    import os
+    if not os.getenv("EVAL_MODEL"):
+        assert get_eval_model() == "gpt-5.4"
 
 
 def test_build_test_case() -> None:
@@ -30,14 +36,19 @@ def test_build_test_case() -> None:
 
 
 def test_build_metrics_use_openai_model() -> None:
-    """Verify metric builders pass gpt-5.4 as the model."""
+    """Verify metric builders pass the configured eval model (dynamic)."""
     with patch("dark_factory.evaluation.metrics.GEval") as mock_geval:
-        from dark_factory.evaluation.metrics import build_correctness_metric
+        from dark_factory.evaluation.metrics import (
+            build_correctness_metric,
+            get_eval_model,
+        )
 
         build_correctness_metric()
         call_kwargs = mock_geval.call_args.kwargs
         assert call_kwargs["name"] == "Test Correctness"
-        assert call_kwargs["model"] == "gpt-5.4"
+        # Builder must call get_eval_model() at construction time so
+        # runtime Settings-tab changes propagate.
+        assert call_kwargs["model"] == get_eval_model()
 
 
 def test_build_spec_test_case() -> None:
@@ -52,14 +63,48 @@ def test_build_spec_test_case() -> None:
 
 
 def test_build_spec_metrics_use_openai() -> None:
-    """Verify spec metric builders pass gpt-5.4."""
+    """Verify spec metric builders pass the configured eval model (dynamic)."""
     with patch("dark_factory.evaluation.metrics.GEval") as mock_geval:
-        from dark_factory.evaluation.metrics import build_spec_correctness_metric
+        from dark_factory.evaluation.metrics import (
+            build_spec_correctness_metric,
+            get_eval_model,
+        )
 
         build_spec_correctness_metric()
         call_kwargs = mock_geval.call_args.kwargs
         assert call_kwargs["name"] == "Spec Correctness"
-        assert call_kwargs["model"] == "gpt-5.4"
+        assert call_kwargs["model"] == get_eval_model()
+
+
+def test_set_eval_model_propagates_to_builders() -> None:
+    """Changing the eval model at runtime must affect the NEXT builder
+    call. Regression test for the ``set_eval_model`` refactor — the
+    previous ``EVAL_MODEL`` constant was captured at import time and
+    never picked up Settings-tab PATCHes."""
+    with patch("dark_factory.evaluation.metrics.GEval") as mock_geval:
+        from dark_factory.evaluation.metrics import (
+            build_spec_correctness_metric,
+            get_eval_model,
+            set_eval_model,
+        )
+
+        original = get_eval_model()
+        try:
+            set_eval_model("gpt-test-override-1234")
+            build_spec_correctness_metric()
+            assert mock_geval.call_args.kwargs["model"] == "gpt-test-override-1234"
+        finally:
+            set_eval_model(original)
+
+
+def test_set_eval_model_rejects_empty_string() -> None:
+    """Defensive validator: empty strings would silently break GEval."""
+    import pytest as _pytest
+
+    from dark_factory.evaluation.metrics import set_eval_model
+
+    with _pytest.raises(ValueError, match="non-empty string"):
+        set_eval_model("")
 
 
 def test_evaluate_spec_tool_exists() -> None:

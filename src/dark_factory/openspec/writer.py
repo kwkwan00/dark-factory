@@ -6,6 +6,9 @@ import shutil
 from pathlib import Path
 
 import jinja2
+import structlog
+
+log = structlog.get_logger()
 
 from dark_factory.models.domain import Spec
 
@@ -15,6 +18,7 @@ _env = jinja2.Environment(
     keep_trailing_newline=True,
     trim_blocks=True,
     lstrip_blocks=True,
+    autoescape=False,  # M9: explicitly set — output is Markdown, not HTML
 )
 
 
@@ -35,6 +39,7 @@ def write_spec_md(spec: Spec, root: Path) -> Path:
 
     out_path = out_dir / "spec.md"
     out_path.write_text(content)
+    log.info("wrote_openspec", path=str(out_path), capability=capability)
     return out_path
 
 

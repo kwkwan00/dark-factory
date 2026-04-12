@@ -73,3 +73,26 @@ def sample_context(sample_requirement: Requirement) -> PipelineContext:
 @pytest.fixture
 def fake_llm() -> FakeLLMClient:
     return FakeLLMClient()
+
+
+# ── API test fixtures ──────────────────────────────────────────────────────────
+# L7 fix: shared fixture with proper setup/teardown for API tests.
+# The lifespan creates Neo4j clients — mock them to avoid needing a real DB.
+
+
+@pytest.fixture
+def api_client():
+    """TestClient with mocked Neo4j/memory — safe to use without external services."""
+    from unittest.mock import MagicMock, patch
+
+    with (
+        patch("dark_factory.graph.client.Neo4jClient") as _neo4j_cls,
+        patch("dark_factory.memory.schema.init_memory_schema"),
+        patch("dark_factory.memory.repository.MemoryRepository"),
+    ):
+        from dark_factory.api.app import app
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            yield client
+        # TestClient exits lifespan here — cleanup runs automatically

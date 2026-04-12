@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -14,6 +15,12 @@ if TYPE_CHECKING:
     from dark_factory.models.domain import CodeArtifact, Spec
 
 log = structlog.get_logger()
+
+# Fixed namespace for converting Neo4j string IDs → Qdrant point UUIDs.
+# Qdrant only accepts unsigned int or UUID as point ID; we use uuid5 with
+# this namespace so the same node ID always maps to the same point ID
+# (deterministic, reversible-by-name, no extra storage needed).
+_QDRANT_ID_NAMESPACE = uuid.UUID("9c8d7e6f-5a4b-3c2d-1e0f-aabbccddeeff")
 
 
 class VectorRepository:
@@ -166,10 +173,97 @@ class VectorRepository:
             points=[self._to_point_id(node_id)],
         )
 
+    # ── Episode operations ───────────────────────────────────────────
+    #
+    # Episodic memory stores the autobiographical narrative of one
+    # feature swarm run. The caller (``EpisodeWriter``) is
+    # responsible for producing the embedding vector — we accept it
+    # as a pre-computed argument rather than re-embedding here, so
+    # the writer's error handling can surface embedding failures
+    # distinctly from Qdrant-side failures.
+
+    def upsert_episode(
+        self,
+        *,
+        episode_id: str,
+        run_id: str,
+        feature: str,
+        outcome: str,
+        summary: str,
+        vector: list[float],
+        turns_used: int = 0,
+        duration_seconds: float = 0.0,
+    ) -> None:
+        self._client.client.upsert(
+            collection_name=self._client.collection_name("episodes"),
+            points=[
+                PointStruct(
+                    id=self._to_point_id(episode_id),
+                    vector=vector,
+                    payload={
+                        "id": episode_id,
+                        "run_id": run_id,
+                        "feature": feature,
+                        "outcome": outcome,
+                        "summary": summary,
+                        "turns_used": turns_used,
+                        "duration_seconds": duration_seconds,
+                    },
+                )
+            ],
+        )
+
+    def search_episodes(
+        self,
+        *,
+        query_text: str,
+        feature: str | None = None,
+        outcome: str | None = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        """Semantic search over episode summaries.
+
+        Used as the Qdrant half of the ``recall_episodes`` hybrid
+        RRF merge. Returns the same ``{id, score, **payload}`` shape
+        as ``search_memories`` so the merge helper can treat them
+        identically.
+        """
+        vector = self._embeddings.embed(query_text)
+        conditions = []
+        if feature:
+            conditions.append(
+                FieldCondition(key="feature", match=MatchValue(value=feature))
+            )
+        if outcome and outcome.lower() != "any":
+            conditions.append(
+                FieldCondition(key="outcome", match=MatchValue(value=outcome.lower()))
+            )
+        query_filter = Filter(must=conditions) if conditions else None
+        results = self._client.client.query_points(
+            collection_name=self._client.collection_name("episodes"),
+            query=vector,
+            query_filter=query_filter,
+            limit=limit,
+            score_threshold=0.3,
+        ).points
+        return [
+            {"id": p.payload.get("id", ""), "score": p.score, **p.payload}
+            for p in results
+        ]
+
     # ── Helpers ──────────────────────────────────────────────────────
 
     @staticmethod
     def _to_point_id(node_id: str) -> str:
-        """Convert a Neo4j node ID to a Qdrant-compatible point ID.
-        Qdrant accepts string IDs natively."""
-        return node_id
+        """Convert a string node ID to a Qdrant-compatible point UUID.
+
+        Qdrant only accepts unsigned int or UUID as point IDs (it rejects
+        free-form strings like "mistake-b6d011d5"). We generate a
+        deterministic UUID5 from the node ID, so:
+
+        - The same node ID always maps to the same point ID (idempotent
+          upserts).
+        - The original node ID is preserved in the payload's ``id`` field
+          for retrieval/display.
+        """
+        return str(uuid.uuid5(_QDRANT_ID_NAMESPACE, node_id))

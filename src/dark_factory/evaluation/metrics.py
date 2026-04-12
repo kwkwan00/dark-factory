@@ -2,17 +2,54 @@
 
 Provides GEval-based metrics that assess whether generated artifacts are correct,
 coherent, complete, and safe relative to requirements and acceptance criteria.
-Uses OpenAI GPT-5.4 as the LLM-as-a-judge for evaluation.
+Uses an OpenAI model as the LLM-as-a-judge for evaluation.
 """
 
 from __future__ import annotations
 
+import os
+
+import structlog
 from deepeval.metrics import GEval
 from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
+log = structlog.get_logger()
+
 # DeepEval natively supports OpenAI models via the model string parameter.
 # Set OPENAI_API_KEY in your environment.
-EVAL_MODEL = "gpt-5.4"
+#
+# The eval model is mutable at runtime so the Settings tab can switch it
+# without a process restart. ``get_eval_model()`` is called inside each
+# metric builder (at metric construction time, not at import time) so
+# the latest value is always picked up.
+#
+# ``set_eval_model`` is called from:
+#   - ``load_settings`` at app startup (after env var + config.toml merge)
+#   - ``PATCH /api/settings`` when the operator changes the dropdown
+#
+# NOTE: gpt-5.4 may not be available in all OpenAI accounts. If you see
+# `403 model not found`, change the value via the Settings tab (or set
+# ``EVAL_MODEL=gpt-4.1`` etc. in the environment at boot).
+_eval_model: str = os.getenv("EVAL_MODEL", "gpt-5.4")
+
+
+def get_eval_model() -> str:
+    """Return the currently-configured evaluation model name."""
+    return _eval_model
+
+
+def set_eval_model(name: str) -> None:
+    """Update the evaluation model at runtime.
+
+    Subsequent metric-builder calls will use the new name. Metrics
+    already built and handed to DeepEval are not retroactively updated
+    — this only affects the NEXT pipeline run.
+    """
+    global _eval_model
+    if not name or not isinstance(name, str):
+        raise ValueError(f"eval model name must be a non-empty string, got {name!r}")
+    _eval_model = name
+    log.info("eval_model_updated", model=name)
 
 
 # ── Metric builders ──────────────────────────────────────────────────
@@ -33,7 +70,7 @@ def build_correctness_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.EXPECTED_OUTPUT,
         ],
         threshold=threshold,
-        model=EVAL_MODEL,
+        model=get_eval_model(),
     )
 
 
@@ -51,7 +88,7 @@ def build_coherence_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.ACTUAL_OUTPUT,
         ],
         threshold=threshold,
-        model=EVAL_MODEL,
+        model=get_eval_model(),
     )
 
 
@@ -71,7 +108,7 @@ def build_completeness_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.INPUT,
         ],
         threshold=threshold,
-        model=EVAL_MODEL,
+        model=get_eval_model(),
     )
 
 
@@ -89,7 +126,7 @@ def build_code_quality_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.EXPECTED_OUTPUT,
         ],
         threshold=threshold,
-        model=EVAL_MODEL,
+        model=get_eval_model(),
     )
 
 
@@ -112,7 +149,7 @@ def build_spec_correctness_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.INPUT,
         ],
         threshold=threshold,
-        model=EVAL_MODEL,
+        model=get_eval_model(),
     )
 
 
@@ -130,7 +167,7 @@ def build_spec_coherence_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.ACTUAL_OUTPUT,
         ],
         threshold=threshold,
-        model=EVAL_MODEL,
+        model=get_eval_model(),
     )
 
 
@@ -151,7 +188,7 @@ def build_spec_instruction_following_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.INPUT,
         ],
         threshold=threshold,
-        model=EVAL_MODEL,
+        model=get_eval_model(),
     )
 
 
@@ -173,7 +210,7 @@ def build_spec_safety_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.INPUT,
         ],
         threshold=threshold,
-        model=EVAL_MODEL,
+        model=get_eval_model(),
     )
 
 
@@ -202,11 +239,26 @@ def evaluate_generated_spec(
     requirement_description: str,
     spec_json: str,
     threshold: float = 0.5,
+    target_spec_id: str | None = None,
+    sub_spec_title: str | None = None,
 ) -> dict:
     """Run all spec evaluation metrics and return results.
 
+    ``target_spec_id`` and ``sub_spec_title`` are passed through purely
+    for log enrichment — with decomposition on, a single parent
+    requirement fans out into many sub-specs, all of which would
+    otherwise share the same ``requirement`` field in the
+    ``evaluating_spec`` log event and become indistinguishable.
+
     Returns a dict with metric names as keys and dicts of score/passed/reason.
     """
+    log.info(
+        "evaluating_spec",
+        requirement=requirement_title,
+        target_spec_id=target_spec_id,
+        sub_spec_title=sub_spec_title,
+        threshold=threshold,
+    )
     test_case = build_spec_test_case(
         requirement_title=requirement_title,
         requirement_description=requirement_description,
@@ -223,7 +275,7 @@ def evaluate_generated_spec(
     results: dict[str, dict] = {}
     for metric in metrics:
         metric.measure(test_case)
-        results[metric.__name__] = {
+        results[metric.name] = {
             "score": metric.score,
             "passed": metric.is_successful(),
             "reason": getattr(metric, "reason", None),
@@ -274,6 +326,7 @@ def evaluate_generated_tests(
 
     Returns a dict with metric names as keys and dicts of score/passed/reason as values.
     """
+    log.info("evaluating_tests", spec=spec_title, threshold=threshold)
     test_case = build_test_case(
         spec_title=spec_title,
         acceptance_criteria=acceptance_criteria,
@@ -290,7 +343,7 @@ def evaluate_generated_tests(
     results: dict[str, dict] = {}
     for metric in metrics:
         metric.measure(test_case)
-        results[metric.__name__] = {
+        results[metric.name] = {
             "score": metric.score,
             "passed": metric.is_successful(),
             "reason": getattr(metric, "reason", None),

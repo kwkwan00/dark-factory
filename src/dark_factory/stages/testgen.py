@@ -68,7 +68,11 @@ class TestgenStage(Stage):
             )
             tests.append(test_case)
 
-            out_path = self.output_dir / test_case.file_path
+            # C5 fix: validate path stays within output directory
+            out_path = (self.output_dir / test_case.file_path).resolve()
+            if not out_path.is_relative_to(self.output_dir.resolve()):
+                log.warning("testgen_path_traversal_blocked", path=test_case.file_path)
+                continue
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(test_case.content)
             log.info("wrote_test", path=str(out_path))

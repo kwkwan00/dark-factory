@@ -62,7 +62,8 @@ def test_run_feature_swarm_includes_run_context() -> None:
 
     with patch("dark_factory.agents.swarm.set_current_feature"):
         mock_compiled = MagicMock()
-        mock_compiled.invoke.return_value = {"messages": []}
+        # run_feature_swarm now uses compiled.stream() — return an empty iterator
+        mock_compiled.stream.return_value = iter([])
 
         from dark_factory.agents.swarm import run_feature_swarm
 
@@ -71,11 +72,14 @@ def test_run_feature_swarm_includes_run_context() -> None:
             run_context="[PATTERN from payments] Always validate currency",
         )
 
-        call_args = mock_compiled.invoke.call_args[0][0]
+        call_args = mock_compiled.stream.call_args[0][0]
         msg = call_args["messages"][0]["content"]
         assert "Learnings from earlier features" in msg
         assert "Always validate currency" in msg
-        assert result["status"] == "success"
+        # C2 fix: an empty stream (no tool calls) is now reported as 'error'
+        # since the swarm didn't actually produce any code.
+        assert result["status"] == "error"
+        assert "without writing any code" in result["error"]
 
 
 def test_run_feature_swarm_respects_max_handoffs() -> None:
@@ -84,12 +88,12 @@ def test_run_feature_swarm_respects_max_handoffs() -> None:
 
     with patch("dark_factory.agents.swarm.set_current_feature"):
         mock_compiled = MagicMock()
-        mock_compiled.invoke.return_value = {"messages": []}
+        mock_compiled.stream.return_value = iter([])
 
         from dark_factory.agents.swarm import run_feature_swarm
 
         run_feature_swarm(mock_compiled, ["spec-1"], "auth", max_handoffs=25)
-        msg = mock_compiled.invoke.call_args[0][0]["messages"][0]["content"]
+        msg = mock_compiled.stream.call_args[0][0]["messages"][0]["content"]
         assert "25 handoffs" in msg
 
 
