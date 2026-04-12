@@ -55,7 +55,8 @@
       "Bash(xargs -I {} basename {})",
       "Bash(find /Users/kquon/ai-dark-factory/frontend/src/components -name \"*.tsx\" -exec wc -l {} +)",
       "Bash(find /Users/kquon/ai-dark-factory/.venv -name *.py)",
-      "Bash(python -m pytest tests/ -x -q)"
+      "Bash(python -m pytest tests/ -x -q)",
+      "Bash(ls:*)"
     ]
   }
 }

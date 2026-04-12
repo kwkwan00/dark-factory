@@ -1,7 +1,0 @@
-{% for spec in specs %}
-{% set outer = loop.index %}
-## {{ outer }}. {{ spec.title }}
-{% for criterion in spec.acceptance_criteria %}
-- [ ] {{ outer }}.{{ loop.index }} {{ criterion }}
-{% endfor %}
-{% endfor %}

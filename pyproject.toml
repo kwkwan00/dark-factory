@@ -3,7 +3,7 @@ name = "ai-dark-factory"
 version = "0.1.0"
 description = "Code generator that converts requirements into specs, populates a Neo4j knowledge graph, and generates application code with evaluation tests."
 authors = [
-    { name = "Kevin Quon", email = "kquon@nvisia.com" },
+    { name = "Kevin Quon" },
 ]
 requires-python = ">=3.12"
 dependencies = [

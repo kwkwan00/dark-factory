@@ -1,6 +1,6 @@
 # AI Dark Factory
 
-**Author:** Kevin Quon &lt;[kquon@nvisia.com](mailto:kquon@nvisia.com)&gt;
+**Author:** [Kevin Quon](https://www.linkedin.com/in/kwkwan00/)
 
 An autonomous code generation platform that converts requirements into specs, populates a knowledge graph, and generates production-quality application code through a multi-agent swarm pipeline with cross-feature reconciliation, procedural memory, and real-time observability.
 
@@ -12,8 +12,8 @@ Built as a **FastAPI backend + React SPA** with the [AG-UI protocol](https://doc
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                          React SPA (Vite)                            │
-│  Manufacture · Agent Logs · Metrics · Gap Finder · Memory · Settings │
+│                          React SPA (Vite)                                    │
+│  Manufacture · Agent Logs · Gap Finder · Memory · Metrics · Settings · About │
 └──────────────────────┬───────────────────────────────────────────────┘
                        │  AG-UI SSE events  +  REST
 ┌──────────────────────▼───────────────────────────────────────────────┐
@@ -148,22 +148,20 @@ max_parallel_specs = 4             # spec generation workers
 max_parallel_features = 4          # codegen swarm workers per layer
 max_spec_handoffs = 5              # generate → evaluate → refine iterations
 max_codegen_handoffs = 50          # planner↔coder↔reviewer↔tester transitions
-max_specs_per_requirement = 16     # hard cap on planner output
-enable_spec_decomposition = true
-reuse_existing_specs = true
-spec_eval_threshold = 0.75
-max_reconciliation_turns = 50      # Phase 5 SDK max_turns
-reconciliation_timeout_seconds = 1800
-requirement_dedup_threshold = 0.90 # cosine similarity for semantic dedup
-enable_e2e_validation = true       # Phase 6 Playwright cross-browser tests
-max_e2e_turns = 40
-e2e_timeout_seconds = 1200
-e2e_browsers = ["chromium", "firefox", "webkit"]
+spec_eval_threshold = 0.8
 
-[evaluation]
-eval_model = "gpt-5.4"
-base_threshold = 0.5
-adaptive = true
+[openspec]
+root_dir = "./openspec"
+
+[memory]
+database = "neo4j"                 # "memory" for Neo4j Enterprise multi-db
+enabled = true
+
+[watch]
+enabled = false
+paths = ["./openspec/specs"]
+debounce_seconds = 5
+auto_run = true
 
 [qdrant]
 url = "http://localhost:6333"
@@ -171,26 +169,17 @@ collection_prefix = "dark_factory"
 embedding_model = "text-embedding-3-large"
 enabled = true
 
-[memory]
-database = "memory"
-enabled = true
-
-[postgres]
-enabled = false                    # turn on for forensic metrics store
-url = "postgresql://..."
-
-[watch]
-enabled = false
-paths = ["./openspec/specs"]
-debounce_seconds = 5
-auto_run = false
+[evaluation]
+base_threshold = 0.5
+adaptive = true
+decay_factor = 0.95
 
 [logging]
 level = "INFO"
 format = "console"
 ```
 
-All pipeline fields can be tuned live from the Settings tab without a restart.
+All pipeline fields can be tuned live from the Settings tab without a restart. Additional pipeline settings (`max_codegen_handoffs`, `max_specs_per_requirement`, `enable_spec_decomposition`, `reuse_existing_specs`, `max_reconciliation_turns`, `reconciliation_timeout_seconds`, `requirement_dedup_threshold`, `enable_e2e_validation`, `max_e2e_turns`, `e2e_timeout_seconds`, `e2e_browsers`, `enable_episodic_memory`, `memory_dedup_threshold`) are set via environment variables or the Settings tab — see `.env.example` for the full list.
 
 ---
 
@@ -247,7 +236,7 @@ This phase is **best-effort**: failures, timeouts, or crashes never fail the pip
 
 ### Phase 6 — End-to-End Validation
 
-`E2EValidationStage` runs a second clean-context Claude Agent SDK invocation after reconciliation returns anything other than `error`. Its job is to verify the generated application actually runs in a real browser across a matrix of engines. The agent follows another six-step checklist:
+`E2EValidationStage` runs a second clean-context Claude Agent SDK invocation after reconciliation completes with a `clean` status. The gate is strict: `partial`, `error`, or `skipped` reconciliation statuses all skip E2E validation, and a skip-reason text event is emitted to the Agent Log so operators see exactly why. Its job is to verify the generated application actually runs in a real browser across a matrix of engines. The agent follows another six-step checklist:
 
 1. **Detect** whether the output is a web app (package manifests, Dockerfile ports, HTML entry points, framework markers). If not, write `Overall status: skipped` and stop.
 2. **Install** `@playwright/test`. Browser binaries for `chromium`, `firefox`, and `webkit` are **pre-installed in the Docker image** at `/ms-playwright`, so no browser download is needed at runtime.
@@ -264,12 +253,23 @@ Per-browser test counts are fanned out to `dark_factory_e2e_tests_total{browser,
 
 | Tab              | What it shows                                                      |
 |------------------|--------------------------------------------------------------------|
-| **Manufacture**  | Run launcher (path input or drag-and-drop), cancel button, run history sidebar, per-run detail popup (Metrics / Output / Evaluations) |
-| **Agent Logs**   | Real-time ring buffer of ~2000 AG-UI progress events, color-coded by layer / feature / agent / decision / handoff / tool call |
-| **Metrics**      | 15 dashboards: summary KPIs, eval trends, LLM cost breakdown, per-run stats, quality, throughput, incidents, tool calls, memory activity, decomposition, artifacts, background loop sampler |
+| **Manufacture**  | Run launcher (path input or drag-and-drop upload), cancel button, always-visible run history (10 most recent with datetime started, status, pass rate, duration), per-run detail popup |
+| **Agent Logs**   | Real-time ring buffer of ~2000 AG-UI progress events, color-coded badges by layer / feature / agent / decision / handoff / tool call / spec / eval, with pause/resume/clear, auto-scroll, and text filter |
 | **Gap Finder**   | Neo4j-powered gap detection — unplanned requirements, stale specs, specs without artifacts, failing evaluations, with priority badges |
 | **Agent Memory** | Browse procedural memory (Pattern / Mistake / Solution / Strategy) with search + filters |
-| **Settings**     | Live-mutable pipeline config — parallelism, handoff limits, reconciliation, spec decomposition, model selection + API key overrides, service health, file watcher control, danger-zone clear-all |
+| **Metrics**      | 17 dashboards: summary KPIs, eval trends, LLM cost breakdown, per-run stats, quality, throughput, incidents, tool calls, memory activity, decomposition, artifacts, background loop sampler, episodic memory, memory graph |
+| **Settings**     | Live-mutable pipeline config — parallelism, handoff limits, reconciliation, spec decomposition, E2E validation, model selection + API key overrides, service health, file watcher control, danger-zone clear-all |
+| **About**        | Architecture whitepaper with interactive React Flow diagrams (system topology, pipeline, swarm mechanics, memory, observability, cancellation), design philosophy, business value, data model reference, extensibility guide |
+
+**Run Detail popup** (opens from run history) has five tabs:
+
+| Tab              | What it shows                                                      |
+|------------------|--------------------------------------------------------------------|
+| **Metrics**      | Status, pass rate, duration, spec/feature counts, LLM cost, incidents, eval metrics (with spec ID, requirement, type, reason), tool calls, artifacts, decomposition |
+| **Agent Log**    | Historical progress events for the run — same color-coded badge layout as the main Agent Logs tab, with text filter and expandable JSON payload detail per event |
+| **Evaluations**  | Per-spec evaluation tree with requirements, metric scores, attempt history |
+| **Output**       | File explorer for generated code/artifacts with syntax highlighting |
+| **Episodes**     | Episodic memory timeline — feature narratives, outcomes, key turning-point events, eval scores |
 
 ---
 
@@ -296,13 +296,43 @@ Per-browser test counts are fanned out to `dark_factory_e2e_tests_total{browser,
 | GET    | `/api/graph/gaps`        | Gap finder output                                 |
 | GET    | `/api/settings`          | Current pipeline settings                         |
 | PATCH  | `/api/settings`          | Update pipeline settings at runtime               |
-| POST   | `/api/watch/start|stop`  | File watcher controls                             |
+| POST   | `/api/watch/start`       | Start file watcher                                |
+| POST   | `/api/watch/stop`        | Stop file watcher                                 |
+| GET    | `/api/watch/status`      | Current watcher status                            |
 | GET    | `/api/watch/events`      | SSE stream of file system events                  |
 | POST   | `/api/upload`            | Drag-and-drop file upload — native + rich formats, 25 MB/file, 150 MB/upload, 24h TTL |
 
 ### Metrics
 
-15 endpoints under `/api/metrics/` covering summary KPIs, eval trends, LLM usage + cost, swarm features, quality, throughput, incidents, agent stats, tool calls, memory activity, decomposition, artifacts, and the background loop sampler.
+17 endpoints under `/api/metrics/`:
+
+| Method | Path                               | Purpose                                    |
+|--------|------------------------------------|--------------------------------------------|
+| GET    | `/api/metrics/summary`             | Overview KPIs (runs, LLM calls, evals, incidents) |
+| GET    | `/api/metrics/runs`                | Recent runs (paginated)                    |
+| GET    | `/api/metrics/runs/{run_id}`       | Full metrics detail for a specific run (includes eval metrics, progress log, tool calls, artifacts, decomposition, incidents) |
+| GET    | `/api/metrics/eval_trend`          | Evaluation metric trends over time         |
+| GET    | `/api/metrics/llm_usage`           | LLM usage grouped by model/phase/client    |
+| GET    | `/api/metrics/swarm_features`      | Feature swarm statistics                   |
+| GET    | `/api/metrics/cost_rollup`         | Cost aggregation                           |
+| GET    | `/api/metrics/throughput`          | Throughput over N days                     |
+| GET    | `/api/metrics/quality`             | Quality metrics                            |
+| GET    | `/api/metrics/incidents`           | Incident log (filterable by category)      |
+| GET    | `/api/metrics/agent_stats`         | Per-agent statistics for a run             |
+| GET    | `/api/metrics/tool_calls`          | Tool invocation stats (by tool/agent/feature) |
+| GET    | `/api/metrics/memory_activity`     | Memory node creation/update activity       |
+| GET    | `/api/metrics/decomposition`       | Spec decomposition metrics                 |
+| GET    | `/api/metrics/artifacts`           | Generated artifact summary by language     |
+| GET    | `/api/metrics/memory`              | Procedural memory graph observability      |
+| GET    | `/api/metrics/episodes/{run_id}`   | Episodic memory timeline for a run         |
+| GET    | `/api/metrics/background_loop`     | Background loop health metrics             |
+
+### Models
+
+| Method | Path                   | Purpose                                            |
+|--------|------------------------|----------------------------------------------------|
+| POST   | `/api/models/anthropic`| Configure Anthropic LLM provider                   |
+| POST   | `/api/models/openai`   | Configure OpenAI LLM provider                      |
 
 ### Runs
 
@@ -330,13 +360,15 @@ Required:
 Optional:
 
 - `QDRANT_URL`, `QDRANT_API_KEY` — vector database (fallback to Neo4j if unreachable)
-- `POSTGRES_ENABLED`, `POSTGRES_URL`, `POSTGRES_PASSWORD` — forensic metrics store
+- `POSTGRES_ENABLED`, `POSTGRES_URL`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` — forensic metrics store
 - `PROMETHEUS_ENABLED` — in-process metrics (default on)
 - `GRAFANA_USER`, `GRAFANA_PASSWORD` — dashboard auth (change from admin/admin in production)
 - `DEEP_AGENT_TIMEOUT_SECONDS` — default ceiling for Claude Agent SDK calls (default 600s)
+- `DEEP_AGENT_DEBUG_STDERR` — enable `--debug-to-stderr` on the Claude Agent SDK Node CLI subprocess for verbose diagnostics when investigating silent crashes (default off)
+- `EVAL_MODEL` — override the DeepEval judge model (default `gpt-5.4`)
 - `MAX_PARALLEL_FEATURES`, `MAX_PARALLEL_SPECS`, `MAX_SPEC_HANDOFFS`, `MAX_CODEGEN_HANDOFFS`, `SPEC_EVAL_THRESHOLD`, `ENABLE_SPEC_DECOMPOSITION`, `MAX_SPECS_PER_REQUIREMENT`, `MAX_RECONCILIATION_TURNS`, `RECONCILIATION_TIMEOUT_SECONDS`, `REQUIREMENT_DEDUP_THRESHOLD`, `ENABLE_E2E_VALIDATION`, `MAX_E2E_TURNS`, `E2E_TIMEOUT_SECONDS`, `E2E_BROWSERS`, `ENABLE_EPISODIC_MEMORY`, `MEMORY_DEDUP_THRESHOLD` — pipeline tuning overrides
 
-See `.env.example` for the full list.
+See `.env.example` for the full list with descriptions.
 
 ---
 
@@ -352,7 +384,7 @@ After all input files are parsed, `IngestStage` runs a **semantic deduplication 
 
 ### Cross-browser E2E validation (Phase 6)
 
-After reconciliation finishes cleanly, `E2EValidationStage` spawns a dedicated Claude Agent SDK session that runs **Playwright smoke tests across `chromium`, `firefox`, and `webkit`** by default. The agent detects whether the run produced a web app, generates minimal tests from the specs' acceptance criteria, starts the server in the background, runs the suite across the full browser matrix, and writes `E2E_REPORT.md` plus a browsable Playwright HTML report + failure screenshots under `e2e_artifacts/`. Browser binaries are **bundled in the Docker image** (via `npx playwright install --with-deps chromium firefox webkit`) so no runtime download is needed. Per-browser test counts feed the `dark_factory_e2e_tests_total{browser, status}` Prometheus counter for precise flake attribution. Like reconciliation, E2E is best-effort — crashes are recorded as incidents and swallowed.
+After reconciliation finishes with a `clean` status, `E2EValidationStage` spawns a dedicated Claude Agent SDK session that runs **Playwright smoke tests across `chromium`, `firefox`, and `webkit`** by default. The agent detects whether the run produced a web app, generates minimal tests from the specs' acceptance criteria, starts the server in the background, runs the suite across the full browser matrix, and writes `E2E_REPORT.md` plus a browsable Playwright HTML report + failure screenshots under `e2e_artifacts/`. Browser binaries are **bundled in the Docker image** (via `npx playwright install --with-deps chromium firefox webkit`) so no runtime download is needed. Per-browser test counts feed the `dark_factory_e2e_tests_total{browser, status}` Prometheus counter for precise flake attribution. Like reconciliation, E2E is best-effort — crashes are recorded as incidents and swallowed.
 
 ### Procedural memory (Neo4j + Qdrant)
 
@@ -368,7 +400,7 @@ Agents learn from past runs via a dedicated memory database with both **semantic
 
 **Semantic memory** (Pattern / Mistake / Solution / Strategy) answers *"what should I do?"* with generalised lessons. Feedback loop: eval pass → boost recalled memories; eval fail → demote. Relevance decays 5% each run. Cross-feature learnings are briefed to subsequent features **within the same run**.
 
-**Episodic memory** answers *"what happened last time I was in this exact situation?"* After every feature swarm completes, the orchestrator spins up a small LLM call to synthesise a 200-word narrative summary plus 3–8 key turning-point events, embeds the result with `text-embedding-3-large`, and writes it to both Neo4j (`Episode` node with `PRODUCED_IN` edge to its Run) and Qdrant (`dark_factory_episodes` collection). Planners call `recall_episodes` at the start of every feature to retrieve ranked past trajectories — if an earlier run succeeded with a specific approach, the current run biases toward it; if it failed a particular way, the current run avoids the same mode. Hybrid RRF merge between Neo4j keyword match and Qdrant vector match mirrors the existing `recall_memories` architecture. Episodes are surfaced in the Run Detail popup's Episodes tab alongside Metrics / Evaluations / Output.
+**Episodic memory** answers *"what happened last time I was in this exact situation?"* After every feature swarm completes, the orchestrator spins up a small LLM call to synthesise a 200-word narrative summary plus 3–8 key turning-point events, embeds the result with `text-embedding-3-large`, and writes it to both Neo4j (`Episode` node with `PRODUCED_IN` edge to its Run) and Qdrant (`dark_factory_episodes` collection). Planners call `recall_episodes` at the start of every feature to retrieve ranked past trajectories — if an earlier run succeeded with a specific approach, the current run biases toward it; if it failed a particular way, the current run avoids the same mode. Hybrid RRF merge between Neo4j keyword match and Qdrant vector match mirrors the existing `recall_memories` architecture. Episodes are surfaced in the Run Detail popup's Episodes tab alongside Metrics, Agent Log, Evaluations, and Output.
 
 Episodic memory costs ~1k LLM tokens per feature for the summarisation pass — toggle off via `enable_episodic_memory` if you're running single-shot features that never recur.
 
@@ -387,9 +419,19 @@ Three improvements keep the memory graph clean and the recall path sharp:
 - **Grafana** ships with provisioned datasources and dashboards for pipeline throughput, cost rollups, and error budgets.
 - **Incident table** surfaces errors, warnings, and reconciliation issues in the Run Detail popup with stack traces.
 
+### Deep agent resilience
+
+The Claude Agent SDK subprocess can crash silently (OOM, Node segfault, network timeout) with no useful stderr. Three layers of defense:
+
+1. **`_safe_tool_deep_agent`** — a wrapper used by all 9 `@tool`-decorated deep-agent functions (codegen, dependency analysis, risk assessment, security review, performance review, spec compliance review, unit/integration/edge-case test gen). Catches `Exception` and returns a structured error string instead of crashing the feature swarm. Non-tool callers (reconciliation, doc extraction, E2E validation) still see the exception for their own error handling.
+2. **Stderr capture** — every SDK invocation buffers up to 200 lines / 16 KiB of subprocess stderr via a callback. When a crash occurs, the tail is logged alongside the incident for diagnostics.
+3. **`DEEP_AGENT_DEBUG_STDERR`** — when set to `1`/`true`, the underlying Node CLI is spawned with `--debug-to-stderr` so it emits startup, transport, and protocol-state lines. Operators flip this on while investigating silent exits to see what the subprocess was doing before it died.
+
+A source-level regression test (`test_all_tool_decorated_deep_agents_use_safe_wrapper`) verifies that every `@tool` function using `_run_deep_agent` actually calls `_safe_tool_deep_agent`, preventing future tools from bypassing the safety wrapper.
+
 ### Cooperative cancellation
 
-A module-level `threading.Event` is polled at hot-path checkpoints across all five phases. `POST /api/agent/cancel` sets the flag; the pipeline raises `PipelineCancelled` at the next checkpoint, runs the `finally` cleanup, and emits a clean `cancelled` status (not a generic error). The flag auto-resets at the start of every run to prevent bleed.
+A module-level `threading.Event` is polled at hot-path checkpoints across all six phases. `POST /api/agent/cancel` sets the flag; the pipeline raises `PipelineCancelled` at the next checkpoint, runs the `finally` cleanup, and emits a clean `cancelled` status (not a generic error). The flag auto-resets at the start of every run to prevent bleed.
 
 ### File watcher
 
@@ -450,14 +492,27 @@ src/dark_factory/
 
 frontend/
 ├── src/
-│   ├── App.tsx            # Tab routing + layout
-│   ├── api/client.ts      # AG-UI HttpAgent + REST client
-│   ├── components/*Tab.tsx
-│   ├── hooks/             # useAgentRun, useDashboard, ...
+│   ├── App.tsx              # Tab routing + layout (7 tabs)
+│   ├── api/client.ts        # AG-UI HttpAgent + REST client
+│   ├── components/
+│   │   ├── ManufactureTab.tsx    # Run launcher + history + detail popup
+│   │   ├── AgentLogsTab.tsx      # Real-time SSE event stream
+│   │   ├── GapFinderTab.tsx      # Neo4j gap detection
+│   │   ├── AgentMemoryTab.tsx    # Procedural memory browser
+│   │   ├── MetricsTab.tsx        # 17 metrics dashboards
+│   │   ├── SettingsTab.tsx       # Live config + health + admin
+│   │   ├── AboutTab.tsx          # Architecture whitepaper
+│   │   └── RunDetailWindow.tsx   # Per-run popup (5 tabs)
+│   ├── contexts/
+│   │   └── ManufactureContext.tsx # State preserved across tab switches
+│   ├── hooks/               # useAgentRun, useDashboard, ...
+│   ├── lib/
+│   │   ├── agentLogFormat.ts     # Shared event badge/formatting (live + historical)
+│   │   └── openRunDetail.ts      # Run detail window opener
 │   └── main.tsx
 └── vite.config.ts
 
-tests/                      # 595 tests across 36 files
+tests/                        # 635 tests across 38 files
 ```
 
 ---
@@ -465,7 +520,7 @@ tests/                      # 595 tests across 36 files
 ## Development
 
 ```bash
-# Run the full test suite (595 tests)
+# Run the full test suite (635 tests)
 uv run pytest tests/ -v
 
 # Fast subset (skip integration + slow tests)
@@ -502,7 +557,7 @@ This system operates at **L4 (Fully Autonomous / Explorer)** on the [Vellum agen
 
 ## Author
 
-**Kevin Quon** &lt;[kquon@nvisia.com](mailto:kquon@nvisia.com)&gt;
+**[Kevin Quon](https://www.linkedin.com/in/kwkwan00/)**
 
 ---
 
