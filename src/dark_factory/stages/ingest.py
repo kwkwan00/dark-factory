@@ -75,28 +75,9 @@ class _RequirementList(BaseModel):
     requirements: list[_ExtractedRequirement]
 
 
-_SPLITTER_SYSTEM_PROMPT = """\
-You are a senior requirements analyst. You extract DISCRETE, TESTABLE features \
-from product requirements documents.
+from dark_factory.prompts import get_prompt
 
-Each extracted requirement must be:
-- Atomic: a single feature, user story, or capability (not a group)
-- Testable: concrete enough that acceptance criteria can be written
-- Independent: can be understood and implemented without reference to other items
-- Scoped: focused on one behavior, not a whole subsystem
-
-When a document contains tables, numbered lists, or user stories, extract each \
-row/item as its own requirement. When a document describes a single large \
-feature, split it into its logical sub-components.
-
-Do NOT extract:
-- Section headers that are just labels
-- Metadata (version, author, date)
-- Goals or non-goals (these are context, not requirements)
-- Success metrics (these are measurements, not requirements)
-- Open questions or future considerations
-
-Return ALL discrete requirements in the document."""
+_SPLITTER_SYSTEM_PROMPT = get_prompt("ingest_splitter", "system")
 
 
 class IngestStage(Stage):
@@ -360,15 +341,9 @@ class IngestStage(Stage):
             content = content[:MAX_SPLIT_INPUT_CHARS]
             truncated = True
 
-        prompt = (
-            f"Extract every discrete, testable requirement from the following "
-            f"document. Each requirement must be atomic (one feature per entry). "
-            f"If the document contains a requirements table or numbered list, "
-            f"each row/item becomes its own requirement.\n\n"
-            f"Document:\n{content}"
-        )
+        prompt = get_prompt("ingest_splitter", "user").format(content=content)
         if truncated:
-            prompt += "\n\n(Note: document was truncated; extract what is visible.)"
+            prompt += get_prompt("ingest_splitter", "user_truncated_suffix")
 
         result = self.llm.complete_structured(
             prompt=prompt,

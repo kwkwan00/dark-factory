@@ -11,7 +11,18 @@ database = "neo4j"
 
 [llm]
 provider = "anthropic"         # "anthropic" | "langchain" | "claude-agent" (via Claude Agent SDK)
-model = "claude-sonnet-4-6"
+model = "claude-sonnet-4-6"    # default model — used when no per-role override is set
+
+[model_routing]
+# Per-role model overrides. Omit or leave empty to use the default [llm] model.
+# planner = "claude-haiku-4-5-20251001"     # fast model for planning
+# coder = "claude-sonnet-4-6"               # balanced for code generation
+# reviewer = "claude-sonnet-4-6"            # balanced for code review
+# tester = "claude-sonnet-4-6"              # balanced for test generation
+# deep_analysis = "claude-haiku-4-5-20251001"  # fast for read-only analysis
+# deep_codegen = "claude-sonnet-4-6"           # balanced for agentic codegen
+# spec = "claude-sonnet-4-6"                   # spec generation stage
+# ingest = "claude-haiku-4-5-20251001"         # fast for requirement extraction
 
 [pipeline]
 output_dir = "./output"

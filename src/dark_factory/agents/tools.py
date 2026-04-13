@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any
 
 from langchain_core.tools import tool
 
+from dark_factory.prompts import get_prompt
+
 if TYPE_CHECKING:
     from dark_factory.graph.repository import GraphRepository
     from dark_factory.memory.repository import MemoryRepository
@@ -27,6 +29,7 @@ _memory_repo: MemoryRepository | None = None
 _current_run_id: str = ""
 _eval_config: Any = None  # EvaluationConfig, lazy to avoid circular import
 _vector_repo: Any = None  # VectorRepository, lazy to avoid circular import
+_run_storage: Any = None  # RunStorage | None — durable storage for the active run
 
 # Progress broker for global fan-out to any subscribers (Run tab bridge,
 # Agent Logs tab stream). Accessed from worker threads during swarm execution.
@@ -92,6 +95,17 @@ def set_graph_repo(repo: GraphRepository) -> None:
 def set_output_dir(path: str | Path) -> None:
     global _output_dir
     _output_dir = Path(path)
+
+
+def set_run_storage(rs: Any) -> None:
+    """Install the RunStorage for the active pipeline run."""
+    global _run_storage
+    _run_storage = rs
+
+
+def get_run_storage() -> Any:
+    """Return the active RunStorage, or None."""
+    return _run_storage
 
 
 def set_openspec_root(path: str | Path) -> None:
@@ -271,6 +285,14 @@ def write_file(file_path: str, content: str) -> str:
         feature=feature,
         bytes_written=len(content.encode("utf-8")),
     )
+    # Dual-write: persist to durable storage alongside the local scratch.
+    rs = _run_storage
+    if rs is not None:
+        try:
+            storage_path = f"{feature}/{file_path}" if feature else file_path
+            rs.write_output(storage_path, content)
+        except Exception:
+            pass  # Best-effort — local write already succeeded
     return str(out)
 
 
@@ -568,6 +590,117 @@ def _safe_tool_deep_agent(
         )
 
 
+# ── Direct API helpers (replacing Claude Agent SDK for @tool calls) ──
+
+
+def _resolve_deep_model(role: str) -> str | None:
+    """Resolve model for a deep agent role from routing config, or None for default."""
+    try:
+        from dark_factory.config import load_settings
+        settings = load_settings()
+        override = settings.model_routing.resolve(role, settings.llm.model)
+        return override
+    except Exception:
+        return None
+
+
+def _safe_llm_complete(prompt: str, timeout_seconds: float | None = None) -> str:
+    """Call ``AnthropicClient.complete()`` for read-only analysis tools.
+
+    Same error-catching contract as :func:`_safe_tool_deep_agent`: returns
+    an error string on failure instead of raising, so the calling LangGraph
+    agent can keep going.
+    """
+    try:
+        from dark_factory.llm.anthropic import AnthropicClient
+
+        model = _resolve_deep_model("deep_analysis")
+        client = AnthropicClient(model=model) if model else AnthropicClient()
+        return client.complete(
+            prompt, timeout_seconds=timeout_seconds or DEEP_AGENT_TIMEOUT_SECONDS
+        )
+    except Exception as exc:
+        log.error("deep_analysis_failed", error=str(exc))
+        try:
+            from dark_factory.metrics.helpers import record_incident
+
+            record_incident(
+                category="llm",
+                severity="error",
+                message=f"Deep analysis failed: {exc}",
+                phase="deep_agent",
+                feature=get_current_feature() or None,
+            )
+        except Exception:
+            pass
+        return (
+            f"Error: analysis failed: {exc}. "
+            f"This call was best-effort; continue with the rest of the "
+            f"workflow using any partial results you already have."
+        )
+
+
+def _safe_agentic_call(
+    prompt: str,
+    allowed_tools: list[str],
+    max_turns: int = 20,
+    timeout_seconds: float | None = None,
+) -> str:
+    """Run a multi-turn agentic tool-use loop via direct Anthropic API.
+
+    Same error-catching contract as :func:`_safe_tool_deep_agent`: returns
+    an error string on failure instead of raising.
+    """
+    try:
+        from dark_factory.llm.agentic import run_agentic_loop
+
+        sandbox = (_output_dir or Path("./output")).resolve()
+        feature = get_current_feature()
+        if feature:
+            candidate = sandbox / feature
+            if candidate.exists():
+                sandbox = candidate
+
+        def _on_turn(turn: int, max_turns: int, tool_names: list[str], text_preview: str) -> None:
+            emit_progress(
+                "deep_agent_turn",
+                feature=feature or None,
+                turn=turn,
+                max_turns=max_turns,
+                tools=tool_names or None,
+                text=text_preview or None,
+            )
+
+        return run_agentic_loop(
+            prompt=prompt,
+            allowed_tools=allowed_tools,
+            sandbox_root=sandbox,
+            max_turns=max_turns,
+            timeout_seconds=timeout_seconds or DEEP_AGENT_TIMEOUT_SECONDS,
+            model=_resolve_deep_model("deep_codegen"),
+            on_turn=_on_turn,
+        )
+    except Exception as exc:
+        log.error("deep_agentic_failed", error=str(exc), tools=allowed_tools)
+        try:
+            from dark_factory.metrics.helpers import record_incident
+
+            record_incident(
+                category="llm",
+                severity="error",
+                message=f"Agentic call failed: {exc}",
+                phase="deep_agent",
+                feature=get_current_feature() or None,
+            )
+        except Exception:
+            pass
+        return (
+            f"Error: agentic call (tools={allowed_tools}) failed: {exc}. "
+            f"This call was best-effort; continue with the rest of the "
+            f"workflow using any partial results you already have."
+        )
+
+
 # ── Coder deep agent ─────────────────────────────────────────────────
 
 
@@ -577,14 +710,10 @@ def claude_agent_codegen(spec_context: str, instructions: str) -> str:
     file editing, shell, and search capabilities. Provide the spec context
     and any specific instructions (e.g. fix feedback). Returns the agent's
     output describing what was generated."""
-    prompt = (
-        f"Generate production-quality code based on this specification:\n\n"
-        f"{spec_context}\n\n"
-        f"Instructions: {instructions}\n\n"
-        f"Write all files to the current working directory. Use Read/Write/Edit "
-        f"tools to create well-structured code."
+    prompt = get_prompt("deep_codegen", "user").format(
+        spec_context=spec_context, instructions=instructions,
     )
-    return _safe_tool_deep_agent(prompt, ["Read", "Write", "Edit", "Glob", "Grep", "Bash"], max_turns=25)
+    return _safe_agentic_call(prompt, ["Read", "Write", "Edit", "Glob", "Grep", "Bash"], max_turns=25)
 
 
 # ── Planner deep agents ──────────────────────────────────────────────
@@ -596,17 +725,10 @@ def deep_dependency_analysis(spec_ids_json: str, feature_name: str, relevant_mem
     Pass relevant_memories from recall_memories to give the subagent context about
     past dependency issues."""
     context_block = f"\n\nRelevant memories from past runs:\n{relevant_memories}" if relevant_memories else ""
-    prompt = (
-        f"Analyze the dependency tree for feature '{feature_name}'.\n"
-        f"Spec IDs: {spec_ids_json}\n\n"
-        f"Trace all transitive DEPENDS_ON relationships. Look for:\n"
-        f"- Circular dependency risks\n"
-        f"- Missing dependencies (specs that reference unknown IDs)\n"
-        f"- Optimal execution order based on the dependency graph\n"
-        f"{context_block}\n"
-        f"Return a structured dependency report."
+    prompt = get_prompt("deep_dependency_analysis", "user").format(
+        feature_name=feature_name, spec_ids_json=spec_ids_json, context_block=context_block,
     )
-    return _safe_tool_deep_agent(prompt, ["Read", "Glob", "Grep"], max_turns=10)
+    return _safe_llm_complete(prompt)
 
 
 @tool
@@ -619,17 +741,10 @@ def deep_risk_assessment(feature_name: str, spec_context: str, relevant_memories
         context_block += f"\n\nRelevant memories from past runs:\n{relevant_memories}"
     if eval_history:
         context_block += f"\n\nEval history for this feature:\n{eval_history}"
-    prompt = (
-        f"Assess risks for feature '{feature_name}'.\n\n"
-        f"Spec context:\n{spec_context}\n\n"
-        f"Check for patterns that historically caused issues:\n"
-        f"- Complex dependency chains\n"
-        f"- Specs touching security-sensitive areas\n"
-        f"- Features similar to past failures\n"
-        f"{context_block}\n"
-        f"Rate overall risk as low/medium/high with detailed reasoning."
+    prompt = get_prompt("deep_risk_assessment", "user").format(
+        feature_name=feature_name, spec_context=spec_context, context_block=context_block,
     )
-    return _safe_tool_deep_agent(prompt, ["Read", "Glob", "Grep"], max_turns=10)
+    return _safe_llm_complete(prompt)
 
 
 # ── Reviewer deep agents ─────────────────────────────────────────────
@@ -640,20 +755,10 @@ def deep_security_review(code_content: str, spec_context: str, relevant_memories
     """Spawn a deep agent for focused security analysis. Pass relevant_memories
     from recall_memories (especially past security mistakes) for richer context."""
     context_block = f"\n\nPast security-related memories:\n{relevant_memories}" if relevant_memories else ""
-    prompt = (
-        f"Perform a thorough security review of this code:\n\n"
-        f"```\n{code_content}\n```\n\n"
-        f"Spec context:\n{spec_context}\n\n"
-        f"Check for:\n"
-        f"- SQL/command/XSS injection vulnerabilities\n"
-        f"- Authentication and authorization gaps\n"
-        f"- Sensitive data exposure\n"
-        f"- Input validation gaps\n"
-        f"- OWASP Top 10 risks\n"
-        f"{context_block}\n"
-        f"Return findings with severity ratings and fix recommendations."
+    prompt = get_prompt("deep_security_review", "user").format(
+        code_content=code_content, spec_context=spec_context, context_block=context_block,
     )
-    return _safe_tool_deep_agent(prompt, ["Read", "Glob", "Grep"], max_turns=15)
+    return _safe_llm_complete(prompt)
 
 
 @tool
@@ -661,20 +766,10 @@ def deep_performance_review(code_content: str, spec_context: str, relevant_memor
     """Spawn a deep agent for focused performance analysis. Pass relevant_memories
     from recall_memories (especially past performance mistakes) for richer context."""
     context_block = f"\n\nPast performance-related memories:\n{relevant_memories}" if relevant_memories else ""
-    prompt = (
-        f"Analyze this code for performance issues:\n\n"
-        f"```\n{code_content}\n```\n\n"
-        f"Spec context:\n{spec_context}\n\n"
-        f"Check for:\n"
-        f"- Poor algorithmic complexity (O(n^2) or worse where avoidable)\n"
-        f"- Resource leaks (unclosed connections, file handles)\n"
-        f"- Unnecessary memory allocations\n"
-        f"- Blocking I/O in async code paths\n"
-        f"- Missing caching opportunities\n"
-        f"{context_block}\n"
-        f"Return findings with impact ratings and optimization suggestions."
+    prompt = get_prompt("deep_performance_review", "user").format(
+        code_content=code_content, spec_context=spec_context, context_block=context_block,
     )
-    return _safe_tool_deep_agent(prompt, ["Read", "Glob", "Grep"], max_turns=15)
+    return _safe_llm_complete(prompt)
 
 
 @tool
@@ -682,19 +777,10 @@ def deep_spec_compliance_review(code_content: str, acceptance_criteria_json: str
     """Spawn a deep agent that checks code against each acceptance criterion.
     Pass eval_history from query_eval_history to show which criteria failed before."""
     context_block = f"\n\nPast eval results for this spec:\n{eval_history}" if eval_history else ""
-    prompt = (
-        f"Verify this code against each acceptance criterion.\n\n"
-        f"Code:\n```\n{code_content}\n```\n\n"
-        f"Acceptance criteria (JSON array):\n{acceptance_criteria_json}\n\n"
-        f"For EACH criterion:\n"
-        f"1. State the criterion\n"
-        f"2. Find the code that implements it (quote the relevant lines)\n"
-        f"3. Rate: PASS or FAIL\n"
-        f"4. If FAIL, explain what's missing or incorrect\n"
-        f"{context_block}\n"
-        f"Return a structured checklist."
+    prompt = get_prompt("deep_spec_compliance", "user").format(
+        code_content=code_content, acceptance_criteria_json=acceptance_criteria_json, context_block=context_block,
     )
-    return _safe_tool_deep_agent(prompt, ["Read", "Glob", "Grep"], max_turns=15)
+    return _safe_llm_complete(prompt)
 
 
 # ── Tester deep agents ───────────────────────────────────────────────
@@ -705,20 +791,10 @@ def deep_unit_test_gen(code_content: str, spec_context: str, relevant_memories: 
     """Spawn a deep agent for unit test generation. Pass relevant_memories from
     recall_memories to inform the subagent about past testing patterns and pitfalls."""
     context_block = f"\n\nRelevant testing memories:\n{relevant_memories}" if relevant_memories else ""
-    prompt = (
-        f"Generate comprehensive unit tests for this code:\n\n"
-        f"```\n{code_content}\n```\n\n"
-        f"Spec context:\n{spec_context}\n\n"
-        f"Requirements:\n"
-        f"- Test each function/method independently\n"
-        f"- Mock all external dependencies\n"
-        f"- Cover happy paths, error paths, and boundary conditions\n"
-        f"- Use descriptive test names that explain the scenario\n"
-        f"- Write the test file to disk using Write tool\n"
-        f"{context_block}\n"
-        f"Return the complete test code."
+    prompt = get_prompt("deep_unit_test_gen", "user").format(
+        code_content=code_content, spec_context=spec_context, context_block=context_block,
     )
-    return _safe_tool_deep_agent(prompt, ["Read", "Write", "Edit", "Glob", "Grep"], max_turns=20)
+    return _safe_agentic_call(prompt, ["Read", "Write", "Edit", "Glob", "Grep"], max_turns=20)
 
 
 @tool
@@ -726,20 +802,10 @@ def deep_integration_test_gen(code_content: str, spec_context: str, relevant_mem
     """Spawn a deep agent for integration test generation. Pass relevant_memories
     from recall_memories to inform about past integration issues."""
     context_block = f"\n\nRelevant integration memories:\n{relevant_memories}" if relevant_memories else ""
-    prompt = (
-        f"Generate integration tests for this code:\n\n"
-        f"```\n{code_content}\n```\n\n"
-        f"Spec context:\n{spec_context}\n\n"
-        f"Requirements:\n"
-        f"- Test cross-module interactions\n"
-        f"- Test API endpoints end-to-end if applicable\n"
-        f"- Test database interactions if applicable\n"
-        f"- Verify behavior matches the spec's WHEN/THEN scenarios\n"
-        f"- Write the test file to disk using Write tool\n"
-        f"{context_block}\n"
-        f"Return the complete test code."
+    prompt = get_prompt("deep_integration_test_gen", "user").format(
+        code_content=code_content, spec_context=spec_context, context_block=context_block,
     )
-    return _safe_tool_deep_agent(prompt, ["Read", "Write", "Edit", "Glob", "Grep"], max_turns=20)
+    return _safe_agentic_call(prompt, ["Read", "Write", "Edit", "Glob", "Grep"], max_turns=20)
 
 
 @tool
@@ -747,21 +813,11 @@ def deep_edge_case_test_gen(code_content: str, spec_context: str, past_mistakes_
     """Spawn a deep agent for adversarial tests. Pass past_mistakes_json from
     search_memory(type='mistake') and relevant_memories from recall_memories."""
     context_block = f"\n\nAdditional testing memories:\n{relevant_memories}" if relevant_memories else ""
-    prompt = (
-        f"Generate edge case and adversarial tests for this code:\n\n"
-        f"```\n{code_content}\n```\n\n"
-        f"Spec context:\n{spec_context}\n\n"
-        f"Past mistakes to guard against:\n{past_mistakes_json}\n\n"
-        f"Requirements:\n"
-        f"- Each past mistake should inform at least one test\n"
-        f"- Test boundary conditions (empty inputs, max values, nulls)\n"
-        f"- Test error handling paths\n"
-        f"- Test concurrent access if applicable\n"
-        f"- Write the test file to disk using Write tool\n"
-        f"{context_block}\n"
-        f"Return the complete test code."
+    prompt = get_prompt("deep_edge_case_test_gen", "user").format(
+        code_content=code_content, spec_context=spec_context,
+        past_mistakes_json=past_mistakes_json, context_block=context_block,
     )
-    return _safe_tool_deep_agent(prompt, ["Read", "Write", "Edit", "Glob", "Grep"], max_turns=20)
+    return _safe_agentic_call(prompt, ["Read", "Write", "Edit", "Glob", "Grep"], max_turns=20)
 
 
 # ── Procedural memory tools ───────────────────────────────────────────

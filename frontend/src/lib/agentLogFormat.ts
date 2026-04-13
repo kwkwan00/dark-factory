@@ -17,6 +17,7 @@ export const EVENT_BADGES: Record<string, { label: string; color: string }> = {
   feature_completed: { label: "FEATURE DONE", color: "#3fb950" },
   feature_skipped: { label: "SKIPPED", color: "#8b949e" },
   agent_active: { label: "AGENT", color: "#bc8cff" },
+  agent_llm_start: { label: "LLM CALL", color: "#bc8cff" },
   agent_decision: { label: "DECISION", color: "#e3b341" },
   agent_handoff: { label: "HANDOFF", color: "#f0883e" },
   tool_call: { label: "TOOL CALL", color: "#39c5cf" },
@@ -32,6 +33,13 @@ export const EVENT_BADGES: Record<string, { label: string; color: string }> = {
   spec_gen_completed: { label: "SPEC DONE", color: "#3fb950" },
   spec_gen_failed: { label: "SPEC FAIL", color: "#f85149" },
   spec_gen_layer_completed: { label: "SPEC LAYER DONE", color: "#58a6ff" },
+  reconciliation_started: { label: "RECON START", color: "#f0883e" },
+  reconciliation_completed: { label: "RECON DONE", color: "#f0883e" },
+  e2e_started: { label: "E2E START", color: "#d2a8ff" },
+  e2e_completed: { label: "E2E DONE", color: "#d2a8ff" },
+  deep_agent_turn: { label: "DEEP AGENT", color: "#bc8cff" },
+  reflection_started: { label: "REFLECTING", color: "#e3b341" },
+  reflection_completed: { label: "REFLECTED", color: "#e3b341" },
   pipeline_cancelled: { label: "CANCELLED", color: "#f85149" },
 };
 
@@ -77,6 +85,11 @@ export function formatEventDetails(ev: ProgressEvent): string {
       return `Feature "${ev.feature}" skipped — ${ev.reason}`;
     case "agent_active":
       return `"${ev.feature}" → ${ev.agent} active (handoff #${ev.messages ?? 0})`;
+    case "agent_llm_start": {
+      const e = ev as { feature?: string; agent?: string; model?: string };
+      const model = e.model ? ` (${e.model})` : "";
+      return `"${e.feature ?? "?"}" ${e.agent ?? "agent"} thinking${model}…`;
+    }
     case "agent_decision": {
       const e = ev as { feature?: string; agent?: string; text?: string };
       const text = e.text ?? "";
@@ -224,6 +237,71 @@ export function formatEventDetails(ev: ProgressEvent): string {
     }
     case "spec_gen_layer_completed":
       return `Spec generation complete: ${ev.total} done${(ev as { failed?: number }).failed ? `, ${(ev as { failed?: number }).failed} failed` : ""}`;
+    case "reconciliation_started": {
+      const e = ev as { feature_count?: number; max_turns?: number; timeout_seconds?: number };
+      return `Reconciliation starting — ${e.feature_count ?? 0} feature(s), max ${e.max_turns ?? "?"} turns, ${e.timeout_seconds ?? "?"}s timeout`;
+    }
+    case "reconciliation_completed": {
+      const e = ev as {
+        status?: string;
+        summary?: string;
+        duration_seconds?: number;
+        report_path?: string;
+      };
+      const dur = e.duration_seconds != null ? ` in ${e.duration_seconds.toFixed(1)}s` : "";
+      return `Reconciliation ${e.status ?? "done"}${dur}${e.summary ? ` — ${e.summary}` : ""}`;
+    }
+    case "e2e_started": {
+      const e = ev as {
+        feature_count?: number;
+        browsers?: string[];
+        max_turns?: number;
+        timeout_seconds?: number;
+      };
+      const browsers = (e.browsers ?? []).join(", ") || "?";
+      return `E2E validation starting — ${e.feature_count ?? 0} feature(s), browsers: ${browsers}, max ${e.max_turns ?? "?"} turns`;
+    }
+    case "e2e_completed": {
+      const e = ev as {
+        status?: string;
+        summary?: string;
+        duration_seconds?: number;
+        tests_total?: number;
+        tests_passed?: number;
+        tests_failed?: number;
+        browsers_run?: string[];
+      };
+      const dur = e.duration_seconds != null ? ` in ${e.duration_seconds.toFixed(1)}s` : "";
+      const tests = e.tests_total != null ? ` — ${e.tests_passed ?? 0}/${e.tests_total} passed` : "";
+      const failed = e.tests_failed ? `, ${e.tests_failed} failed` : "";
+      const browsers = (e.browsers_run ?? []).length > 0 ? ` across ${(e.browsers_run ?? []).join(", ")}` : "";
+      return `E2E validation ${e.status ?? "done"}${dur}${tests}${failed}${browsers}`;
+    }
+    case "deep_agent_turn": {
+      const e = ev as {
+        feature?: string;
+        turn?: number;
+        max_turns?: number;
+        tools?: string[];
+        text?: string;
+      };
+      const turnLabel = e.turn != null ? `turn ${e.turn}/${e.max_turns ?? "?"}` : "";
+      const tools = (e.tools ?? []).length > 0 ? ` → ${(e.tools ?? []).join(", ")}` : "";
+      const text = e.text ? ` — ${e.text.length > 120 ? e.text.slice(0, 120) + "…" : e.text}` : "";
+      return `"${e.feature ?? "?"}" deep agent ${turnLabel}${tools}${text}`;
+    }
+    case "reflection_started": {
+      const e = ev as { layer?: number; attempt?: number; max_retries?: number };
+      return `Reflecting on layer ${e.layer ?? "?"} failures (attempt ${e.attempt ?? 1}/${e.max_retries ?? 1})…`;
+    }
+    case "reflection_completed": {
+      const e = ev as { layer?: number; diagnosis?: string; retryable?: string[]; terminal?: string[] };
+      const retryable = (e.retryable ?? []).length;
+      const terminal = (e.terminal ?? []).length;
+      const action = retryable > 0 ? `retrying ${retryable} feature${retryable > 1 ? "s" : ""}` : "no retry";
+      const diag = e.diagnosis ? ` — ${e.diagnosis.length > 200 ? e.diagnosis.slice(0, 200) + "…" : e.diagnosis}` : "";
+      return `Layer ${e.layer ?? "?"}: ${action}${terminal > 0 ? `, ${terminal} terminal` : ""}${diag}`;
+    }
     case "pipeline_cancelled": {
       const e = ev as { reason?: string; run_id?: string };
       return `Pipeline cancelled — ${e.reason ?? "user_requested"}${e.run_id ? ` (${e.run_id})` : ""}`;

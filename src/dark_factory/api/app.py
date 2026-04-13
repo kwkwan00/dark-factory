@@ -99,6 +99,13 @@ async def lifespan(app: FastAPI):
     setup_logging(level=settings.logging.level, fmt=settings.logging.format)
     app.state.settings = settings
 
+    # Storage backend (local or S3) — used by routes_runs file explorer
+    from dark_factory.storage.backend import get_storage
+
+    app.state.storage = get_storage(
+        local_root=pathlib.Path(settings.pipeline.output_dir)
+    )
+
     # Shared Neo4j client for graph queries (connection pool managed by driver)
     app.state.neo4j_client = Neo4jClient(settings.neo4j)
 

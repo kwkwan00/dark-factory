@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import structlog
-from neo4j import GraphDatabase
+from neo4j import GraphDatabase, Session
 
 from dark_factory.config import Neo4jConfig
 
@@ -27,15 +27,15 @@ class Neo4jClient:
         """Verify connectivity to Neo4j."""
         self._driver.verify_connectivity()
 
-    def session(self, **kwargs):
+    def session(self, **kwargs) -> Session:  # type: ignore[type-arg]
         """Return a new Neo4j session."""
         return self._driver.session(database=self.config.database, **kwargs)
 
     def close(self) -> None:
         self._driver.close()
 
-    def __enter__(self):
+    def __enter__(self) -> Neo4jClient:
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, *exc: object) -> None:
         self.close()

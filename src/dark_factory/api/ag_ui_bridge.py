@@ -150,6 +150,45 @@ def _text_events(encoder: EventEncoder, text: str) -> list[str]:
     ]
 
 
+def _reflect_on_reconciliation(
+    result: object,
+    attempt: int,
+    max_attempts: int,
+) -> dict | None:
+    """Call the reflection LLM to decide whether to retry reconciliation."""
+    try:
+        import json as _json
+
+        from dark_factory.agents.tools import _resolve_deep_model
+        from dark_factory.llm.anthropic import AnthropicClient
+        from dark_factory.prompts import get_prompt
+
+        status = getattr(result, "status", "unknown")
+        summary = getattr(result, "summary", "")
+        agent_output = getattr(result, "agent_output", "")
+
+        prompt = get_prompt("reconciliation_reflection", "user").format(
+            status=status,
+            summary=summary,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            agent_output=agent_output[-4000:] if agent_output else "",
+        )
+        system = get_prompt("reconciliation_reflection", "system")
+
+        model = _resolve_deep_model("deep_analysis")
+        client = AnthropicClient(model=model) if model else AnthropicClient()
+        raw = client.complete(prompt, system=system, timeout_seconds=30)
+
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+        return _json.loads(text)
+    except Exception as exc:
+        log.warning("reconciliation_reflection_failed", error=str(exc))
+        return None
+
+
 def _translate_progress(
     encoder: EventEncoder,
     progress: dict,
@@ -484,8 +523,18 @@ async def run_pipeline_stream(
     )
 
     neo4j_client = None
-    pipeline_run_id: str = ""
     pipeline_start_time = time.time()
+
+    # Generate a run ID unconditionally so storage sync always works.
+    # If memory is enabled, create_run returns a Neo4j-backed ID;
+    # otherwise fall back to a timestamp-based ID.
+    from datetime import datetime
+
+    pipeline_run_id = f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:4]}"
+
+    from dark_factory.agents.tools import set_current_run_id
+
+    set_current_run_id(pipeline_run_id)
 
     # ── Create the Run History entry IMMEDIATELY ─────────────────────────────
     # This creates a Neo4j Run node in 'running' status before Phase 1 even
@@ -495,13 +544,24 @@ async def run_pipeline_stream(
             pipeline_run_id = await asyncio.to_thread(
                 lambda: memory_repo.create_run(spec_count=0, feature_count=0)
             )
-            from dark_factory.agents.tools import set_current_run_id
-
             set_current_run_id(pipeline_run_id)
             log.info("run_history_entry_created_early", run_id=pipeline_run_id)
         except Exception as exc:
             log.warning("create_run_early_failed", error=str(exc))
-            pipeline_run_id = ""
+            # Keep the fallback run ID — don't reset to ""
+
+    # Create the RunStorage for durable persistence (local or S3).
+    # pipeline_run_id is always set (either from Neo4j or timestamp fallback).
+    from dark_factory.storage.backend import RunStorage, get_storage
+
+    run_storage: RunStorage | None = None
+    try:
+        run_storage = RunStorage(
+            get_storage(local_root=Path(settings.pipeline.output_dir)),
+            pipeline_run_id,
+        )
+    except Exception as exc:
+        log.warning("run_storage_init_failed", run_id=pipeline_run_id, error=str(exc))
 
     # Stamp the run start into the Postgres metrics store (if enabled) and
     # push the run_id into the recorder so every subsequent progress event
@@ -539,7 +599,14 @@ async def run_pipeline_stream(
         from dark_factory.stages.spec import SpecStage
         from dark_factory.ui.helpers import build_llm
 
-        llm = build_llm(settings)
+        routing = settings.model_routing
+        default_model = settings.llm.model
+        ingest_model = routing.resolve("ingest", default_model)
+        spec_model = routing.resolve("spec", default_model)
+        # Build per-stage LLM clients (same instance if models match).
+        llm_ingest = build_llm(settings, model_override=ingest_model)
+        llm_spec = build_llm(settings, model_override=spec_model) if spec_model != ingest_model else llm_ingest
+        llm = llm_ingest  # default for other uses
         neo4j_client = Neo4jClient(settings.neo4j)
         repo = GraphRepository(neo4j_client)
         ctx = PipelineContext(input_path=requirements_path)
@@ -589,7 +656,7 @@ async def run_pipeline_stream(
         # the Spec stage runs. Both are optional — the stage handles
         # ``None`` for either gracefully.
         ingest_stage = IngestStage(
-            llm=llm,
+            llm=llm_ingest,
             embed_fn=ingest_embed_fn,
             dedup_threshold=settings.pipeline.requirement_dedup_threshold,
         )
@@ -651,6 +718,35 @@ async def run_pipeline_stream(
             StepFinishedEvent(type=EventType.STEP_FINISHED, step_name="Ingest", step_id=step_id)
         )
 
+        # Sync uploaded input files to durable storage
+        if run_storage is not None:
+            try:
+                input_path = Path(requirements_path)
+                if input_path.is_dir():
+                    await asyncio.to_thread(
+                        run_storage.sync_input_from_local, input_path
+                    )
+                elif input_path.is_file():
+                    await asyncio.to_thread(
+                        run_storage.upload_input_from_local,
+                        input_path,
+                        input_path.name,
+                    )
+            except Exception as exc:
+                log.warning("storage_input_sync_failed", error=str(exc))
+
+        # Sync parsed requirements to durable storage
+        if run_storage is not None and ctx.requirements:
+            try:
+                def _sync_requirements():
+                    for req in ctx.requirements:
+                        run_storage.write_requirement(
+                            f"{req.id}.json", req.model_dump_json(indent=2)
+                        )
+                await asyncio.to_thread(_sync_requirements)
+            except Exception as exc:
+                log.warning("storage_requirements_sync_failed", error=str(exc))
+
         # ── Phase 2: Spec Generation ──────────────────────────────────────────
         step_id = str(uuid4())
         yield encoder.encode(
@@ -664,7 +760,7 @@ async def run_pipeline_stream(
             yield ev
 
         spec_stage = SpecStage(
-            llm=llm,
+            llm=llm_spec,
             max_parallel=settings.pipeline.max_parallel_specs,
             max_handoffs=settings.pipeline.max_spec_handoffs,
             eval_threshold=settings.pipeline.spec_eval_threshold,
@@ -690,6 +786,19 @@ async def run_pipeline_stream(
 
         for ev in _text_events(encoder, f"Generated {len(ctx.specs)} specs"):
             yield ev
+
+        # Sync generated specs to durable storage
+        if run_storage is not None and ctx.specs:
+            try:
+                def _sync_specs():
+                    for spec in ctx.specs:
+                        run_storage.write_spec(
+                            f"{spec.id}.json", spec.model_dump_json(indent=2)
+                        )
+                await asyncio.to_thread(_sync_specs)
+            except Exception as exc:
+                log.warning("storage_specs_sync_failed", error=str(exc))
+
         yield encoder.encode(
             StepFinishedEvent(
                 type=EventType.STEP_FINISHED, step_name="Spec Generation", step_id=step_id
@@ -820,6 +929,17 @@ async def run_pipeline_stream(
             )
         )
 
+        # Sync swarm-generated output to durable storage
+        if run_storage is not None and pipeline_run_id:
+            try:
+                swarm_output_dir = Path(settings.pipeline.output_dir) / pipeline_run_id
+                count = await asyncio.to_thread(
+                    run_storage.sync_output_from_local, swarm_output_dir
+                )
+                log.info("storage_swarm_sync_done", run_id=pipeline_run_id, files=count)
+            except Exception as exc:
+                log.warning("storage_swarm_sync_failed", run_id=pipeline_run_id, error=str(exc))
+
         # ── Phase 5: Reconciliation ──────────────────────────────────────────
         # Best-effort cross-feature polishing pass — always runs after
         # the feature swarms complete. A single extended Claude Agent
@@ -849,74 +969,123 @@ async def run_pipeline_stream(
             ):
                 yield ev
 
-            try:
-                recon_stage = ReconciliationStage(
-                    max_turns=settings.pipeline.max_reconciliation_turns,
-                    timeout_seconds=settings.pipeline.reconciliation_timeout_seconds,
-                )
-                recon_output_dir = Path(settings.pipeline.output_dir) / pipeline_run_id
-                recon_result_obj = await asyncio.to_thread(
-                    recon_stage.run,
-                    run_id=pipeline_run_id,
-                    output_dir=recon_output_dir,
-                    feature_results=completed,
-                )
-                reconciliation_result = recon_result_obj.model_dump()
+            recon_output_dir = Path(settings.pipeline.output_dir) / pipeline_run_id
+            max_recon_retries = settings.pipeline.max_reconciliation_retries
 
-                for ev in _text_events(
-                    encoder,
-                    f"Reconciliation {recon_result_obj.status}: "
-                    f"{recon_result_obj.summary}",
-                ):
-                    yield ev
-
-                # Prometheus: reconciliation_runs_total{status} counter
+            for recon_attempt in range(1 + max_recon_retries):
                 try:
-                    from dark_factory.metrics.prometheus import (
-                        observe_reconciliation_run,
-                    )
+                    extra_turns = 0
+                    if recon_attempt > 0:
+                        # Retry with more turns based on reflection recommendation
+                        extra_turns = getattr(recon_stage, "_extra_turns", 20)
+                        for ev in _text_events(
+                            encoder,
+                            f"Retrying reconciliation (attempt {recon_attempt + 1})…",
+                        ):
+                            yield ev
 
-                    observe_reconciliation_run(
-                        status=recon_result_obj.status,
-                        duration_seconds=recon_result_obj.duration_seconds,
+                    recon_stage = ReconciliationStage(
+                        max_turns=settings.pipeline.max_reconciliation_turns + extra_turns,
+                        timeout_seconds=settings.pipeline.reconciliation_timeout_seconds,
                     )
-                except Exception:  # pragma: no cover — defensive
-                    pass
+                    recon_result_obj = await asyncio.to_thread(
+                        recon_stage.run,
+                        run_id=pipeline_run_id,
+                        output_dir=recon_output_dir,
+                        feature_results=completed,
+                    )
+                    reconciliation_result = recon_result_obj.model_dump()
 
-                # Record an incident for partial / error outcomes so the
-                # Run Detail popup surfaces what happened.
-                if recon_result_obj.status in ("partial", "error"):
+                    for ev in _text_events(
+                        encoder,
+                        f"Reconciliation {recon_result_obj.status}: "
+                        f"{recon_result_obj.summary}",
+                    ):
+                        yield ev
+
+                    # Prometheus: reconciliation_runs_total{status} counter
                     try:
-                        from dark_factory.metrics.helpers import record_incident
+                        from dark_factory.metrics.prometheus import (
+                            observe_reconciliation_run,
+                        )
 
-                        record_incident(
-                            category="subprocess",
-                            severity=(
-                                "warning"
-                                if recon_result_obj.status == "partial"
-                                else "error"
-                            ),
-                            message=recon_result_obj.summary,
-                            phase="reconciliation",
-                            feature=None,
-                            stack=recon_result_obj.agent_output[-2000:]
-                            or None,
+                        observe_reconciliation_run(
+                            status=recon_result_obj.status,
+                            duration_seconds=recon_result_obj.duration_seconds,
                         )
                     except Exception:  # pragma: no cover — defensive
                         pass
-            except Exception as exc:
-                # Reconciliation is best-effort. Log, emit, don't fail.
-                log.warning(
-                    "reconciliation_stage_crashed",
-                    run_id=pipeline_run_id,
-                    error=str(exc),
-                )
-                for ev in _text_events(
-                    encoder,
-                    f"Reconciliation crashed: {exc}. Continuing with "
-                    f"feature output as-is.",
-                ):
-                    yield ev
+
+                    # If clean or last attempt, accept the result.
+                    if recon_result_obj.status == "clean" or recon_attempt >= max_recon_retries:
+                        # Record an incident for partial / error outcomes.
+                        if recon_result_obj.status in ("partial", "error"):
+                            try:
+                                from dark_factory.metrics.helpers import record_incident
+
+                                record_incident(
+                                    category="subprocess",
+                                    severity=(
+                                        "warning"
+                                        if recon_result_obj.status == "partial"
+                                        else "error"
+                                    ),
+                                    message=recon_result_obj.summary,
+                                    phase="reconciliation",
+                                    feature=None,
+                                    stack=recon_result_obj.agent_output[-2000:]
+                                    or None,
+                                )
+                            except Exception:  # pragma: no cover — defensive
+                                pass
+                        break
+
+                    # Not clean and retries remain — run reflection to decide.
+                    try:
+                        recon_reflection = await asyncio.to_thread(
+                            _reflect_on_reconciliation,
+                            recon_result_obj,
+                            recon_attempt + 1,
+                            1 + max_recon_retries,
+                        )
+                        if recon_reflection and recon_reflection.get("should_retry"):
+                            extra = recon_reflection.get("extra_turns", 20)
+                            recon_stage._extra_turns = extra  # type: ignore[attr-defined]
+                            for ev in _text_events(
+                                encoder,
+                                f"Reflection: {recon_reflection.get('diagnosis', '')} — retrying with +{extra} turns.",
+                            ):
+                                yield ev
+                            continue
+                        else:
+                            # Reflection declined retry — accept result.
+                            break
+                    except Exception:
+                        break
+
+                except Exception as exc:
+                    # Reconciliation is best-effort. Log, emit, don't fail.
+                    log.warning(
+                        "reconciliation_stage_crashed",
+                        run_id=pipeline_run_id,
+                        error=str(exc),
+                    )
+                    for ev in _text_events(
+                        encoder,
+                        f"Reconciliation crashed: {exc}. Continuing with "
+                        f"feature output as-is.",
+                    ):
+                        yield ev
+                    break
+
+            # Sync reconciliation output to durable storage
+            if run_storage is not None:
+                try:
+                    await asyncio.to_thread(
+                        run_storage.sync_output_from_local, recon_output_dir
+                    )
+                except Exception as exc:
+                    log.warning("storage_recon_sync_failed", error=str(exc))
 
             yield encoder.encode(
                 StepFinishedEvent(
@@ -1066,6 +1235,15 @@ async def run_pipeline_stream(
                     f"reconciled output as-is.",
                 ):
                     yield ev
+
+            # Sync E2E output (report, screenshots, html-report) to storage
+            if run_storage is not None:
+                try:
+                    await asyncio.to_thread(
+                        run_storage.sync_output_from_local, e2e_output_dir
+                    )
+                except Exception as exc:
+                    log.warning("storage_e2e_sync_failed", error=str(exc))
 
             yield encoder.encode(
                 StepFinishedEvent(

@@ -22,26 +22,34 @@ def get_settings() -> Settings:
     return _cached_settings
 
 
-def build_llm(settings: Settings) -> Any:
-    """Instantiate the configured LLM client."""
+def build_llm(settings: Settings, model_override: str | None = None) -> Any:
+    """Instantiate the configured LLM client.
+
+    Parameters
+    ----------
+    model_override:
+        If given, use this model id instead of ``settings.llm.model``.
+        Used by multi-model routing for per-stage model selection.
+    """
+    model_id = model_override or settings.llm.model
     if settings.llm.provider == "anthropic":
         from dark_factory.llm.anthropic import AnthropicClient
 
         return AnthropicClient(
             api_key=os.getenv("ANTHROPIC_API_KEY"),
-            model=settings.llm.model,
+            model=model_id,
         )
     elif settings.llm.provider == "langchain":
         from dark_factory.llm.langchain import LangChainClient
 
         return LangChainClient(
             api_key=os.getenv("ANTHROPIC_API_KEY"),
-            model=settings.llm.model,
+            model=model_id,
         )
     elif settings.llm.provider == "claude-agent":
         from dark_factory.llm.claude_code import ClaudeAgentClient
 
-        return ClaudeAgentClient(model=settings.llm.model)
+        return ClaudeAgentClient(model=model_id)
     else:
         raise ValueError(f"Unknown LLM provider: {settings.llm.provider}")
 

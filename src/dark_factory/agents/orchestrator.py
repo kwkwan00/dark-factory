@@ -51,6 +51,10 @@ class OrchestratorState(TypedDict, total=False):
     strategy_overrides: dict[str, Any]
     layer_pass_rates: list[float]
 
+    # Self-healing: per-layer retry tracking
+    layer_retries: dict[int, int]  # layer_idx → attempt count
+    retry_layer: int | None  # set by reflection to re-run a layer
+
     # Final output
     all_artifacts: list[dict[str, Any]]
     all_tests: list[dict[str, Any]]
@@ -301,6 +305,7 @@ def make_execute_layer_node(
     *,
     enable_episodic_memory: bool = True,
     settings: "Settings | None" = None,
+    agent_models: dict[str, Any] | None = None,
 ):
     """Create the execute_layer node with cross-feature learning and parallel execution.
 
@@ -485,7 +490,9 @@ def make_execute_layer_node(
         # H10 fix: build the swarm graph ONCE per layer, not per feature.
         # All features in a layer share the same strategy_overrides, so the
         # compiled graph can be reused across parallel workers.
-        compiled_for_layer = build_feature_swarm(model, strategy_overrides=overrides)
+        compiled_for_layer = build_feature_swarm(
+            model, strategy_overrides=overrides, models=agent_models,
+        )
 
         # Run features in parallel within the layer
         def _run_one(feature_name: str, spec_ids: list[str]) -> FeatureResult:
@@ -698,8 +705,73 @@ def make_execute_layer_node(
     return execute_layer_node
 
 
-def make_adjust_strategy_node(threshold: float = 0.5):
-    """Create a node that adjusts agent strategy between layers based on performance."""
+def _run_reflection(
+    layer_idx: int,
+    total_layers: int,
+    layer_results: list[FeatureResult],
+    retry_attempt: int,
+    max_retries: int,
+    overrides: dict[str, Any],
+) -> dict | None:
+    """Call the reflection LLM to diagnose failures and decide on retry.
+
+    Returns a parsed JSON dict with ``retryable_features``, ``strategy``,
+    etc., or ``None`` if reflection is unavailable or fails.
+    """
+    failed = [r for r in layer_results if r["status"] in ("error", "skipped")]
+    if not failed:
+        return None
+
+    try:
+        import json as _json
+
+        from dark_factory.llm.anthropic import AnthropicClient
+        from dark_factory.prompts import get_prompt
+
+        failed_details = "\n".join(
+            f"- {r['feature']} [{r['status']}]: {r.get('error', 'no error message')}"
+            for r in failed
+        )
+        succeeded = sum(1 for r in layer_results if r["status"] == "success")
+        total = len(layer_results)
+
+        prompt = get_prompt("reflection", "user").format(
+            layer_idx=layer_idx + 1,
+            total_layers=total_layers,
+            pass_rate=succeeded / total if total else 0,
+            succeeded=succeeded,
+            total=total,
+            retry_attempt=retry_attempt,
+            max_retries=max_retries,
+            failed_details=failed_details,
+            strategy_overrides=_json.dumps(overrides) if overrides else "none",
+        )
+        system = get_prompt("reflection", "system")
+
+        # Use a fast model for reflection to minimise cost.
+        from dark_factory.agents.tools import _resolve_deep_model
+
+        model = _resolve_deep_model("deep_analysis")
+        client = AnthropicClient(model=model) if model else AnthropicClient()
+        raw = client.complete(prompt, system=system, timeout_seconds=30)
+
+        # Extract JSON from the response (handle markdown fences).
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1].rsplit("```", 1)[0]
+        return _json.loads(text)
+    except Exception as exc:
+        log.warning("reflection_failed", error=str(exc))
+        return None
+
+
+def make_adjust_strategy_node(threshold: float = 0.5, max_layer_retries: int = 1):
+    """Create a node that adjusts agent strategy between layers.
+
+    When a layer has failures and retries remain, runs a reflection LLM
+    call to diagnose root causes and decide whether to retry the layer
+    with adjusted strategy.
+    """
 
     def adjust_strategy_node(state: OrchestratorState) -> dict:
         completed = state.get("completed_features", [])
@@ -707,9 +779,12 @@ def make_adjust_strategy_node(threshold: float = 0.5):
         current_layer = state.get("current_layer", 0)
         overrides = dict(state.get("strategy_overrides", {}))
         layer_rates = list(state.get("layer_pass_rates", []))
+        layer_retries = dict(state.get("layer_retries", {}))
 
         # Compute pass rate for the just-completed layer (current_layer was already incremented)
         prev_layer_idx = current_layer - 1
+        retry_layer: int | None = None
+
         if 0 <= prev_layer_idx < len(order):
             layer_features = set(order[prev_layer_idx])
             layer_results = [r for r in completed if r["feature"] in layer_features]
@@ -721,19 +796,106 @@ def make_adjust_strategy_node(threshold: float = 0.5):
             log.info("layer_pass_rate", layer=prev_layer_idx, rate=round(layer_rate, 2))
 
             if layer_rate < threshold:
-                log.warning("strategy_adjustment", reason="low_pass_rate", rate=layer_rate)
-                overrides["force_claude_agent"] = True
-                overrides["max_handoffs"] = 30
+                attempt = layer_retries.get(prev_layer_idx, 0)
+
+                # ── Self-healing: reflection + retry ──────────────────
+                if attempt < max_layer_retries and layer_rate < 1.0:
+                    from dark_factory.agents.tools import emit_progress as _emit
+
+                    _emit(
+                        "reflection_started",
+                        layer=prev_layer_idx + 1,
+                        attempt=attempt + 1,
+                        max_retries=max_layer_retries,
+                    )
+
+                    reflection = _run_reflection(
+                        layer_idx=prev_layer_idx,
+                        total_layers=len(order),
+                        layer_results=layer_results,
+                        retry_attempt=attempt + 1,
+                        max_retries=max_layer_retries,
+                        overrides=overrides,
+                    )
+
+                    if reflection and reflection.get("retryable_features"):
+                        retryable = set(reflection["retryable_features"])
+                        diagnosis = reflection.get("diagnosis", "")
+                        strategy = reflection.get("strategy", {})
+
+                        log.info(
+                            "reflection_retry",
+                            layer=prev_layer_idx,
+                            retryable=sorted(retryable),
+                            diagnosis=diagnosis[:200],
+                        )
+
+                        # Apply strategy adjustments from reflection
+                        if strategy.get("force_claude_agent"):
+                            overrides["force_claude_agent"] = True
+                        if strategy.get("max_handoffs"):
+                            overrides["max_handoffs"] = strategy["max_handoffs"]
+                        if strategy.get("prompt_hint"):
+                            overrides["prompt_hint"] = strategy["prompt_hint"]
+
+                        # Remove failed results for retryable features so
+                        # they get re-run. Keep terminal failures.
+                        completed = [
+                            r for r in completed
+                            if r["feature"] not in retryable
+                            or r["feature"] not in layer_features
+                        ]
+
+                        layer_retries[prev_layer_idx] = attempt + 1
+                        retry_layer = prev_layer_idx
+
+                        _emit(
+                            "reflection_completed",
+                            layer=prev_layer_idx + 1,
+                            diagnosis=diagnosis[:500],
+                            retryable=sorted(retryable),
+                            terminal=sorted(
+                                set(reflection.get("terminal_features", []))
+                            ),
+                        )
+                    else:
+                        # Reflection declined retry or unavailable.
+                        log.info("reflection_no_retry", layer=prev_layer_idx)
+                        overrides["force_claude_agent"] = True
+                        overrides["max_handoffs"] = 30
+
+                        _emit(
+                            "reflection_completed",
+                            layer=prev_layer_idx + 1,
+                            diagnosis=reflection.get("diagnosis", "Reflection declined retry") if reflection else "Reflection unavailable",
+                            retryable=[],
+                            terminal=[],
+                        )
+                else:
+                    # No retries left — fall back to basic strategy adjustment.
+                    log.warning("strategy_adjustment", reason="low_pass_rate", rate=layer_rate)
+                    overrides["force_claude_agent"] = True
+                    overrides["max_handoffs"] = 30
+
             elif layer_rate >= threshold and overrides.get("force_claude_agent"):
                 # Performance recovered — relax overrides
                 log.info("strategy_relaxed", reason="pass_rate_recovered")
                 overrides.pop("force_claude_agent", None)
                 overrides.pop("max_handoffs", None)
+                overrides.pop("prompt_hint", None)
 
-        return {
+        updates: dict[str, Any] = {
             "strategy_overrides": overrides,
             "layer_pass_rates": layer_rates,
+            "layer_retries": layer_retries,
+            "completed_features": completed,
         }
+
+        # If reflection decided to retry, rewind current_layer.
+        if retry_layer is not None:
+            updates["current_layer"] = retry_layer
+
+        return updates
 
     return adjust_strategy_node
 
@@ -818,6 +980,8 @@ def check_done(state: OrchestratorState) -> Literal["execute_layer", "aggregate"
     order = state.get("execution_order", [])
     if layer_idx >= len(order):
         return "aggregate"
+    # Self-healing: if adjust_strategy rewound current_layer, we re-enter
+    # execute_layer for the retried layer.
     return "execute_layer"
 
 
@@ -842,7 +1006,18 @@ def build_orchestrator(settings: Settings, repo: GraphRepository) -> StateGraph:
     # content, producing ``Error invoking tool 'write_file'`` errors.
     from dark_factory.agents.swarm import build_chat_model
 
-    model = build_chat_model(settings)
+    # Build per-agent models from routing config. If no overrides are
+    # configured, every agent gets the same default model.
+    routing = settings.model_routing
+    default_model_id = settings.llm.model
+    default_model = build_chat_model(settings)
+
+    agent_models: dict[str, Any] = {}
+    for role in ("planner", "coder", "reviewer", "tester"):
+        override = routing.resolve(role, default_model_id)
+        if override != default_model_id:
+            agent_models[role] = build_chat_model(settings, model_override=override)
+
     max_parallel = settings.pipeline.max_parallel_features
     default_max_handoffs = settings.pipeline.max_codegen_handoffs
 
@@ -851,14 +1026,18 @@ def build_orchestrator(settings: Settings, repo: GraphRepository) -> StateGraph:
     graph.add_node(
         "execute_layer",
         make_execute_layer_node(
-            model,
+            default_model,
             max_parallel=max_parallel,
             default_max_handoffs=default_max_handoffs,
             enable_episodic_memory=settings.pipeline.enable_episodic_memory,
             settings=settings,
+            agent_models=agent_models or None,
         ),
     )
-    graph.add_node("adjust_strategy", make_adjust_strategy_node(settings.evaluation.strategy_threshold))
+    graph.add_node("adjust_strategy", make_adjust_strategy_node(
+        threshold=settings.evaluation.strategy_threshold,
+        max_layer_retries=settings.pipeline.max_layer_retries,
+    ))
     graph.add_node("aggregate", aggregate_node)
 
     graph.add_edge(START, "plan")
@@ -878,7 +1057,7 @@ def run_orchestrator(settings: Settings, spec_ids: list[str]) -> OrchestratorSta
 
     from pathlib import Path
 
-    from dark_factory.agents.tools import set_output_dir
+    from dark_factory.agents.tools import set_output_dir, set_run_storage
 
     repo, neo4j_client, memory_client = init_swarm_context(settings)
     try:
@@ -924,6 +1103,14 @@ def run_orchestrator(settings: Settings, spec_ids: list[str]) -> OrchestratorSta
         run_output_dir.mkdir(parents=True, exist_ok=True)
         set_output_dir(run_output_dir)
         log.info("run_output_dir", path=str(run_output_dir))
+
+        # Wire up durable storage for this run
+        from dark_factory.storage.backend import RunStorage, get_storage
+        run_storage = RunStorage(
+            get_storage(local_root=Path(settings.pipeline.output_dir)),
+            run_id,
+        )
+        set_run_storage(run_storage)
 
         start_time = time.time()
         graph = build_orchestrator(settings, repo)

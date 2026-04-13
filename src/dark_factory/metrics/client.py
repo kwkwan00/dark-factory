@@ -34,19 +34,30 @@ class PostgresClient:
 
     @staticmethod
     def _build_dsn(config: PostgresConfig) -> str:
-        """Return a DSN with the password from ``config.password`` applied
-        when it's non-empty. Otherwise ``config.url`` is used verbatim."""
+        """Return a DSN with the password from ``config.password`` applied.
+
+        When ``config.password`` is non-empty it **always** wins — if
+        the URL already embeds credentials, the password component is
+        replaced so the operator only needs to set ``POSTGRES_PASSWORD``
+        in one place.  When ``config.password`` is empty the URL is
+        used verbatim (credentials and all).
+        """
         raw = config.password.get_secret_value()
         if not raw:
             return config.url
-        # Minimal DSN password injection: if url already has user/pass,
-        # trust the caller and don't rewrite.
-        if "@" in config.url and "://" in config.url:
-            scheme, rest = config.url.split("://", 1)
-            if "@" in rest:
-                return config.url  # already has credentials
-            return f"{scheme}://:{raw}@{rest}"
-        return config.url
+
+        # Replace or inject the password in the URL.
+        if "://" not in config.url:
+            return config.url
+
+        scheme, rest = config.url.split("://", 1)
+        if "@" in rest:
+            # URL has user(:pass)?@host — replace just the password.
+            userinfo, hostpart = rest.split("@", 1)
+            user = userinfo.split(":", 1)[0]
+            return f"{scheme}://{user}:{raw}@{hostpart}"
+        # No credentials in URL — prepend :<password>@
+        return f"{scheme}://:{raw}@{rest}"
 
     def connection(self):
         """Context manager yielding a pooled connection."""

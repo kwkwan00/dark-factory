@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 
+
 class _FakeCursor:
     """Just enough of a psycopg cursor to satisfy the repository."""
 

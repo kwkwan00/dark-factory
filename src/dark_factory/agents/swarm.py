@@ -22,6 +22,7 @@ from langchain.agents import create_agent
 from langgraph_swarm import create_handoff_tool, create_swarm
 from typing_extensions import TypedDict
 
+from dark_factory.prompts import get_prompt
 from dark_factory.agents.tools import (
     CODEGEN_TOOLS,
     DEEP_PLANNER_TOOLS,
@@ -419,36 +420,7 @@ def _build_planner(model: "str | Any"):
             *MEMORY_WRITE_STRATEGY,
             handoff_to_coder,
         ],
-        system_prompt=(
-            "You are a project planner coordinating spec-driven code generation. "
-            "You receive a list of spec IDs via the user message. Check which are "
-            "already done, pick the next unfinished spec, query the knowledge graph "
-            "for context, then hand off to the Coder by calling transfer_to_coder.\n\n"
-            "EPISODIC MEMORY (call FIRST): Before picking a strategy for this "
-            "feature, call recall_episodes with the current feature name. This "
-            "returns past trajectories — what approach the previous run picked, "
-            "what went wrong, what fixed it, and whether the outcome was "
-            "success / partial / failed. If a past episode succeeded with a "
-            "particular approach, strongly prefer that approach unless the "
-            "current spec has meaningfully changed. If past episodes failed "
-            "with a particular approach, avoid it and note the failure mode "
-            "so the Coder can steer clear.\n\n"
-            "EVALUATION: Before handing off each spec to the Coder, call evaluate_spec "
-            "to verify correctness, coherence, instruction following, and safety. "
-            "Also call query_eval_history to check how this spec performed in past "
-            "runs — if scores are trending down, flag the spec for extra attention.\n\n"
-            "DEEP ANALYSIS: For complex features with many specs:\n"
-            "1. First call recall_memories and query_eval_history to gather context\n"
-            "2. Pass the memories as relevant_memories and eval history as eval_history "
-            "to deep_dependency_analysis and deep_risk_assessment\n"
-            "This gives the deep subagents full knowledge of past issues.\n\n"
-            "SEMANTIC MEMORY: Call recall_memories with the feature name to "
-            "retrieve known patterns, mistakes, solutions, and strategies from "
-            "past runs. If you discover a useful planning approach during this "
-            "run, record it with record_strategy.\n\n"
-            "If ALL specs are complete, respond with DONE and do NOT call any "
-            "handoff tool."
-        ),
+        system_prompt=get_prompt("swarm_planner", "system"),
         name="planner",
     )
 
@@ -461,27 +433,7 @@ def _build_coder(model: "str | Any", prompt_suffix: str = ""):
     return create_agent(
         model,
         tools=[*CODEGEN_TOOLS, *VECTOR_SEARCH_TOOLS, *MEMORY_READ_TOOLS, *MEMORY_WRITE_PATTERN, claude_agent_codegen, handoff_to_reviewer],
-        system_prompt=(
-            "You are a senior software engineer generating production-quality code. "
-            "Use get_spec_context to understand dependencies.\n\n"
-            "RAG: Before generating code, call search_similar_specs to find similar "
-            "past specs and search_similar_code to find reference implementations. "
-            "Use these as context for higher quality code generation.\n\n"
-            "MEMORY: Call recall_memories to check for known patterns and past "
-            "mistakes related to this spec. Apply any relevant patterns. If you "
-            "discover a reusable pattern, record it with record_pattern.\n\n"
-            "You have two strategies for code generation:\n"
-            "1. Use write_file to write code directly for simple specs.\n"
-            "2. Use claude_agent_codegen for complex specs — it delegates to the "
-            "Claude Agent SDK which has built-in file editing, shell, and search "
-            "tools for sophisticated multi-file code generation. Pass the spec "
-            "context and any fix instructions to it.\n\n"
-            "If you receive reviewer feedback, fix the issues described. "
-            "Prefer claude_agent_codegen for fixes since it can read existing code "
-            "and make targeted edits.\n\n"
-            "When code is complete, hand off to the Reviewer by calling "
-            "transfer_to_reviewer."
-        ) + (f"\n\n{prompt_suffix}" if prompt_suffix else ""),
+        system_prompt=get_prompt("swarm_coder", "system") + (f"\n\n{prompt_suffix}" if prompt_suffix else ""),
         name="coder",
     )
 
@@ -498,29 +450,7 @@ def _build_reviewer(model: "str | Any"):
     return create_agent(
         model,
         tools=[*GRAPH_READ_TOOLS, read_file, *EVAL_TOOLS, *EVAL_HISTORY_TOOLS, *DEEP_REVIEWER_TOOLS, *MEMORY_READ_TOOLS, *MEMORY_WRITE_MISTAKE, handoff_to_coder, handoff_to_tester],
-        system_prompt=(
-            "You are a code reviewer. Read the generated code using read_file, "
-            "check it against the spec's acceptance criteria from the knowledge graph.\n\n"
-            "EVALUATION: Use evaluate_tests to run AI evaluation on the generated code. "
-            "Call query_eval_history to compare against past scores for this spec — "
-            "if a metric has been consistently failing, focus your review there.\n\n"
-            "DEEP REVIEW: For thorough analysis:\n"
-            "1. First call recall_memories and query_eval_history to gather context\n"
-            "2. Pass the memories as relevant_memories to deep_security_review and "
-            "deep_performance_review so they know about past security/performance issues\n"
-            "3. Pass eval history to deep_spec_compliance_review so it knows which "
-            "criteria have failed before\n"
-            "Available deep review tools: deep_security_review, deep_performance_review, "
-            "deep_spec_compliance_review.\n\n"
-            "MEMORY: Check recall_memories for known mistakes related to this spec "
-            "before reviewing. If you find issues, record each one with record_mistake "
-            "(include error_type like 'missing_validation', 'async_mismatch'). When a "
-            "previously reported issue is fixed, record the fix with record_solution "
-            "and link it to the original mistake_id.\n\n"
-            "If the code passes review, hand off to Tester by calling transfer_to_tester.\n"
-            "If it needs fixes, describe the issues and hand off back to Coder by "
-            "calling transfer_to_coder."
-        ),
+        system_prompt=get_prompt("swarm_reviewer", "system"),
         name="reviewer",
     )
 
@@ -533,27 +463,7 @@ def _build_tester(model: "str | Any"):
     return create_agent(
         model,
         tools=[*TESTGEN_TOOLS, *EVAL_TOOLS, *DEEP_TESTER_TOOLS, *MEMORY_READ_TOOLS, *MEMORY_WRITE_MISTAKE, handoff_to_planner],
-        system_prompt=(
-            "You are a QA engineer. Write thorough tests for the current spec's "
-            "code artifact. Use get_spec_context to understand acceptance criteria, "
-            "read_file to inspect the source, then write_file to create tests.\n\n"
-            "DEEP TESTING: Use specialized deep agents for comprehensive coverage:\n"
-            "1. First call recall_memories and search_memory(memory_type='mistake') to gather context\n"
-            "2. Pass the memories as relevant_memories to each deep test tool\n"
-            "3. For deep_edge_case_test_gen, also pass past mistakes as past_mistakes_json\n"
-            "Available: deep_unit_test_gen, deep_integration_test_gen, deep_edge_case_test_gen\n\n"
-            "EVALUATION: After writing tests, you MUST call evaluate_tests to run "
-            "AI evaluation on the generated tests. Pass the spec title, acceptance "
-            "criteria (as JSON array), the source code, and the test code. If any "
-            "metric scores below 0.5, revise the tests and re-evaluate before "
-            "handing off. Record evaluation failures as mistakes in memory.\n\n"
-            "MEMORY: Check recall_memories before writing tests to avoid known "
-            "pitfalls. If tests reveal failures, record the root cause with "
-            "record_mistake. If you identify the fix needed, record it with "
-            "record_solution.\n\n"
-            "When tests pass evaluation, hand off back to Planner by calling "
-            "transfer_to_planner."
-        ),
+        system_prompt=get_prompt("swarm_tester", "system"),
         name="tester",
     )
 
@@ -730,8 +640,69 @@ def _get_stop_reason_handler() -> Any:
     return _STOP_REASON_HANDLER_CLASS
 
 
-def build_chat_model(settings: Settings) -> Any:
-    """Construct the langchain chat model used by every swarm agent.
+_PROGRESS_HANDLER_CLASS: Any = None
+
+
+def _get_progress_handler(feature_name: str) -> Any:
+    """Return a callback handler that emits ``agent_llm_start``
+    progress events so the Agent Logs tab shows real-time activity
+    during each agent's LLM call — not just after the node completes.
+
+    Without this, the planner (and every other agent) appears silent
+    in the live log for the entire duration of its LLM call because
+    LangGraph's ``stream_mode="updates"`` only yields after the full
+    node finishes.
+    """
+    global _PROGRESS_HANDLER_CLASS
+
+    if _PROGRESS_HANDLER_CLASS is not None:
+        return _PROGRESS_HANDLER_CLASS(feature_name)
+
+    try:
+        from langchain_core.callbacks.base import BaseCallbackHandler
+    except Exception:  # pragma: no cover
+        return None
+
+    class _SwarmProgressHandler(BaseCallbackHandler):
+        """Emit a progress event when any swarm agent starts an LLM call."""
+
+        def __init__(self, feature: str) -> None:
+            super().__init__()
+            self._feature = feature
+
+        def on_llm_start(self, serialized: Any, prompts: Any, **kwargs: Any) -> None:
+            try:
+                from dark_factory.agents.tools import emit_progress
+
+                # Try to extract the agent name from the invocation params
+                invocation = kwargs.get("invocation_params", {}) or {}
+                model = invocation.get("model", "") or invocation.get("model_name", "") or ""
+                metadata = kwargs.get("metadata", {}) or {}
+                agent = metadata.get("langgraph_node", "") or ""
+
+                emit_progress(
+                    "agent_llm_start",
+                    feature=self._feature,
+                    agent=agent or None,
+                    model=model or None,
+                )
+            except Exception:
+                pass
+
+    _PROGRESS_HANDLER_CLASS = _SwarmProgressHandler
+    return _PROGRESS_HANDLER_CLASS(feature_name)
+
+
+def build_chat_model(settings: Settings, model_override: str | None = None) -> Any:
+    """Construct a langchain chat model.
+
+    Parameters
+    ----------
+    settings:
+        Global settings (provides default model, provider, token limits).
+    model_override:
+        If given, use this model id instead of ``settings.llm.model``.
+        Used by multi-model routing to give each swarm agent its own model.
 
     **Why this function exists**: passing a bare model string like
     ``"anthropic:claude-sonnet-4-6"`` to ``create_agent`` makes
@@ -754,10 +725,12 @@ def build_chat_model(settings: Settings) -> Any:
     Non-Anthropic providers fall back to the original string-based
     init so this change is provider-scoped.
     """
+    model_id = model_override or settings.llm.model
+
     if settings.llm.provider != "anthropic":
         # Keep the old behaviour for any future provider. String
         # shortcut + langchain defaults.
-        return f"{settings.llm.provider}:{settings.llm.model}"
+        return f"{settings.llm.provider}:{model_id}"
 
     # Lazy import so non-anthropic deployments don't need the package.
     from langchain_anthropic import ChatAnthropic
@@ -765,7 +738,7 @@ def build_chat_model(settings: Settings) -> Any:
     from dark_factory.llm.base import DEFAULT_LLM_TIMEOUT_SECONDS
 
     kwargs: dict[str, Any] = {
-        "model": settings.llm.model,
+        "model": model_id,
         "max_tokens": settings.pipeline.max_llm_tokens,
         "timeout": DEFAULT_LLM_TIMEOUT_SECONDS,
     }
@@ -786,6 +759,8 @@ def build_chat_model(settings: Settings) -> Any:
 def build_feature_swarm(
     model: "str | Any",
     strategy_overrides: dict[str, Any] | None = None,
+    *,
+    models: dict[str, Any] | None = None,
 ) -> Any:
     """Build and compile a single swarm instance.
 
@@ -793,19 +768,23 @@ def build_feature_swarm(
     ``strategy_overrides`` modifies agent prompts when performance is poor.
     Returns the compiled LangGraph graph.
 
-    ``model`` accepts either a langchain ``BaseChatModel`` instance
-    (the preferred path — see :func:`build_chat_model`) or a provider
-    string like ``"anthropic:claude-sonnet-4-6"`` (the old path, kept
-    for non-Anthropic providers).
+    Parameters
+    ----------
+    model:
+        Default model for all agents (langchain ``BaseChatModel`` or string).
+    models:
+        Optional per-agent model map with keys ``"planner"``, ``"coder"``,
+        ``"reviewer"``, ``"tester"``. Missing keys fall back to *model*.
     """
     suffix = _strategy_suffix(strategy_overrides)
+    m = models or {}
 
     workflow = create_swarm(
         agents=[
-            _build_planner(model),
-            _build_coder(model, prompt_suffix=suffix),
-            _build_reviewer(model),
-            _build_tester(model),
+            _build_planner(m.get("planner", model)),
+            _build_coder(m.get("coder", model), prompt_suffix=suffix),
+            _build_reviewer(m.get("reviewer", model)),
+            _build_tester(m.get("tester", model)),
         ],
         default_active_agent="planner",
     )
@@ -859,7 +838,14 @@ def run_feature_swarm(
     }
     # M15 fix: enforce a hard recursion limit on the swarm so a runaway
     # agent loop can't blow past max_handoffs
-    stream_config = {"recursion_limit": max_handoffs * 4}
+    stream_config: dict[str, Any] = {"recursion_limit": max_handoffs * 4}
+
+    # Inject a progress callback so agent LLM calls emit real-time
+    # events to the Agent Logs tab (without this, the log is silent
+    # until each graph node fully completes its LLM call).
+    progress_handler = _get_progress_handler(feature_name)
+    if progress_handler is not None:
+        stream_config["callbacks"] = [progress_handler]
 
     # Track tools called during this run so we can decide success
     tool_calls_made: dict[str, int] = {}

@@ -30,8 +30,10 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    # Port exposed only for local dev/adminer access. Remove or
+    # restrict to 127.0.0.1 in production.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-darkfactory}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-darkfactory}
@@ -111,6 +113,7 @@ services:
       POSTGRES_URL: postgresql://${POSTGRES_USER:-darkfactory}:${POSTGRES_PASSWORD:-darkfactory}@postgres:5432/${POSTGRES_DB:-darkfactory_metrics}
       PROMETHEUS_ENABLED: "true"
       PROMETHEUS_URL: http://prometheus:9090
+      DEEP_AGENT_DEBUG_STDERR: "1"
     depends_on:
       neo4j:
         condition: service_healthy

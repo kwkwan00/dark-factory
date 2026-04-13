@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+
 import threading
 
 from dark_factory.agents.swarm import FeatureResult, MAX_HANDOFFS

@@ -12,29 +12,10 @@ from dark_factory.stages.base import Stage
 
 log = structlog.get_logger()
 
-TESTGEN_SYSTEM_PROMPT = """\
-You are a QA engineer. Given source code and its specification, generate thorough \
-evaluation tests. Return valid JSON matching the provided schema."""
+from dark_factory.prompts import get_prompt
 
-TESTGEN_USER_TEMPLATE = """\
-Generate tests for this code artifact.
-
-Artifact ID: {artifact_id}
-Spec: {spec_title}
-File: {file_path}
-Language: {language}
-
-Acceptance Criteria:
-{criteria}
-
-Source Code:
-```{language}
-{code}
-```
-
-Return JSON with fields: id (string, use "test-" prefix + artifact id), artifact_id, \
-test_type ("unit", "integration", or "eval"), file_path (test file path), \
-content (full test source code)."""
+TESTGEN_SYSTEM_PROMPT = get_prompt("testgen", "system")
+TESTGEN_USER_TEMPLATE = get_prompt("testgen", "user")
 
 
 class TestgenStage(Stage):

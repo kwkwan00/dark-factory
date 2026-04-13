@@ -821,6 +821,19 @@ export interface EpisodeResponse {
   ended_at: string;
 }
 
+/** A single run in the history list from GET /api/history. */
+export interface HistoryRun {
+  id: string;
+  status: string;
+  pass_rate?: number;
+  duration_seconds?: number;
+  timestamp?: string;
+  stage?: string;
+  spec_count?: number;
+  feature_count?: number;
+  [key: string]: unknown;
+}
+
 export const api = {
   /** Gap finder: actionable insights about what's missing, failed,
    * or stale in the knowledge graph. */
@@ -828,7 +841,7 @@ export const api = {
     get<GraphGaps>(`/api/graph/gaps?stale_days=${staleDays}`),
 
   history: (limit = 20) =>
-    get<{ runs: Array<Record<string, unknown>> }>(`/api/history?limit=${limit}`),
+    get<{ runs: HistoryRun[] }>(`/api/history?limit=${limit}`),
 
   /** Episodes: per-feature autobiographical records written after
    * every swarm run. Used by the Run Detail popup's Episodes tab

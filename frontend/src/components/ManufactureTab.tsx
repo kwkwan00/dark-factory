@@ -129,6 +129,12 @@ export default function ManufactureTab() {
   const isRunning = state.status === "running";
   const result = state.result;
 
+  // Derive the currently-running pipeline stage name from the step tree
+  // so the run history table can show "running · Reconciliation" etc.
+  const currentStageName = state.steps.findLast(
+    (s) => s.status === "running",
+  )?.name;
+
   return (
     <div>
       {/* Drop zone */}
@@ -295,11 +301,11 @@ export default function ManufactureTab() {
               </thead>
               <tbody>
                 {historyState.data.runs.map((r, i) => {
-                  const status = r.status as string;
-                  const passRate = r.pass_rate as number | undefined;
-                  const duration = r.duration_seconds as number | undefined;
-                  const id = (r.id as string | undefined) ?? `run-${i}`;
-                  const timestamp = r.timestamp as string | undefined;
+                  const status = r.status;
+                  const passRate = r.pass_rate;
+                  const duration = r.duration_seconds;
+                  const id = r.id ?? `run-${i}`;
+                  const timestamp = r.timestamp;
                   const startedLabel = timestamp
                     ? new Date(timestamp).toLocaleString()
                     : "—";
@@ -353,6 +359,11 @@ export default function ManufactureTab() {
                             />
                           )}
                           {status}
+                          {status === "running" && isRunning && currentStageName && (
+                            <span style={{ color: "#8b949e", fontWeight: 400 }}>
+                              {" "}· {currentStageName}
+                            </span>
+                          )}
                         </span>
                       </td>
                       <td>
@@ -420,24 +431,20 @@ export default function ManufactureTab() {
             </div>
             <div className="stat-card">
               <div className="stat-value">
-                {result.all_artifacts
-                  ? (result.all_artifacts as unknown[]).length
-                  : 0}
+                {result.all_artifacts?.length ?? 0}
               </div>
               <div className="stat-label">Artifacts</div>
             </div>
             <div className="stat-card">
               <div className="stat-value">
-                {result.all_tests
-                  ? (result.all_tests as unknown[]).length
-                  : 0}
+                {result.all_tests?.length ?? 0}
               </div>
               <div className="stat-label">Tests</div>
             </div>
             <div className="stat-card">
               <div className="stat-value">
                 {result.pass_rate != null
-                  ? `${Math.round((result.pass_rate as number) * 100)}%`
+                  ? `${Math.round(result.pass_rate * 100)}%`
                   : "—"}
               </div>
               <div className="stat-label">Pass Rate</div>

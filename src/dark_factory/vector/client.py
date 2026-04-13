@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import structlog
 from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from dark_factory.config import QdrantConfig
 
@@ -32,7 +33,7 @@ class QdrantClientWrapper:
         try:
             self._client.get_collections()
             return True
-        except Exception:
+        except (ConnectionError, TimeoutError, UnexpectedResponse, ResponseHandlingException, OSError):
             return False
 
     def close(self) -> None:

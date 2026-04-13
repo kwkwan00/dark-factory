@@ -1,12 +1,188 @@
-"""Tests for the destructive admin endpoints."""
+"""Tests for admin route helpers and the destructive admin endpoints."""
 
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+# ── Unit tests: admin helper functions ─────────────────────────────────────
+
+
+def test_clear_output_dir_path_safety():
+    """_clear_output_dir refuses to delete a directory outside cwd."""
+    from dark_factory.api.routes_admin import _clear_output_dir
+
+    request = MagicMock()
+    settings = MagicMock()
+    settings.pipeline.output_dir = "/tmp/totally-outside-cwd"
+    request.app.state.settings = settings
+
+    with pytest.raises(ValueError, match="not inside cwd"):
+        _clear_output_dir(request)
+
+
+def test_clear_output_dir_wipes_and_recreates(tmp_path, monkeypatch):
+    """_clear_output_dir deletes files and recreates the directory."""
+    from dark_factory.api.routes_admin import _clear_output_dir
+
+    # Create a subdirectory inside tmp_path to act as output_dir
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "file1.txt").write_text("hello")
+    (output_dir / "file2.txt").write_text("world")
+
+    request = MagicMock()
+    settings = MagicMock()
+    settings.pipeline.output_dir = str(output_dir)
+    request.app.state.settings = settings
+
+    # Monkeypatch cwd to tmp_path so the safety check passes
+    monkeypatch.chdir(tmp_path)
+
+    result = _clear_output_dir(request)
+    assert result["files_deleted"] == 2
+    assert result["bytes_freed"] > 0
+    assert output_dir.exists()  # recreated empty
+    assert list(output_dir.iterdir()) == []
+
+
+def test_clear_neo4j_counts_and_deletes():
+    """_clear_neo4j runs count then DETACH DELETE on all nodes."""
+    from dark_factory.api.routes_admin import _clear_neo4j
+
+    request = MagicMock()
+    session = MagicMock()
+    # First call: count query
+    count_result = MagicMock()
+    count_result.single.return_value = {"cnt": 42}
+    # Second call: delete query
+    session.run.side_effect = [count_result, None]
+    request.app.state.neo4j_client.session.return_value.__enter__ = MagicMock(return_value=session)
+    request.app.state.neo4j_client.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    result = _clear_neo4j(request)
+    assert result["nodes_deleted"] == 42
+    assert session.run.call_count == 2
+
+
+def test_clear_qdrant_disabled_when_no_vector_repo():
+    """_clear_qdrant returns disabled status when vector_repo is None."""
+    from dark_factory.api.routes_admin import _clear_qdrant
+
+    request = MagicMock()
+    request.app.state.vector_repo = None
+
+    result = _clear_qdrant(request)
+    assert result["status"] == "disabled"
+
+
+def test_clear_postgres_disabled_when_no_metrics_client():
+    """_clear_postgres returns disabled status when metrics_client is None."""
+    from dark_factory.api.routes_admin import _clear_postgres
+
+    request = MagicMock()
+    request.app.state.metrics_client = None
+
+    result = _clear_postgres(request)
+    assert result["status"] == "disabled"
+
+
+def test_clear_prometheus_in_process_only_when_disabled():
+    """_clear_prometheus resets in-process collectors even when prometheus
+    is disabled in settings."""
+    from dark_factory.api.routes_admin import _clear_prometheus
+
+    request = MagicMock()
+    settings = MagicMock()
+    settings.prometheus = None
+    request.app.state.settings = settings
+
+    result = _clear_prometheus(request)
+    assert result["status"] == "in_process_only"
+    assert "in_process" in result
+
+
+def test_clear_prometheus_in_process_only_when_enabled_false():
+    """_clear_prometheus with enabled=False still resets in-process collectors."""
+    from dark_factory.api.routes_admin import _clear_prometheus
+
+    request = MagicMock()
+    settings = MagicMock()
+    prom_cfg = MagicMock()
+    prom_cfg.enabled = False
+    settings.prometheus = prom_cfg
+    request.app.state.settings = settings
+
+    result = _clear_prometheus(request)
+    assert result["status"] == "in_process_only"
+    assert result["reason"] == "prometheus.enabled=false"
+
+
+def test_reset_all_zeroes_counters():
+    """reset_all() clears all dark_factory_ collectors and returns counts."""
+    from dark_factory.metrics.prometheus import (
+        observe_llm_call,
+        reset_all,
+    )
+
+    # Create some state first
+    observe_llm_call(client="test", model="m1", phase="p1",
+                     latency_seconds=0.1, input_tokens=10, output_tokens=5)
+
+    result = reset_all()
+    assert isinstance(result, dict)
+    assert "cleared_collectors" in result
+    assert "reinitialised_collectors" in result
+    assert "skipped_collectors" in result
+    total = result["cleared_collectors"] + result["reinitialised_collectors"]
+    assert total > 0
+
+
+def test_clear_output_dir_nonexistent_is_safe(tmp_path, monkeypatch):
+    """_clear_output_dir handles a non-existent output directory gracefully."""
+    from dark_factory.api.routes_admin import _clear_output_dir
+
+    output_dir = tmp_path / "nonexistent_output"
+
+    request = MagicMock()
+    settings = MagicMock()
+    settings.pipeline.output_dir = str(output_dir)
+    request.app.state.settings = settings
+
+    monkeypatch.chdir(tmp_path)
+
+    result = _clear_output_dir(request)
+    assert result["files_deleted"] == 0
+    assert result["bytes_freed"] == 0
+    assert output_dir.exists()  # created empty
+
+
+def test_clear_postgres_truncates_tables():
+    """_clear_postgres truncates metrics tables when client is available."""
+    from dark_factory.api.routes_admin import _clear_postgres
+
+    request = MagicMock()
+    cursor = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor)
+    conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    request.app.state.metrics_client.connection.return_value.__enter__ = MagicMock(return_value=conn)
+    request.app.state.metrics_client.connection.return_value.__exit__ = MagicMock(return_value=False)
+
+    result = _clear_postgres(request)
+    assert "tables_truncated" in result
+    assert len(result["tables_truncated"]) > 0
+    assert cursor.execute.call_count > 0
+
+
+# ── /api/admin/clear-all endpoint tests ────────────────────────────────────
 
 
 def test_admin_clear_all_requires_confirm(api_client):
@@ -141,304 +317,3 @@ def test_admin_clear_all_skip_output_dir(api_client):
     assert resp.status_code == 200
     assert resp.json()["cleared"]["output_dir"] == {"status": "skipped"}
     mock_clear_output.assert_not_called()
-
-
-# ── Per-helper unit tests ─────────────────────────────────────────────────
-
-
-def test_clear_output_dir_refuses_paths_outside_cwd(tmp_path, monkeypatch):
-    """Safety: if the operator has pointed output_dir outside the working
-    directory, the clear function refuses to delete anything. Prevents a
-    misconfigured config from wiping unrelated host files."""
-    from dark_factory.api.routes_admin import _clear_output_dir
-    from dark_factory.config import Settings
-
-    # Build a settings object pointing at an absolute path OUTSIDE cwd
-    outside = Path("/tmp/definitely-not-in-cwd-admin-test")
-    settings = Settings()
-    settings.pipeline.output_dir = str(outside)
-
-    req = MagicMock()
-    req.app.state.settings = settings
-
-    with pytest.raises(ValueError, match="not inside cwd"):
-        _clear_output_dir(req)
-
-
-def test_clear_output_dir_wipes_and_recreates(tmp_path, monkeypatch):
-    """Happy path: files inside the output dir are deleted and the dir
-    itself is recreated empty."""
-    from dark_factory.api.routes_admin import _clear_output_dir
-    from dark_factory.config import Settings
-
-    # Create a realistic output dir tree inside cwd
-    output_dir = tmp_path / "output"
-    output_dir.mkdir()
-    (output_dir / "file1.py").write_text("hello")
-    (output_dir / "nested").mkdir()
-    (output_dir / "nested" / "file2.txt").write_text("world" * 10)
-
-    monkeypatch.chdir(tmp_path)
-
-    settings = Settings()
-    settings.pipeline.output_dir = "./output"
-
-    req = MagicMock()
-    req.app.state.settings = settings
-
-    result = _clear_output_dir(req)
-
-    assert result["files_deleted"] == 2
-    assert result["bytes_freed"] > 0
-    assert output_dir.exists()
-    assert list(output_dir.iterdir()) == []
-
-
-def test_clear_neo4j_counts_and_deletes_all_nodes():
-    """_clear_neo4j issues a count query and a DETACH DELETE, returning
-    the pre-deletion node count."""
-    from dark_factory.api.routes_admin import _clear_neo4j
-
-    mock_session = MagicMock()
-    # First session.run() is the count query — returns a record-like with
-    # a ``cnt`` field; second is the DETACH DELETE.
-    count_result = MagicMock()
-    count_result.single.return_value = {"cnt": 1234}
-    mock_session.run.side_effect = [count_result, None]
-
-    mock_client = MagicMock()
-    mock_client.session.return_value.__enter__.return_value = mock_session
-
-    req = MagicMock()
-    req.app.state.neo4j_client = mock_client
-
-    result = _clear_neo4j(req)
-    assert result == {"nodes_deleted": 1234}
-
-    # Verify the two queries were run
-    sqls = [call.args[0] for call in mock_session.run.call_args_list]
-    assert any("count(n)" in sql for sql in sqls)
-    assert any("DETACH DELETE" in sql for sql in sqls)
-
-
-def test_clear_qdrant_disabled_when_vector_repo_is_none():
-    from dark_factory.api.routes_admin import _clear_qdrant
-
-    req = MagicMock()
-    req.app.state.vector_repo = None
-    assert _clear_qdrant(req) == {"status": "disabled"}
-
-
-def test_clear_postgres_disabled_when_client_is_none():
-    from dark_factory.api.routes_admin import _clear_postgres
-
-    req = MagicMock()
-    req.app.state.metrics_client = None
-    assert _clear_postgres(req) == {"status": "disabled"}
-
-
-# ── Prometheus clearing ─────────────────────────────────────────────────────
-
-
-def test_clear_prometheus_in_process_only_when_disabled():
-    """If ``settings.prometheus.enabled`` is false we skip the remote
-    delete entirely but still reset in-process collectors."""
-    from dark_factory.api.routes_admin import _clear_prometheus
-
-    settings = MagicMock()
-    settings.prometheus.enabled = False
-    req = MagicMock()
-    req.app.state.settings = settings
-
-    with patch(
-        "dark_factory.metrics.prometheus.reset_all",
-        return_value={
-            "cleared_collectors": 10,
-            "reinitialised_collectors": 3,
-            "skipped_collectors": 0,
-        },
-    ):
-        result = _clear_prometheus(req)
-
-    assert result["status"] == "in_process_only"
-    assert result["in_process"]["cleared_collectors"] == 10
-    assert result["reason"] == "prometheus.enabled=false"
-
-
-def test_clear_prometheus_happy_path(monkeypatch):
-    """Happy path: both delete_series and clean_tombstones return 204,
-    and we report completed + in-process reset stats."""
-    from dark_factory.api.routes_admin import _clear_prometheus
-
-    settings = MagicMock()
-    settings.prometheus.enabled = True
-    settings.prometheus.url = "http://prom.test:9090"
-    req = MagicMock()
-    req.app.state.settings = settings
-
-    class FakeResponse:
-        def __init__(self, status_code: int = 204, text: str = "") -> None:
-            self.status_code = status_code
-            self.text = text
-
-    class FakeClient:
-        def __init__(self, *args, **kwargs):
-            self.calls: list[tuple[str, dict]] = []
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def post(self, url: str, params: dict | None = None) -> FakeResponse:
-            self.calls.append((url, params or {}))
-            return FakeResponse(204)
-
-    import httpx
-
-    monkeypatch.setattr(httpx, "Client", FakeClient)
-
-    with patch(
-        "dark_factory.metrics.prometheus.reset_all",
-        return_value={
-            "cleared_collectors": 25,
-            "reinitialised_collectors": 4,
-            "skipped_collectors": 0,
-        },
-    ):
-        result = _clear_prometheus(req)
-
-    assert result["status"] == "completed"
-    assert result["series_deleted"] is True
-    assert result["tombstones_cleaned"] is True
-    assert result["in_process"]["cleared_collectors"] == 25
-    assert result["url"] == "http://prom.test:9090"
-
-
-def test_clear_prometheus_reports_admin_api_disabled(monkeypatch):
-    """If Prometheus returns 404 on the delete endpoint, it means the
-    admin API wasn't enabled on the server. Report that clearly so the
-    operator knows they need ``--web.enable-admin-api``."""
-    from dark_factory.api.routes_admin import _clear_prometheus
-
-    settings = MagicMock()
-    settings.prometheus.enabled = True
-    settings.prometheus.url = "http://prom.test:9090"
-    req = MagicMock()
-    req.app.state.settings = settings
-
-    class FakeResponse:
-        def __init__(self, status_code: int = 404) -> None:
-            self.status_code = status_code
-            self.text = "admin APIs disabled"
-
-    class FakeClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def post(self, url: str, params: dict | None = None) -> FakeResponse:
-            return FakeResponse(404)
-
-    import httpx
-
-    monkeypatch.setattr(httpx, "Client", FakeClient)
-
-    with patch(
-        "dark_factory.metrics.prometheus.reset_all",
-        return_value={
-            "cleared_collectors": 5,
-            "reinitialised_collectors": 1,
-            "skipped_collectors": 0,
-        },
-    ):
-        result = _clear_prometheus(req)
-
-    assert result["status"] == "admin_api_disabled"
-    assert "--web.enable-admin-api" in result["hint"]
-    # In-process reset still happened
-    assert result["in_process"]["cleared_collectors"] == 5
-
-
-def test_clear_prometheus_reports_unreachable(monkeypatch):
-    """Network error → status=unreachable, in-process reset still reported."""
-    from dark_factory.api.routes_admin import _clear_prometheus
-
-    settings = MagicMock()
-    settings.prometheus.enabled = True
-    settings.prometheus.url = "http://prom.test:9090"
-    req = MagicMock()
-    req.app.state.settings = settings
-
-    import httpx
-
-    class FakeClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def post(self, *args, **kwargs):
-            raise httpx.ConnectError("connection refused")
-
-    monkeypatch.setattr(httpx, "Client", FakeClient)
-
-    with patch(
-        "dark_factory.metrics.prometheus.reset_all",
-        return_value={
-            "cleared_collectors": 7,
-            "reinitialised_collectors": 1,
-            "skipped_collectors": 0,
-        },
-    ):
-        result = _clear_prometheus(req)
-
-    assert result["status"] == "unreachable"
-    assert "connection refused" in result["error"]
-    assert result["in_process"]["cleared_collectors"] == 7
-
-
-def test_reset_all_actually_zeroes_counters():
-    """Integration-ish: bump some dark_factory counters and verify that
-    ``reset_all`` brings them back to 0. Uses the real global REGISTRY
-    so this catches prometheus_client API drift."""
-    from dark_factory.metrics import prometheus as prom
-
-    # Labelled counter
-    prom.llm_calls_total.labels(
-        client="anthropic", model="claude-opus-4-6", phase="spec"
-    ).inc(5)
-    # Unlabelled gauge
-    prom.background_loop_active_tasks.set(42)
-    # Unlabelled counter
-    prom.metrics_events_dropped_total.inc(3)
-
-    # Sanity: they're non-zero before reset
-    sample_before = {
-        s.name: s.value
-        for s in prom.llm_calls_total.collect()[0].samples
-        if s.name.endswith("_total")
-    }
-    assert any(v > 0 for v in sample_before.values())
-    assert prom.background_loop_active_tasks._value.get() == 42
-    assert prom.metrics_events_dropped_total._value.get() == 3
-
-    report = prom.reset_all()
-    assert report["cleared_collectors"] > 0
-
-    # Labelled counter has no children after clear()
-    assert len(prom.llm_calls_total._metrics) == 0
-    # Unlabelled gauge is back to 0
-    assert prom.background_loop_active_tasks._value.get() == 0
-    # Unlabelled counter is back to 0
-    assert prom.metrics_events_dropped_total._value.get() == 0

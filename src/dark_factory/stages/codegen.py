@@ -13,27 +13,10 @@ from dark_factory.stages.base import Stage
 
 log = structlog.get_logger()
 
-CODEGEN_SYSTEM_PROMPT = """\
-You are a senior software engineer. Given a specification and its dependency context \
-from a knowledge graph, generate clean, well-structured application code. \
-Return valid JSON matching the provided schema."""
+from dark_factory.prompts import get_prompt
 
-CODEGEN_USER_TEMPLATE = """\
-Generate application code for this specification.
-
-Spec ID: {spec_id}
-Title: {title}
-Description:
-{description}
-
-Acceptance Criteria:
-{criteria}
-
-Dependency Context:
-{dep_context}
-
-Return JSON with fields: id (string, use "code-" prefix + spec id), spec_id, \
-file_path (appropriate path for the generated module), language, content (the full source code)."""
+CODEGEN_SYSTEM_PROMPT = get_prompt("codegen", "system")
+CODEGEN_USER_TEMPLATE = get_prompt("codegen", "user")
 
 
 class CodegenStage(Stage):

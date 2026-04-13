@@ -1,27 +1,25 @@
 """Per-run file tree + file preview endpoints.
 
-Powers the "Run Detail" popup window — given a ``run_id`` the pipeline
-wrote its artifacts under ``<pipeline.output_dir>/<run_id>/``, so these
-endpoints let the UI browse that tree and preview individual files.
+Powers the "Output" tab in the Run Detail popup — given a ``run_id``
+the pipeline wrote its artifacts under ``{run_id}/output/`` in the
+configured storage backend (local filesystem or S3).
 
 Safety rails:
 - ``run_id`` must match ``RUN_ID_RE``: alphanumeric + dash/underscore.
-- The resolved target file must be ``is_relative_to`` the run directory
-  (prevents ``..`` traversal through symlinks or otherwise).
+- Path traversal (``..``) is rejected at the API level.
 - Files larger than :data:`MAX_FILE_BYTES` are refused (returns 413).
 - Files that don't decode as UTF-8 or that look binary (null-byte in
-  the first 1 KiB) are refused (returns 415) — the UI is a text viewer,
-  not an image/pdf/zip viewer.
+  the first 1 KiB) are refused (returns 415).
 """
 
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import Any
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
 log = structlog.get_logger()
 
@@ -40,105 +38,117 @@ MAX_FILE_BYTES = 1 * 1024 * 1024
 MAX_ENTRIES_PER_DIR = 2000
 
 
-def _run_dir(request: Request, run_id: str) -> Path:
-    """Resolve the output directory for ``run_id`` with safety checks."""
+def _validate_run_id(run_id: str) -> None:
     if not RUN_ID_RE.match(run_id):
         raise HTTPException(status_code=400, detail="Invalid run_id format")
 
-    settings = request.app.state.settings
-    base = Path(settings.pipeline.output_dir).resolve()
-    run_dir = (base / run_id).resolve()
 
-    # Defence in depth: even though run_id is validated above, confirm
-    # the resolved path is still inside base before touching it.
-    if not run_dir.is_relative_to(base):
-        raise HTTPException(status_code=400, detail="run_id escapes output dir")
-
-    if not run_dir.exists() or not run_dir.is_dir():
-        raise HTTPException(
-            status_code=404,
-            detail=f"No output directory for run {run_id!r}",
-        )
-    return run_dir
+def _get_storage(request: Request):
+    """Return the storage backend from app state, or create one."""
+    storage = getattr(request.app.state, "storage", None)
+    if storage is not None:
+        return storage
+    from dark_factory.storage.backend import get_storage
+    return get_storage()
 
 
-def _build_tree(root: Path) -> dict[str, Any]:
-    """Walk ``root`` and return a nested dict describing the file tree.
+def _build_tree_from_walk(
+    entries: list[tuple[str, int]],
+) -> dict[str, Any]:
+    """Build a nested tree structure from a flat list of (path, size) tuples.
 
-    Each directory node: ``{name, type: 'dir', path, children: [...]}``.
-    Each file node:      ``{name, type: 'file', path, size}``.
-    ``path`` is relative to ``root`` so the frontend can pass it straight
-    back to :func:`get_run_file`.
+    Works for both local filesystem ``walk()`` output and S3 ``walk()``
+    output — both return flat relative paths.
     """
+    root: dict[str, Any] = {
+        "name": "",
+        "type": "dir",
+        "path": "",
+        "children": [],
+    }
 
-    def walk(dir_path: Path, rel_prefix: str) -> dict[str, Any]:
-        entries: list[dict[str, Any]] = []
-        try:
-            raw = sorted(
-                dir_path.iterdir(),
-                key=lambda p: (not p.is_dir(), p.name.lower()),
-            )
-        except PermissionError as exc:
-            return {
-                "name": dir_path.name,
-                "type": "dir",
-                "path": rel_prefix,
-                "children": [],
-                "error": f"permission denied: {exc}",
-            }
+    # Index directories by their path for fast lookup
+    dir_nodes: dict[str, dict[str, Any]] = {"": root}
 
-        truncated = False
-        if len(raw) > MAX_ENTRIES_PER_DIR:
-            raw = raw[:MAX_ENTRIES_PER_DIR]
-            truncated = True
+    # Sort entries so directories are implicitly created in order
+    sorted_entries = sorted(entries, key=lambda e: e[0].lower())
 
-        for entry in raw:
-            # Skip symlinks that point outside the run dir — ``is_relative_to``
-            # on the resolved target is the definitive check.
-            try:
-                resolved = entry.resolve()
-                if not resolved.is_relative_to(root):
-                    continue
-            except (OSError, RuntimeError):
-                continue
+    if len(sorted_entries) > MAX_ENTRIES_PER_DIR * 10:
+        sorted_entries = sorted_entries[: MAX_ENTRIES_PER_DIR * 10]
+        root["truncated"] = True
 
-            rel = f"{rel_prefix}/{entry.name}" if rel_prefix else entry.name
-            if entry.is_dir():
-                entries.append(walk(entry, rel))
-            elif entry.is_file():
-                try:
-                    size = entry.stat().st_size
-                except OSError:
-                    size = 0
-                entries.append(
-                    {
-                        "name": entry.name,
-                        "type": "file",
-                        "path": rel,
-                        "size": size,
-                    }
-                )
-            # Skip sockets, devices, broken symlinks, etc.
+    for rel_path, size in sorted_entries:
+        parts = rel_path.split("/")
+        filename = parts[-1]
+        dir_parts = parts[:-1]
 
-        node: dict[str, Any] = {
-            "name": dir_path.name if rel_prefix else "",
-            "type": "dir",
-            "path": rel_prefix,
-            "children": entries,
+        # Ensure all parent directories exist in the tree
+        current_path = ""
+        parent_node = root
+        for part in dir_parts:
+            current_path = f"{current_path}/{part}" if current_path else part
+            if current_path not in dir_nodes:
+                dir_node: dict[str, Any] = {
+                    "name": part,
+                    "type": "dir",
+                    "path": current_path,
+                    "children": [],
+                }
+                dir_nodes[current_path] = dir_node
+                if len(parent_node["children"]) < MAX_ENTRIES_PER_DIR:
+                    parent_node["children"].append(dir_node)
+            parent_node = dir_nodes[current_path]
+
+        # Add the file node
+        file_node: dict[str, Any] = {
+            "name": filename,
+            "type": "file",
+            "path": rel_path,
+            "size": size,
         }
-        if truncated:
-            node["truncated"] = True
-        return node
+        if len(parent_node["children"]) < MAX_ENTRIES_PER_DIR:
+            parent_node["children"].append(file_node)
 
-    return walk(root, "")
+    # Sort children: directories first, then files, both alphabetical
+    def _sort_children(node: dict[str, Any]) -> None:
+        children = node.get("children", [])
+        children.sort(
+            key=lambda c: (c["type"] != "dir", c["name"].lower())
+        )
+        for child in children:
+            if child["type"] == "dir":
+                _sort_children(child)
+
+    _sort_children(root)
+    return root
+
+
+def _count_tree(node: dict[str, Any]) -> tuple[int, int]:
+    """Count files and total bytes in a tree node."""
+    files = 0
+    total_bytes = 0
+    for child in node.get("children", []):
+        if child.get("type") == "file":
+            files += 1
+            total_bytes += int(child.get("size") or 0)
+        else:
+            f, b = _count_tree(child)
+            files += f
+            total_bytes += b
+    return files, total_bytes
 
 
 @router.get("/runs/{run_id}/files")
 def get_run_files(request: Request, run_id: str):
     """Return the file tree under the run's output directory."""
-    run_dir = _run_dir(request, run_id)
+    _validate_run_id(run_id)
+    storage = _get_storage(request)
+
+    from dark_factory.storage.backend import RunStorage
+    rs = RunStorage(storage, run_id)
+
     try:
-        tree = _build_tree(run_dir)
+        entries = list(rs.walk_output())
     except Exception as exc:
         log.warning("run_files_walk_failed", run_id=run_id, error=str(exc))
         raise HTTPException(
@@ -146,80 +156,68 @@ def get_run_files(request: Request, run_id: str):
             detail=f"Failed to read output dir: {exc}",
         ) from exc
 
-    # Count files at the top level for the UI's summary line.
-    def _count(node: dict[str, Any]) -> tuple[int, int]:
-        files = 0
-        total_bytes = 0
-        for child in node.get("children", []):
-            if child.get("type") == "file":
-                files += 1
-                total_bytes += int(child.get("size") or 0)
-            else:
-                f, b = _count(child)
-                files += f
-                total_bytes += b
-        return files, total_bytes
+    if not entries:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No output files for run {run_id!r}",
+        )
 
-    file_count, total_bytes = _count(tree)
-    return {
+    tree = _build_tree_from_walk(entries)
+    file_count, total_bytes = _count_tree(tree)
+
+    # Return JSONResponse directly to bypass FastAPI's jsonable_encoder,
+    # which hits RecursionError on deeply nested file trees.
+    return JSONResponse({
         "run_id": run_id,
-        "root": str(run_dir),
+        "root": rs.output_prefix,
         "tree": tree,
         "file_count": file_count,
         "total_bytes": total_bytes,
-    }
+    })
 
 
 @router.get("/runs/{run_id}/file")
 def get_run_file(
     request: Request,
     run_id: str,
-    path: str = Query(..., description="Path relative to run directory"),
+    path: str = Query(..., description="Path relative to run output directory"),
 ):
-    """Return the text content of a single file inside the run directory."""
-    run_dir = _run_dir(request, run_id)
+    """Return the text content of a single file inside the run's output."""
+    _validate_run_id(run_id)
+    storage = _get_storage(request)
+
+    from dark_factory.storage.backend import RunStorage
+    rs = RunStorage(storage, run_id)
 
     # Normalise the relative path — strip leading slashes so ``/spec.json``
     # and ``spec.json`` both work, reject absolute paths and '..' segments.
     rel = path.strip().lstrip("/")
     if not rel:
         raise HTTPException(status_code=400, detail="path is required")
-    if ".." in Path(rel).parts:
+    if ".." in rel.split("/"):
         raise HTTPException(status_code=400, detail="path traversal rejected")
 
-    target = (run_dir / rel).resolve()
-
-    # Symlink defence: the resolved target must still be inside run_dir.
-    if not target.is_relative_to(run_dir):
-        raise HTTPException(
-            status_code=400, detail="resolved path escapes run directory"
-        )
-
-    if not target.exists() or not target.is_file():
+    if not rs.output_exists(rel):
         raise HTTPException(status_code=404, detail=f"file not found: {rel}")
 
     try:
-        size = target.stat().st_size
-    except OSError as exc:
+        raw = rs.read_output_bytes(rel)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"file not found: {rel}")
+    except Exception as exc:
         raise HTTPException(
-            status_code=503, detail=f"stat failed: {exc}"
+            status_code=503, detail=f"read failed: {exc}"
         ) from exc
 
+    size = len(raw)
     if size > MAX_FILE_BYTES:
         raise HTTPException(
             status_code=413,
             detail=(
                 f"file too large ({size} bytes > {MAX_FILE_BYTES} max). "
-                "Download via direct filesystem access instead."
+                "Download via direct filesystem access or presigned URL instead."
             ),
         )
-
-    try:
-        raw = target.read_bytes()
-    except OSError as exc:
-        raise HTTPException(
-            status_code=503, detail=f"read failed: {exc}"
-        ) from exc
 
     # Reject obvious binary blobs — null byte in the sniff window is a
     # reliable signal. UTF-8 decode catches the rest.
@@ -237,9 +235,16 @@ def get_run_file(
             detail=f"non-UTF8 file: {exc}",
         ) from exc
 
-    return {
+    # Include presigned URL when available (S3 backend)
+    presigned = rs.presign_output(rel)
+
+    result: dict[str, Any] = {
         "run_id": run_id,
         "path": rel,
         "size": size,
         "content": text,
     }
+    if presigned:
+        result["presigned_url"] = presigned
+
+    return result

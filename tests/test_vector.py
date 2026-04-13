@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+
 from dark_factory.config import QdrantConfig, Settings
 from dark_factory.vector.merge import hybrid_merge
 

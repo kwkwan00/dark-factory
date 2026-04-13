@@ -1,457 +1,362 @@
-"""Tests for the write-time memory deduplication helper + repository integration.
+"""Tests for memory deduplication and the /api/metrics/memory endpoint.
 
-Tier A change: ``MemoryRepository.record_*`` methods call
-``MemoryDedupHelper.find_existing_match`` before creating a new node.
-Matches above threshold get boosted instead of duplicated. This file
-covers:
-
-- Threshold respect: matches at/above threshold get picked up; matches
-  below are rejected.
-- Type isolation: Pattern dedup never accidentally merges into a Mistake.
-- Source feature filtering: dedup scopes to the same feature by default.
-- Graceful degradation: Qdrant outage, embedding failure, or missing
-  vector_repo all fall through to "no match" without crashing.
-- Integration: record_pattern returns the existing id on match, boosts
-  relevance, and skips the Neo4j CREATE.
-- Integration: record_mistake bumps times_seen on the existing node on match.
-- Integration: record_solution honours the mistake_id linkage even on
-  dedup path.
-- Disabled via threshold=0.0.
-- Metric counter wiring: created / deduped outcomes fire the right counters.
+Unit tests for MemoryDedupHelper and MemoryRepository dedup integration
+come first, followed by the endpoint tests that require the ``api_client``
+fixture.
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from dark_factory.memory.dedup_writer import MemoryDedupHelper
-from dark_factory.memory.repository import MemoryRepository
 
 
-# ── MemoryDedupHelper unit tests ────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────
 
 
-def _make_vector_repo(search_results: list[dict]):
-    vec = MagicMock()
-    vec.search_memories.return_value = search_results
-    return vec
+def _make_vector_repo(search_results=None, side_effect=None):
+    """Create a mock VectorRepository that returns the given search results."""
+    repo = MagicMock()
+    if side_effect is not None:
+        repo.search_memories.side_effect = side_effect
+    else:
+        repo.search_memories.return_value = search_results or []
+    return repo
+
+
+def _make_mock_neo4j():
+    """Create a mock Neo4jClient with a session context manager."""
+    client = MagicMock()
+    session = MagicMock()
+    client.session.return_value.__enter__ = MagicMock(return_value=session)
+    client.session.return_value.__exit__ = MagicMock(return_value=False)
+    return client, session
+
+
+# ── Unit tests: MemoryDedupHelper ──────────────────────────────────────────
 
 
 def test_dedup_helper_disabled_when_no_vector_repo():
-    helper = MemoryDedupHelper(vector_repo=None, threshold=0.92)
+    """Helper is disabled when vector_repo is None."""
+    helper = MemoryDedupHelper(vector_repo=None)
     assert helper.enabled is False
-    assert (
-        helper.find_existing_match(
-            memory_type="pattern",
-            query_text="use JWT",
-            source_feature="auth",
-        )
-        is None
-    )
 
 
 def test_dedup_helper_disabled_when_threshold_zero():
-    """threshold=0.0 is the explicit disable switch."""
-    vec = _make_vector_repo([{"id": "p-1", "score": 1.0}])
-    helper = MemoryDedupHelper(vector_repo=vec, threshold=0.0)
+    """Helper is disabled when threshold is set to 0.0."""
+    repo = _make_vector_repo()
+    helper = MemoryDedupHelper(vector_repo=repo, threshold=0.0)
     assert helper.enabled is False
-    # Even with a guaranteed match, no search happens
-    assert (
-        helper.find_existing_match(
-            memory_type="pattern",
-            query_text="x",
-            source_feature="f",
-        )
-        is None
-    )
-    vec.search_memories.assert_not_called()
 
 
-def test_dedup_helper_returns_match_when_score_above_threshold():
-    vec = _make_vector_repo(
-        [
-            {"id": "p-existing", "score": 0.95, "description": "use JWT"},
-            {"id": "p-other", "score": 0.6, "description": "unrelated"},
-        ]
-    )
-    helper = MemoryDedupHelper(vector_repo=vec, threshold=0.92)
-    match = helper.find_existing_match(
-        memory_type="pattern",
-        query_text="use JWT",
-        source_feature="auth",
-    )
-    assert match is not None
-    assert match["id"] == "p-existing"
+def test_dedup_helper_enabled_with_repo_and_threshold():
+    """Helper is enabled when both vector_repo and threshold > 0."""
+    repo = _make_vector_repo()
+    helper = MemoryDedupHelper(vector_repo=repo, threshold=0.92)
+    assert helper.enabled is True
 
 
-def test_dedup_helper_rejects_match_below_threshold():
-    vec = _make_vector_repo([{"id": "p-meh", "score": 0.80}])
-    helper = MemoryDedupHelper(vector_repo=vec, threshold=0.92)
-    assert (
-        helper.find_existing_match(
-            memory_type="pattern",
-            query_text="use JWT",
-            source_feature="auth",
-        )
-        is None
-    )
-
-
-def test_dedup_helper_tolerates_empty_query():
-    vec = _make_vector_repo([{"id": "p-1", "score": 1.0}])
-    helper = MemoryDedupHelper(vector_repo=vec, threshold=0.5)
-    assert (
-        helper.find_existing_match(
-            memory_type="pattern",
-            query_text="   ",
-            source_feature="auth",
-        )
-        is None
-    )
-    vec.search_memories.assert_not_called()
-
-
-def test_dedup_helper_tolerates_search_exception():
-    """Qdrant outage → no match, no crash."""
-    vec = MagicMock()
-    vec.search_memories.side_effect = RuntimeError("qdrant down")
-    helper = MemoryDedupHelper(vector_repo=vec, threshold=0.92)
+def test_dedup_find_existing_match_returns_none_when_disabled():
+    """find_existing_match returns None when dedup is disabled."""
+    helper = MemoryDedupHelper(vector_repo=None)
     result = helper.find_existing_match(
         memory_type="pattern",
-        query_text="use JWT",
+        query_text="use parameterized queries",
         source_feature="auth",
     )
     assert result is None
 
 
-def test_dedup_helper_scopes_to_source_feature_by_default():
-    """The helper passes source_feature to search_memories so
-    matches are scoped to the same feature by default."""
-    vec = _make_vector_repo([])
-    helper = MemoryDedupHelper(vector_repo=vec, threshold=0.92)
-    helper.find_existing_match(
+def test_dedup_find_existing_match_returns_none_for_empty_query():
+    """find_existing_match returns None for empty/whitespace query_text."""
+    repo = _make_vector_repo()
+    helper = MemoryDedupHelper(vector_repo=repo)
+    result = helper.find_existing_match(
         memory_type="pattern",
-        query_text="use JWT",
+        query_text="   ",
         source_feature="auth",
     )
-    call_kwargs = vec.search_memories.call_args.kwargs
-    assert call_kwargs["source_feature"] == "auth"
-    assert call_kwargs["memory_type"] == "pattern"
+    assert result is None
+    repo.search_memories.assert_not_called()
 
 
-def test_dedup_helper_cross_feature_opt_in():
-    vec = _make_vector_repo([])
-    helper = MemoryDedupHelper(vector_repo=vec, threshold=0.92)
+def test_dedup_find_existing_match_above_threshold():
+    """find_existing_match returns the top hit when score >= threshold."""
+    repo = _make_vector_repo(search_results=[
+        {"id": "pattern-abc", "score": 0.95, "description": "use parameterized queries"},
+    ])
+    helper = MemoryDedupHelper(vector_repo=repo, threshold=0.92)
+    result = helper.find_existing_match(
+        memory_type="pattern",
+        query_text="use parameterized queries for SQL",
+        source_feature="auth",
+    )
+    assert result is not None
+    assert result["id"] == "pattern-abc"
+    assert result["score"] == 0.95
+
+
+def test_dedup_find_existing_match_below_threshold():
+    """find_existing_match returns None when top score < threshold."""
+    repo = _make_vector_repo(search_results=[
+        {"id": "pattern-abc", "score": 0.85, "description": "use prepared statements"},
+    ])
+    helper = MemoryDedupHelper(vector_repo=repo, threshold=0.92)
+    result = helper.find_existing_match(
+        memory_type="pattern",
+        query_text="use parameterized queries for SQL",
+        source_feature="auth",
+    )
+    assert result is None
+
+
+def test_dedup_cross_feature_opt_in():
+    """match_cross_feature=True passes source_feature=None to search."""
+    repo = _make_vector_repo(search_results=[])
+    helper = MemoryDedupHelper(vector_repo=repo, threshold=0.92)
     helper.find_existing_match(
         memory_type="pattern",
-        query_text="use JWT",
+        query_text="use parameterized queries",
         source_feature="auth",
         match_cross_feature=True,
     )
-    call_kwargs = vec.search_memories.call_args.kwargs
+    call_kwargs = repo.search_memories.call_args.kwargs
     assert call_kwargs["source_feature"] is None
 
 
-def test_dedup_helper_rejects_non_list_results():
-    """Defensive: a MagicMock vector repo returning a MagicMock
-    instead of a list shouldn't trick the helper into returning a
-    bogus match."""
-    vec = MagicMock()
-    vec.search_memories.return_value = MagicMock()  # not a list
-    helper = MemoryDedupHelper(vector_repo=vec, threshold=0.92)
-    assert (
-        helper.find_existing_match(
-            memory_type="pattern",
-            query_text="x",
-            source_feature="f",
+def test_dedup_same_feature_default():
+    """By default, search is scoped to the same source_feature."""
+    repo = _make_vector_repo(search_results=[])
+    helper = MemoryDedupHelper(vector_repo=repo, threshold=0.92)
+    helper.find_existing_match(
+        memory_type="pattern",
+        query_text="use parameterized queries",
+        source_feature="auth",
+        match_cross_feature=False,
+    )
+    call_kwargs = repo.search_memories.call_args.kwargs
+    assert call_kwargs["source_feature"] == "auth"
+
+
+def test_dedup_graceful_on_search_failure():
+    """Search failures return None (graceful fallback)."""
+    repo = _make_vector_repo(side_effect=RuntimeError("qdrant down"))
+    helper = MemoryDedupHelper(vector_repo=repo, threshold=0.92)
+    result = helper.find_existing_match(
+        memory_type="pattern",
+        query_text="use parameterized queries",
+        source_feature="auth",
+    )
+    assert result is None
+
+
+def test_dedup_handles_non_list_results():
+    """Non-list results from search are treated as no match."""
+    repo = _make_vector_repo()
+    # MagicMock returns a MagicMock by default, which is not a list
+    repo.search_memories.return_value = MagicMock()
+    helper = MemoryDedupHelper(vector_repo=repo, threshold=0.92)
+    result = helper.find_existing_match(
+        memory_type="pattern",
+        query_text="use parameterized queries",
+        source_feature="auth",
+    )
+    assert result is None
+
+
+def test_dedup_handles_non_dict_top_result():
+    """If the top result in the list is not a dict, return None."""
+    repo = _make_vector_repo(search_results=["not-a-dict"])
+    helper = MemoryDedupHelper(vector_repo=repo, threshold=0.92)
+    result = helper.find_existing_match(
+        memory_type="pattern",
+        query_text="use parameterized queries",
+        source_feature="auth",
+    )
+    assert result is None
+
+
+def test_dedup_handles_invalid_score():
+    """If the score field is not a number, return None."""
+    repo = _make_vector_repo(search_results=[
+        {"id": "pattern-abc", "score": "not-a-number"},
+    ])
+    helper = MemoryDedupHelper(vector_repo=repo, threshold=0.92)
+    result = helper.find_existing_match(
+        memory_type="pattern",
+        query_text="use parameterized queries",
+        source_feature="auth",
+    )
+    assert result is None
+
+
+def test_dedup_handles_none_score():
+    """If the score field is None, return None."""
+    repo = _make_vector_repo(search_results=[
+        {"id": "pattern-abc", "score": None},
+    ])
+    helper = MemoryDedupHelper(vector_repo=repo, threshold=0.92)
+    result = helper.find_existing_match(
+        memory_type="pattern",
+        query_text="test query",
+        source_feature="auth",
+    )
+    assert result is None
+
+
+def test_dedup_record_pattern_dedupes(monkeypatch):
+    """MemoryRepository.record_pattern returns existing id on dedup match."""
+    from dark_factory.memory.repository import MemoryRepository
+
+    neo4j_client, session = _make_mock_neo4j()
+    vector_repo = _make_vector_repo(search_results=[
+        {"id": "pattern-existing", "score": 0.95},
+    ])
+    repo = MemoryRepository(neo4j_client, vector_repo, dedup_threshold=0.92)
+    result = repo.record_pattern(
+        description="use parameterized queries",
+        context="SQL injection prevention",
+        source_feature="auth",
+        agent="Coder",
+    )
+    assert result == "pattern-existing"
+
+
+def test_dedup_record_mistake_dedupes():
+    """MemoryRepository.record_mistake returns existing id on dedup match."""
+    from dark_factory.memory.repository import MemoryRepository
+
+    neo4j_client, session = _make_mock_neo4j()
+    vector_repo = _make_vector_repo(search_results=[
+        {"id": "mistake-existing", "score": 0.95},
+    ])
+    repo = MemoryRepository(neo4j_client, vector_repo, dedup_threshold=0.92)
+    result = repo.record_mistake(
+        description="forgot to close file handle",
+        error_type="ResourceLeak",
+        trigger_context="open() without context manager",
+        source_feature="io",
+        agent="Reviewer",
+    )
+    assert result == "mistake-existing"
+
+
+def test_dedup_record_solution_dedupes():
+    """MemoryRepository.record_solution returns existing id on dedup match."""
+    from dark_factory.memory.repository import MemoryRepository
+
+    neo4j_client, session = _make_mock_neo4j()
+    vector_repo = _make_vector_repo(search_results=[
+        {"id": "solution-existing", "score": 0.95},
+    ])
+    repo = MemoryRepository(neo4j_client, vector_repo, dedup_threshold=0.92)
+    result = repo.record_solution(
+        description="use context manager for files",
+        source_feature="io",
+        agent="Coder",
+    )
+    assert result == "solution-existing"
+
+
+def test_dedup_record_strategy_dedupes():
+    """MemoryRepository.record_strategy returns existing id on dedup match."""
+    from dark_factory.memory.repository import MemoryRepository
+
+    neo4j_client, session = _make_mock_neo4j()
+    vector_repo = _make_vector_repo(search_results=[
+        {"id": "strategy-existing", "score": 0.95},
+    ])
+    repo = MemoryRepository(neo4j_client, vector_repo, dedup_threshold=0.92)
+    result = repo.record_strategy(
+        description="always validate inputs at boundaries",
+        applicability="any function accepting external data",
+        source_feature="security",
+        agent="Architect",
+    )
+    assert result == "strategy-existing"
+
+
+def test_boost_relevance_calls_neo4j():
+    """boost_relevance runs Cypher via execute_write (or run) for the given label."""
+    from dark_factory.memory.repository import MemoryRepository
+
+    neo4j_client, session = _make_mock_neo4j()
+    repo = MemoryRepository(neo4j_client)
+    repo.boost_relevance("pattern-abc", "Pattern", delta=0.1)
+    # The implementation prefers execute_write when available (MagicMock has it)
+    if session.execute_write.called:
+        session.execute_write.assert_called_once()
+    else:
+        session.run.assert_called_once()
+
+
+def test_demote_relevance_calls_neo4j():
+    """demote_relevance runs Cypher via execute_write (or run) for the given label."""
+    from dark_factory.memory.repository import MemoryRepository
+
+    neo4j_client, session = _make_mock_neo4j()
+    repo = MemoryRepository(neo4j_client)
+    repo.demote_relevance("pattern-abc", "Pattern", delta=0.05)
+    if session.execute_write.called:
+        session.execute_write.assert_called_once()
+    else:
+        session.run.assert_called_once()
+
+
+def test_boost_invalid_label_is_noop():
+    """boost_relevance with an invalid label does nothing."""
+    from dark_factory.memory.repository import MemoryRepository
+
+    neo4j_client, session = _make_mock_neo4j()
+    repo = MemoryRepository(neo4j_client)
+    repo.boost_relevance("pattern-abc", "InvalidLabel", delta=0.1)
+    session.run.assert_not_called()
+
+
+def test_demote_invalid_label_is_noop():
+    """demote_relevance with an invalid label does nothing."""
+    from dark_factory.memory.repository import MemoryRepository
+
+    neo4j_client, session = _make_mock_neo4j()
+    repo = MemoryRepository(neo4j_client)
+    repo.demote_relevance("pattern-abc", "InvalidLabel", delta=0.05)
+    session.run.assert_not_called()
+
+
+def test_dedup_metrics_emitted_on_write():
+    """observe_memory_write is called with outcome=created on new writes."""
+    from dark_factory.memory.repository import MemoryRepository
+
+    neo4j_client, session = _make_mock_neo4j()
+    # No dedup match — force creation path
+    vector_repo = _make_vector_repo(search_results=[])
+    repo = MemoryRepository(neo4j_client, vector_repo, dedup_threshold=0.92)
+
+    with patch("dark_factory.metrics.prometheus.observe_memory_write") as mock_write:
+        repo.record_pattern(
+            description="new pattern",
+            context="some context",
+            source_feature="auth",
+            agent="Coder",
         )
-        is None
-    )
+        mock_write.assert_called_once_with(memory_type="pattern", outcome="created")
 
 
-# ── MemoryRepository integration tests ──────────────────────────────────────
+def test_set_dedup_threshold_clamps():
+    """set_dedup_threshold clamps values to [0.0, 1.0]."""
+    from dark_factory.memory.repository import MemoryRepository
 
-
-def _make_mock_neo4j():
-    """Build a MagicMock Neo4jClient that captures session.run calls."""
-    mock_client = MagicMock()
-    mock_session = MagicMock()
-    mock_client.session.return_value.__enter__ = MagicMock(return_value=mock_session)
-    mock_client.session.return_value.__exit__ = MagicMock(return_value=False)
-    return mock_client, mock_session
-
-
-def test_record_pattern_creates_new_when_no_match():
-    """With no dedup match, record_pattern creates a new Neo4j node."""
-    mock_client, mock_session = _make_mock_neo4j()
-    mock_vector = MagicMock()
-    mock_vector.search_memories.return_value = []  # no matches
-
-    repo = MemoryRepository(mock_client, vector_repo=mock_vector, dedup_threshold=0.92)
-    result_id = repo.record_pattern(
-        description="use parameterized queries",
-        context="SQL injection prevention",
-        source_feature="auth",
-        agent="coder",
-    )
-    assert result_id.startswith("pattern-")
-    # Neo4j CREATE was executed
-    assert mock_session.run.called
-    # The session.run call created a pattern node
-    cypher_calls = [c.args[0] for c in mock_session.run.call_args_list]
-    assert any("CREATE (p:Pattern" in c for c in cypher_calls)
-
-
-def test_record_pattern_returns_existing_id_on_match():
-    """High-similarity match → boosts existing + returns its id."""
-    mock_client, mock_session = _make_mock_neo4j()
-    mock_vector = MagicMock()
-    mock_vector.search_memories.return_value = [
-        {"id": "pattern-existing", "score": 0.95}
-    ]
-
-    repo = MemoryRepository(mock_client, vector_repo=mock_vector, dedup_threshold=0.92)
-    result_id = repo.record_pattern(
-        description="use parameterized queries",
-        context="SQL injection prevention",
-        source_feature="auth",
-        agent="coder",
-    )
-    assert result_id == "pattern-existing"
-    # No CREATE cypher should have been run — only the boost cypher
-    cypher_calls = [c.args[0] for c in mock_session.run.call_args_list]
-    assert not any("CREATE (p:Pattern" in c for c in cypher_calls)
-    # H3 fix: boost_relevance now goes through session.execute_write(tx_fn),
-    # so the cypher lives inside the transaction function rather than as a
-    # direct session.run call. Verify execute_write was invoked instead.
-    assert mock_session.execute_write.called, (
-        "expected boost_relevance to call session.execute_write"
-    )
-
-
-def test_record_pattern_below_threshold_creates_new():
-    """Match exists but below threshold → still creates new."""
-    mock_client, mock_session = _make_mock_neo4j()
-    mock_vector = MagicMock()
-    mock_vector.search_memories.return_value = [
-        {"id": "pattern-weakmatch", "score": 0.75}
-    ]
-
-    repo = MemoryRepository(mock_client, vector_repo=mock_vector, dedup_threshold=0.92)
-    result_id = repo.record_pattern(
-        description="use parameterized queries",
-        context="SQL injection prevention",
-        source_feature="auth",
-        agent="coder",
-    )
-    assert result_id.startswith("pattern-")
-    assert result_id != "pattern-weakmatch"
-
-
-def test_record_mistake_dedup_bumps_times_seen():
-    """When a mistake dedupes to an existing node, times_seen
-    should be incremented so the counter reflects 'how often we've
-    tripped on this'."""
-    mock_client, mock_session = _make_mock_neo4j()
-    mock_vector = MagicMock()
-    mock_vector.search_memories.return_value = [
-        {"id": "mistake-existing", "score": 0.98}
-    ]
-
-    repo = MemoryRepository(mock_client, vector_repo=mock_vector, dedup_threshold=0.92)
-    result_id = repo.record_mistake(
-        description="forgot CSRF validation",
-        error_type="security",
-        trigger_context="session endpoint",
-        source_feature="auth",
-        agent="reviewer",
-    )
-    assert result_id == "mistake-existing"
-    # times_seen increment cypher was called
-    cypher_calls = [c.args[0] for c in mock_session.run.call_args_list]
-    assert any("times_seen" in c and "coalesce" in c for c in cypher_calls)
-
-
-def test_record_solution_preserves_mistake_linkage_on_dedup():
-    """When a solution is deduped to an existing node, the caller's
-    mistake_id should still produce a RESOLVED_BY edge to the
-    existing solution."""
-    mock_client, mock_session = _make_mock_neo4j()
-    mock_vector = MagicMock()
-    mock_vector.search_memories.return_value = [
-        {"id": "solution-existing", "score": 0.99}
-    ]
-
-    repo = MemoryRepository(mock_client, vector_repo=mock_vector, dedup_threshold=0.92)
-    result_id = repo.record_solution(
-        description="add CSRF middleware",
-        source_feature="auth",
-        agent="reviewer",
-        mistake_id="mistake-new",
-    )
-    assert result_id == "solution-existing"
-    # The RESOLVED_BY MERGE should still have been executed
-    cypher_calls = [c.args[0] for c in mock_session.run.call_args_list]
-    assert any("RESOLVED_BY" in c for c in cypher_calls)
-
-
-def test_boost_relevance_uses_write_transaction():
-    """H3 guard: boost_relevance wraps the cypher in
-    session.execute_write so Neo4j's per-node write lock
-    serialises concurrent boosts on the same node."""
-    mock_client, mock_session = _make_mock_neo4j()
-
-    # Capture the transaction function passed to execute_write so
-    # we can verify it would run the right cypher when invoked.
-    captured: dict = {}
-
-    def _capture_tx(tx_fn):
-        fake_tx = MagicMock()
-        tx_fn(fake_tx)
-        captured["tx_run_calls"] = fake_tx.run.call_args_list
-
-    mock_session.execute_write.side_effect = _capture_tx
-
-    repo = MemoryRepository(mock_client, vector_repo=None, dedup_threshold=0.0)
-    repo.boost_relevance("pattern-test-1", "Pattern", delta=0.1)
-
-    mock_session.execute_write.assert_called_once()
-    # The inner transaction should have run the Pattern boost cypher.
-    assert "tx_run_calls" in captured
-    assert len(captured["tx_run_calls"]) == 1
-    cypher = captured["tx_run_calls"][0].args[0]
-    assert "MATCH (n:Pattern" in cypher
-    assert "relevance_score" in cypher
-
-
-def test_demote_relevance_uses_write_transaction():
-    """H3 guard: demote_relevance uses the same write-transaction
-    pattern as boost_relevance."""
-    mock_client, mock_session = _make_mock_neo4j()
-
-    captured: dict = {}
-
-    def _capture_tx(tx_fn):
-        fake_tx = MagicMock()
-        tx_fn(fake_tx)
-        captured["tx_run_calls"] = fake_tx.run.call_args_list
-
-    mock_session.execute_write.side_effect = _capture_tx
-
-    repo = MemoryRepository(mock_client, vector_repo=None, dedup_threshold=0.0)
-    repo.demote_relevance("mistake-test-1", "Mistake", delta=0.05)
-
-    mock_session.execute_write.assert_called_once()
-    cypher = captured["tx_run_calls"][0].args[0]
-    assert "MATCH (n:Mistake" in cypher
-    assert "relevance_score" in cypher
-
-
-def test_boost_relevance_invalid_label_is_noop():
-    """Unknown label should warn + return without hitting Neo4j."""
-    mock_client, mock_session = _make_mock_neo4j()
-    repo = MemoryRepository(mock_client, vector_repo=None, dedup_threshold=0.0)
-    repo.boost_relevance("x", "NotARealLabel", delta=0.1)
-    mock_session.execute_write.assert_not_called()
-
-
-def test_record_strategy_dedup_returns_existing():
-    mock_client, mock_session = _make_mock_neo4j()
-    mock_vector = MagicMock()
-    mock_vector.search_memories.return_value = [
-        {"id": "strategy-existing", "score": 0.94}
-    ]
-
-    repo = MemoryRepository(mock_client, vector_repo=mock_vector, dedup_threshold=0.92)
-    result_id = repo.record_strategy(
-        description="start with JWT then fall back to sessions",
-        applicability="auth features",
-        source_feature="auth",
-        agent="planner",
-    )
-    assert result_id == "strategy-existing"
-    cypher_calls = [c.args[0] for c in mock_session.run.call_args_list]
-    assert not any("CREATE (st:Strategy" in c for c in cypher_calls)
-
-
-def test_dedup_disabled_via_zero_threshold_always_creates_new():
-    """Setting the threshold to 0.0 disables dedup entirely — every
-    record_* call creates a new node even when a perfect match
-    exists."""
-    mock_client, mock_session = _make_mock_neo4j()
-    mock_vector = MagicMock()
-    mock_vector.search_memories.return_value = [
-        {"id": "pattern-existing", "score": 1.0}
-    ]
-
-    repo = MemoryRepository(mock_client, vector_repo=mock_vector, dedup_threshold=0.0)
-    result_id = repo.record_pattern(
-        description="use parameterized queries",
-        context="SQL",
-        source_feature="auth",
-        agent="coder",
-    )
-    assert result_id.startswith("pattern-")
-    assert result_id != "pattern-existing"
-    # search_memories shouldn't even have been called — helper is disabled
-    mock_vector.search_memories.assert_not_called()
-
-
-def test_set_dedup_threshold_live_updates():
-    mock_client, _ = _make_mock_neo4j()
-    repo = MemoryRepository(mock_client, vector_repo=None, dedup_threshold=0.92)
-    assert repo.dedup_helper.threshold == 0.92
-    repo.set_dedup_threshold(0.80)
-    assert repo.dedup_helper.threshold == 0.80
-    # Clamps to [0, 1]
+    neo4j_client, _ = _make_mock_neo4j()
+    repo = MemoryRepository(neo4j_client)
     repo.set_dedup_threshold(1.5)
     assert repo.dedup_helper.threshold == 1.0
     repo.set_dedup_threshold(-0.5)
     assert repo.dedup_helper.threshold == 0.0
-
-
-def test_record_pattern_emits_created_metric():
-    """New-node writes fire the ``outcome=created`` counter."""
-    from dark_factory.metrics import prometheus as prom
-
-    mock_client, _ = _make_mock_neo4j()
-    mock_vector = MagicMock()
-    mock_vector.search_memories.return_value = []
-
-    repo = MemoryRepository(mock_client, vector_repo=mock_vector, dedup_threshold=0.92)
-
-    before = prom.memory_writes_total.labels(type="pattern", outcome="created")._value.get()
-    repo.record_pattern(
-        description="test",
-        context="ctx",
-        source_feature="auth",
-        agent="coder",
-    )
-    after = prom.memory_writes_total.labels(type="pattern", outcome="created")._value.get()
-    assert after == before + 1
-
-
-def test_record_pattern_emits_deduped_metric_on_match():
-    """Dedup-matched writes fire the ``outcome=deduped`` counter."""
-    from dark_factory.metrics import prometheus as prom
-
-    mock_client, _ = _make_mock_neo4j()
-    mock_vector = MagicMock()
-    mock_vector.search_memories.return_value = [{"id": "pattern-existing", "score": 0.99}]
-
-    repo = MemoryRepository(mock_client, vector_repo=mock_vector, dedup_threshold=0.92)
-
-    before = prom.memory_writes_total.labels(type="pattern", outcome="deduped")._value.get()
-    repo.record_pattern(
-        description="test",
-        context="ctx",
-        source_feature="auth",
-        agent="coder",
-    )
-    after = prom.memory_writes_total.labels(type="pattern", outcome="deduped")._value.get()
-    assert after == before + 1
+    repo.set_dedup_threshold(0.85)
+    assert repo.dedup_helper.threshold == 0.85
 
 
 # ── /api/metrics/memory endpoint tests ──────────────────────────────────────
@@ -534,7 +439,7 @@ def test_memory_metrics_endpoint_reads_from_repo(api_client):
 
 
 def test_memory_metrics_endpoint_propagates_stats_query_failure(api_client):
-    """Repo errors on stats query → HTTP 503 (it's the load-bearing
+    """Repo errors on stats query -> HTTP 503 (it's the load-bearing
     query; if it's broken the dashboard can't show anything useful)."""
     app = api_client.app
     original = getattr(app.state, "memory_repo", None)

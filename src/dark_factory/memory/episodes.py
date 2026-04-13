@@ -181,25 +181,9 @@ class _EpisodeSynthesis(BaseModel):
     )
 
 
-_SYNTHESIS_SYSTEM_PROMPT = """\
-You are a meticulous post-mortem analyst. A per-feature agent swarm
-has just finished executing. Your job is to produce a compact
-narrative summary of what happened AND a short list of the decisive
-turning points.
+from dark_factory.prompts import get_prompt
 
-The summary will be stored as episodic memory and retrieved by a
-future Planner agent working on the same feature. Write for THAT
-reader: what did the previous attempt try, what worked, what didn't,
-what would you do differently.
-
-Be concrete. If a specific tool / pattern / strategy was the key to
-success, name it. If a specific failure mode tripped the swarm up,
-name it. Avoid generic advice.
-
-The summary should be ~200 words. The key events list should be 3-8
-entries, in chronological order, each one a genuine turning point —
-not a routine handoff or tool invocation.
-"""
+_SYNTHESIS_SYSTEM_PROMPT = get_prompt("episode_synthesis", "system")
 
 
 def _build_synthesis_prompt(

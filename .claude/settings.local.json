@@ -56,7 +56,30 @@
       "Bash(find /Users/kquon/ai-dark-factory/frontend/src/components -name \"*.tsx\" -exec wc -l {} +)",
       "Bash(find /Users/kquon/ai-dark-factory/.venv -name *.py)",
       "Bash(python -m pytest tests/ -x -q)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(RUN_ID='run-20260412-051047-9677')",
+      "Bash(find tests:*)",
+      "Bash(docker volume:*)",
+      "Bash(find . -path */grafana* -name *.yml -o -path */grafana* -name *.yaml)",
+      "Bash(git stash:*)",
+      "Bash(pytest --co -q)",
+      "Bash(python -m py_compile src/dark_factory/**/*.py)",
+      "Bash(wc:*)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Bash(do head:*)",
+      "Bash(echo \"--- $f ---\")",
+      "Bash(find /Users/kquon/ai-dark-factory -type f -name *.py -exec grep -l \"delete.*run\\\\|DELETE.*run\\\\|@.*\\\\.delete\" {})",
+      "Bash(2)",
+      "Bash(docker exec:*)",
+      "Bash(gtimeout 30 uv run pytest \"tests/slow/test_ag_ui_bridge.py::test_stream_calls_complete_run_on_success_path\" -v --tb=long)",
+      "Bash(python -m pytest tests/test_cancellation.py -x -q --no-header --tb=short -k \"not api_client\")",
+      "Bash(python -m pytest tests/test_memory_dedup.py -x -q --no-header --tb=short -k \"not api_client\")",
+      "Bash(python -m pytest tests/test_progress_broker.py -x -q --no-header --tb=short -k \"not api_client\")",
+      "Bash(python -m pytest tests/test_prometheus_metrics.py -x -q --no-header --tb=short -k \"not api_client\")",
+      "Bash(python -m pytest tests/test_routes_admin.py -x -q --no-header --tb=short -k \"not api_client\")",
+      "Read(//opt/homebrew/Cellar/python@3.14/3.14.2/Frameworks/Python.framework/Versions/3.14/bin/**)",
+      "Bash(gh api:*)"
     ]
   }
 }

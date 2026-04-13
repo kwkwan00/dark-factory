@@ -7,28 +7,48 @@ type FetchState<T> =
   | { status: "done"; data: T }
   | { status: "error"; error: string };
 
+/** Default request timeout (30 s). Prevents indefinite hangs when the
+ * backend is slow or unresponsive. */
+const DEFAULT_TIMEOUT_MS = 30_000;
+
 // M1 fix: use ref for fetcher so `load` always calls the latest closure.
 // M8 fix: guard against setState on unmounted component.
-function useFetch<T>(fetcher: () => Promise<T>, deps: unknown[] = []) {
+function useFetch<T>(
+  fetcher: () => Promise<T>,
+  deps: unknown[] = [],
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+) {
   const [state, setState] = useState<FetchState<T>>({ status: "idle" });
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
   const mountedRef = useRef(true);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => () => { mountedRef.current = false; }, []);
 
   const load = useCallback(async () => {
+    // Abort any in-flight request before starting a new one.
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+
     setState({ status: "loading" });
     try {
       const data = await fetcherRef.current();
-      if (mountedRef.current) setState({ status: "done", data });
+      if (mountedRef.current && !ctrl.signal.aborted) {
+        setState({ status: "done", data });
+      }
     } catch (e) {
+      if (ctrl.signal.aborted) return; // timed out or superseded — ignore
       if (mountedRef.current) {
         setState({
           status: "error",
           error: e instanceof Error ? e.message : String(e),
         });
       }
+    } finally {
+      clearTimeout(timer);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);

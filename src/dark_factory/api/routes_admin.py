@@ -259,6 +259,23 @@ def _clear_output_dir(request: Request) -> dict:
         shutil.rmtree(output_dir, ignore_errors=True)
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Also clear the storage backend (essential for S3; for LocalStorage
+    # this is redundant with the rmtree above but harmless).
+    try:
+        from dark_factory.storage.backend import get_storage, reset_storage
+
+        storage = get_storage(local_root=output_dir)
+        # List top-level run prefixes and delete each one.
+        # For S3 this wipes all objects; for LocalStorage the rmtree
+        # already cleared everything.
+        all_keys = storage.list_keys("")
+        if all_keys:
+            storage.delete_prefix("")
+        reset_storage()  # Force re-init on next get_storage() call
+    except Exception as exc:
+        log.warning("storage_clear_failed", error=str(exc))
+
     return {
         "files_deleted": files_deleted,
         "bytes_freed": bytes_freed,

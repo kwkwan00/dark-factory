@@ -42,25 +42,18 @@ def _write_fake_doc(tmp_path: Path, name: str, content: bytes = b"fake") -> Path
     return p
 
 
+_AGENTIC_MOCK_TARGET = "dark_factory.llm.agentic.run_agentic_loop"
+
+
 def _stub_agent_writes_staging(
     items: list[dict],
 ):
-    """Build a ``_run_deep_agent`` side-effect that writes the given
+    """Build a ``run_agentic_loop`` side-effect that writes the given
     list of requirement dicts to the staging file next to the source
-    document and returns a success sentinel. The side-effect inspects
-    the module-level ``_output_dir`` the caller installed to find the
-    right directory, exactly like the real deep agent subprocess."""
+    document and returns a success sentinel. The side-effect uses the
+    ``sandbox_root`` kwarg to find the right directory."""
 
-    def _side_effect(prompt: str, allowed_tools, max_turns: int = 15, timeout_seconds=None):
-        # The extractor sets ``_output_dir`` to the source document's
-        # parent directory. The staging filename is embedded in the
-        # prompt — parse it out so the test doesn't need to duplicate
-        # naming logic.
-        from dark_factory.agents import tools as _tools_mod
-
-        staging_dir = _tools_mod._output_dir
-        assert staging_dir is not None, "extract_with_deep_agent must set _output_dir"
-
+    def _side_effect(*, prompt: str, allowed_tools, sandbox_root, max_turns=20, timeout_seconds=600.0, **kw):
         # The prompt contains a line ``Staging output file: <name>``.
         staging_name = None
         for line in prompt.splitlines():
@@ -69,7 +62,7 @@ def _stub_agent_writes_staging(
                 break
         assert staging_name, f"prompt is missing staging filename: {prompt[:300]}"
 
-        (staging_dir / staging_name).write_text(
+        (sandbox_root / staging_name).write_text(
             json.dumps(items), encoding="utf-8"
         )
         return "wrote staging file"
@@ -97,7 +90,7 @@ def test_extract_happy_path_writes_staging_and_returns_requirements(tmp_path: Pa
         },
     ]
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_stub_agent_writes_staging(items),
     ):
         result = extract_with_deep_agent(source)
@@ -127,7 +120,7 @@ def test_extract_ids_are_stable_across_runs(tmp_path: Path):
         }
     ]
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_stub_agent_writes_staging(items),
     ):
         first = extract_with_deep_agent(source)
@@ -138,7 +131,7 @@ def test_extract_ids_are_stable_across_runs(tmp_path: Path):
     staging.unlink()
 
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_stub_agent_writes_staging(items),
     ):
         second = extract_with_deep_agent(source)
@@ -161,7 +154,7 @@ def test_extract_dedupes_within_a_single_document(tmp_path: Path):
         },
     ]
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_stub_agent_writes_staging(items),
     ):
         result = extract_with_deep_agent(source)
@@ -178,7 +171,7 @@ def test_extract_falls_back_medium_on_invalid_priority(tmp_path: Path):
         }
     ]
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_stub_agent_writes_staging(items),
     ):
         result = extract_with_deep_agent(source)
@@ -193,7 +186,7 @@ def test_extract_skips_blank_entries(tmp_path: Path):
         {"title": "Good one", "description": "This is valid.", "priority": "high"},
     ]
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_stub_agent_writes_staging(items),
     ):
         result = extract_with_deep_agent(source)
@@ -212,7 +205,7 @@ def test_extract_prompt_does_not_include_raw_filename(tmp_path: Path):
 
     captured_prompts: list[str] = []
 
-    def _capture(prompt, allowed_tools, max_turns=15, timeout_seconds=None):
+    def _capture(*, prompt, allowed_tools, sandbox_root, max_turns=20, timeout_seconds=600.0, **kw):
         captured_prompts.append(prompt)
         # Pretend we did nothing — return empty output so the
         # extraction path fails cleanly without needing a real
@@ -220,7 +213,7 @@ def test_extract_prompt_does_not_include_raw_filename(tmp_path: Path):
         return ""
 
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_capture,
     ):
         extract_with_deep_agent(source)
@@ -253,13 +246,13 @@ def test_extract_safe_copy_created_and_cleaned_up(tmp_path: Path):
 
     observed_during_agent: dict = {}
 
-    def _probe(prompt, allowed_tools, max_turns=15, timeout_seconds=None):
+    def _probe(*, prompt, allowed_tools, sandbox_root, max_turns=20, timeout_seconds=600.0, **kw):
         # Verify the synthetic copy exists while the agent is running.
         observed_during_agent["synthetic_exists"] = synthetic_path.exists()
         return ""
 
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_probe,
     ):
         extract_with_deep_agent(source)
@@ -277,23 +270,19 @@ def test_extract_handles_json_wrapped_in_code_fence(tmp_path: Path):
     before giving up."""
     source = _write_fake_doc(tmp_path, "fenced.xml")
 
-    def _write_fenced(prompt, allowed_tools, max_turns=15, timeout_seconds=None):
-        from dark_factory.agents import tools as _tools_mod
+    def _write_fenced(*, prompt, allowed_tools, sandbox_root, max_turns=20, timeout_seconds=600.0, **kw):
         from dark_factory.stages.doc_extraction import _staging_filename_for
 
-        staging_dir = _tools_mod._output_dir
-        # Use the canonical staging-filename helper so this test
-        # stays in sync with the H2 safe-filename refactor.
         staging_name = _staging_filename_for(source)
         payload = json.dumps(
             [{"title": "X", "description": "do X", "priority": "high"}]
         )
         fenced = f"```json\n{payload}\n```"
-        (staging_dir / staging_name).write_text(fenced, encoding="utf-8")
+        (sandbox_root / staging_name).write_text(fenced, encoding="utf-8")
         return "ok"
 
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_write_fenced,
     ):
         result = extract_with_deep_agent(source)
@@ -313,7 +302,7 @@ def test_extract_returns_empty_when_source_missing(tmp_path: Path):
 def test_extract_swallows_agent_crash(tmp_path: Path):
     source = _write_fake_doc(tmp_path, "crash.pdf")
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=RuntimeError("SDK exploded"),
     ):
         result = extract_with_deep_agent(source)
@@ -325,7 +314,7 @@ def test_extract_returns_empty_when_no_staging_file_written(tmp_path: Path):
     logs a warning and returns an empty list rather than raising."""
     source = _write_fake_doc(tmp_path, "forgot.xlsx")
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         return_value="I totally did the thing trust me",
     ):
         result = extract_with_deep_agent(source)
@@ -335,15 +324,13 @@ def test_extract_returns_empty_when_no_staging_file_written(tmp_path: Path):
 def test_extract_returns_empty_on_malformed_json(tmp_path: Path):
     source = _write_fake_doc(tmp_path, "bad-json.html")
 
-    def _write_bad(prompt, allowed_tools, max_turns=15, timeout_seconds=None):
-        from dark_factory.agents import tools as _tools_mod
-
-        staging = _tools_mod._output_dir / _staging_filename_for(source)
+    def _write_bad(*, prompt, allowed_tools, sandbox_root, max_turns=20, timeout_seconds=600.0, **kw):
+        staging = sandbox_root / _staging_filename_for(source)
         staging.write_text("this is not valid json {{{")
         return "ok"
 
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_write_bad,
     ):
         result = extract_with_deep_agent(source)
@@ -353,53 +340,17 @@ def test_extract_returns_empty_on_malformed_json(tmp_path: Path):
 def test_extract_returns_empty_when_staging_is_not_a_list(tmp_path: Path):
     source = _write_fake_doc(tmp_path, "object.csv")
 
-    def _write_object(prompt, allowed_tools, max_turns=15, timeout_seconds=None):
-        from dark_factory.agents import tools as _tools_mod
-
-        staging = _tools_mod._output_dir / _staging_filename_for(source)
+    def _write_object(*, prompt, allowed_tools, sandbox_root, max_turns=20, timeout_seconds=600.0, **kw):
+        staging = sandbox_root / _staging_filename_for(source)
         staging.write_text(json.dumps({"title": "wrong shape"}))
         return "ok"
 
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_write_object,
     ):
         result = extract_with_deep_agent(source)
     assert result == []
-
-
-# ── _output_dir restoration ──────────────────────────────────────────────────
-
-
-def test_extract_restores_output_dir_after_call(tmp_path: Path):
-    """The extractor temporarily mutates ``tools._output_dir`` to point
-    at the source document's parent directory. When the call returns
-    (success OR failure), the previous value must be restored so the
-    next pipeline phase sees the same state it had before."""
-    from dark_factory.agents import tools as _tools_mod
-
-    source = _write_fake_doc(tmp_path, "restore.docx")
-    previous = Path("/some/previous/output")
-    _tools_mod._output_dir = previous
-
-    items = [{"title": "T", "description": "D", "priority": "medium"}]
-    try:
-        with patch(
-            "dark_factory.agents.tools._run_deep_agent",
-            side_effect=_stub_agent_writes_staging(items),
-        ):
-            extract_with_deep_agent(source)
-        assert _tools_mod._output_dir == previous
-
-        # And on failure
-        with patch(
-            "dark_factory.agents.tools._run_deep_agent",
-            side_effect=RuntimeError("boom"),
-        ):
-            extract_with_deep_agent(source)
-        assert _tools_mod._output_dir == previous
-    finally:
-        _tools_mod._output_dir = None
 
 
 # ── IngestStage dispatch ─────────────────────────────────────────────────────
@@ -477,11 +428,11 @@ def test_ingest_stale_staging_file_is_removed_before_agent_runs(tmp_path: Path):
     stale = tmp_path / _staging_filename_for(source)
     stale.write_text(json.dumps([{"title": "Old", "description": "old", "priority": "low"}]))
 
-    def _agent_crashes(prompt, allowed_tools, max_turns=15, timeout_seconds=None):
+    def _agent_crashes(*, prompt, allowed_tools, sandbox_root, max_turns=20, timeout_seconds=600.0, **kw):
         raise RuntimeError("crash")
 
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_agent_crashes,
     ):
         result = extract_with_deep_agent(source)
@@ -511,7 +462,7 @@ def test_extract_priority_parsing(tmp_path: Path, raw: str, expected: Priority):
         {"title": "T", "description": "D", "priority": raw},
     ]
     with patch(
-        "dark_factory.agents.tools._run_deep_agent",
+        _AGENTIC_MOCK_TARGET,
         side_effect=_stub_agent_writes_staging(items),
     ):
         result = extract_with_deep_agent(source)

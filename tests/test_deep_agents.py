@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+
+
 from unittest.mock import patch
 
 import pytest
@@ -472,44 +474,53 @@ def test_safe_tool_deep_agent_does_not_swallow_baseexception():
 
 
 def test_all_tool_decorated_deep_agents_use_safe_wrapper():
-    """Source-level regression guard: every ``@tool`` function in
-    ``tools.py`` that calls into a deep-agent subprocess must route
-    through ``_safe_tool_deep_agent``, not the raw ``_run_deep_agent``
-    helper. A new deep-agent tool that forgets to switch will
-    reintroduce the ``feature_swarm_failed`` cascade on any SDK
-    hiccup."""
+    """Source-level regression guard: every ``@tool`` function that
+    delegates to a deep analysis or agentic call must route through
+    ``_safe_llm_complete`` (Category A read-only analysis) or
+    ``_safe_agentic_call`` (Category B file-creating), not the raw
+    ``_run_deep_agent`` subprocess helper."""
     import inspect
 
     from dark_factory.agents import tools as tools_mod
 
-    tool_fn_names = [
-        "claude_agent_codegen",
+    # Category A — read-only analysis → _safe_llm_complete
+    category_a = [
         "deep_dependency_analysis",
         "deep_risk_assessment",
         "deep_security_review",
         "deep_performance_review",
         "deep_spec_compliance_review",
+    ]
+    # Category B — file-creating → _safe_agentic_call
+    category_b = [
+        "claude_agent_codegen",
         "deep_unit_test_gen",
         "deep_integration_test_gen",
         "deep_edge_case_test_gen",
     ]
-    for name in tool_fn_names:
+
+    for name in category_a:
         tool_obj = getattr(tools_mod, name)
-        # ``@tool`` wraps the original function; the underlying fn is
-        # accessible via ``.func`` on langchain StructuredTool.
         inner = getattr(tool_obj, "func", None) or tool_obj
         src = inspect.getsource(inner)
-        assert "_safe_tool_deep_agent" in src, (
-            f"{name} must call _safe_tool_deep_agent — raw "
-            f"_run_deep_agent will propagate SDK crashes out of the "
-            f"swarm and kill the feature."
+        assert "_safe_llm_complete" in src, (
+            f"{name} must call _safe_llm_complete for read-only analysis."
         )
-        # And it must NOT bypass the wrapper by calling the raw
-        # helper directly.
         assert "_run_deep_agent(" not in src, (
-            f"{name} calls _run_deep_agent() directly — switch to "
-            f"_safe_tool_deep_agent so a transient SDK crash cannot "
-            f"cascade into feature_swarm_failed."
+            f"{name} calls _run_deep_agent() directly — use "
+            f"_safe_llm_complete instead."
+        )
+
+    for name in category_b:
+        tool_obj = getattr(tools_mod, name)
+        inner = getattr(tool_obj, "func", None) or tool_obj
+        src = inspect.getsource(inner)
+        assert "_safe_agentic_call" in src, (
+            f"{name} must call _safe_agentic_call for file-creating tools."
+        )
+        assert "_run_deep_agent(" not in src, (
+            f"{name} calls _run_deep_agent() directly — use "
+            f"_safe_agentic_call instead."
         )
 
 

@@ -882,6 +882,10 @@ export default function AboutTab() {
               "Prometheus + Grafana + optional Postgres forensic store",
             ],
             ["Protocol", "AG-UI SSE events for real-time UI streaming"],
+            [
+              "Storage",
+              "Pluggable local filesystem or AWS S3 — run-ID-scoped layout with input/, requirements/, specs/, output/ subfolders",
+            ],
             ["Agentic level", "L4 — Fully Autonomous / Explorer"],
           ]}
         />
@@ -1104,7 +1108,11 @@ export default function AboutTab() {
             ],
             [
               "Claude Agent SDK",
-              "File I/O + Bash tools for code generation and Phase 5 reconciliation.",
+              "File I/O + Bash tools for Phase 5 reconciliation and Phase 6 E2E validation. Deep-agent tools (codegen, analysis, test gen) use direct Anthropic API calls.",
+            ],
+            [
+              "Storage backend",
+              "Pluggable local filesystem or S3 storage. Each run persists input files, parsed requirements, generated specs, and output code under a run-ID-scoped layout.",
             ],
           ]}
         />

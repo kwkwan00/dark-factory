@@ -15,8 +15,8 @@ export interface PipelineResult {
     error?: string;
   }>;
   pass_rate?: number;
-  all_artifacts?: unknown[];
-  all_tests?: unknown[];
+  all_artifacts?: Array<{ path: string; [key: string]: unknown }>;
+  all_tests?: Array<{ name: string; passed: boolean; [key: string]: unknown }>;
   [key: string]: unknown;
 }
 

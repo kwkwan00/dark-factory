@@ -43,121 +43,19 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger()
 
-SPEC_SYSTEM_PROMPT = """\
-You are a software architect. Given a requirement, produce a detailed specification \
-for spec-driven development using the OpenSpec format. Return valid JSON matching the \
-provided schema."""
+from dark_factory.prompts import get_prompt
 
-SPEC_USER_TEMPLATE = """\
-Convert this requirement into a specification.
-
-Requirement ID: {req_id}
-Title: {title}
-Description:
-{description}
-
-Return JSON with fields: id (string, use "spec-" prefix + requirement id), title, \
-description (detailed technical spec), requirement_ids (list with the requirement id), \
-acceptance_criteria (list of testable criteria), dependencies (list of other spec ids, \
-empty if none), capability (kebab-case name for this capability, e.g. "user-auth"), \
-scenarios (list of objects with fields: name, when, then — each describing a \
-WHEN/THEN behavioral scenario)."""
-
-SPEC_REFINE_TEMPLATE = """\
-You previously generated this specification for requirement `{req_id}`. The
-LLM-as-judge evaluation found weaknesses — refine the spec to address them.
-
-Original requirement:
-{title}: {description}
-
-Previous spec attempt #{prev_attempt} (overall score: {prev_score:.2f}):
-{previous_spec}
-
-Evaluation feedback (per metric):
-{feedback}
-
-Generate an IMPROVED specification that directly addresses the lowest-scoring
-metrics. Be more specific in acceptance criteria, add WHEN/THEN scenarios for
-edge cases, and ensure the technical description is unambiguous. Return the
-same JSON schema."""
+SPEC_SYSTEM_PROMPT = get_prompt("spec", "system")
+SPEC_USER_TEMPLATE = get_prompt("spec", "user")
+SPEC_REFINE_TEMPLATE = get_prompt("spec", "refine")
 
 
 # ── Decomposition planning prompts ───────────────────────────────────────────
 
 
-SPEC_PLAN_SYSTEM_PROMPT = """\
-You are a senior systems architect and requirements decomposer. You break a \
-single product requirement into the smallest possible set of independently \
-implementable, testable specifications.
-
-Principles:
-- Prefer MORE granular sub-specs over fewer. A good sub-spec does ONE thing well.
-- Each sub-spec must be independently testable and buildable in isolation.
-- Separate concerns: data models, validation, storage, business logic, HTTP \
-surface, UI state, presentation, error handling, and cross-cutting infrastructure \
-(auth, logging, config) should each get their own sub-spec where applicable.
-- For UI features, separate state management, API calls, and presentation.
-- For backend features, separate the HTTP handler, service logic, repository, \
-and validation/schemas.
-- Express dependencies between sub-specs by referencing EARLIER sibling titles \
-exactly (case-sensitive). Sibling titles must be distinct and contain no colons.
-- Do NOT generate full technical detail yet — the refinement phase will do that. \
-Keep each sub-spec's description to 1-3 sentences naming scope boundaries.
-- Return 3-8 sub-specs for typical requirements. Return exactly 1 only if the \
-requirement is genuinely atomic.
-
-Return valid JSON matching the provided schema."""
-
-SPEC_PLAN_USER_TEMPLATE = """\
-Decompose this requirement into the full set of granular sub-specifications \
-needed to implement it.
-
-Parent Requirement
-==================
-ID: {req_id}
-Title: {title}
-Description:
-{description}
-
-Rules:
-- Return between 1 and 8 sub-specs. Aim for 3-8 unless the requirement is atomic.
-- Each sub-spec must own ONE capability slice.
-- Sub-spec titles must be distinct within this plan and contain no colons.
-- Use `depends_on` to list titles of EARLIER sibling sub-specs this one requires. \
-Empty list for roots.
-- Use kebab-case for `capability`.
-
-Return JSON with fields: parent_requirement_id (must equal "{req_id}") and specs \
-(a list of objects with fields: title, description, capability, depends_on, rationale)."""
-
-SPEC_USER_TEMPLATE_DECOMPOSED = """\
-Convert this PLANNED sub-specification into a full OpenSpec specification.
-
-Parent Requirement (context only — do NOT expand scope beyond the sub-spec slice)
-==================================================================================
-ID: {parent_req_id}
-Title: {parent_req_title}
-Description:
-{parent_req_description}
-
-Planned Sub-Spec Slice (stay strictly within this scope)
-========================================================
-Title: {planned_title}
-Purpose: {planned_description}
-Capability: {planned_capability}
-Rationale: {planned_rationale}
-Declared sibling dependencies (titles only): {planned_depends_on}
-
-Return JSON with these fields:
-- id: MUST equal "{target_spec_id}" exactly.
-- title: MUST equal "{planned_title}" exactly.
-- description: detailed technical spec for THIS slice only.
-- requirement_ids: list containing "{parent_req_id}".
-- acceptance_criteria: testable criteria SPECIFIC to this slice.
-- dependencies: return an empty list. The pipeline will fill dependencies \
-from the planner's sibling title references.
-- capability: use "{planned_capability}" unless you can provide a better kebab-case name.
-- scenarios: list of objects with fields name, when, then."""
+SPEC_PLAN_SYSTEM_PROMPT = get_prompt("spec_plan", "system")
+SPEC_PLAN_USER_TEMPLATE = get_prompt("spec_plan", "user")
+SPEC_USER_TEMPLATE_DECOMPOSED = get_prompt("spec_plan", "user_decomposed")
 
 
 # ── Internal planner models ──────────────────────────────────────────────────

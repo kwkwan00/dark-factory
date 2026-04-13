@@ -144,10 +144,9 @@ model = "claude-sonnet-4-6"
 
 [pipeline]
 output_dir = "./output"
-max_parallel_specs = 4             # spec generation workers
-max_parallel_features = 4          # codegen swarm workers per layer
-max_spec_handoffs = 5              # generate → evaluate → refine iterations
-max_codegen_handoffs = 50          # planner↔coder↔reviewer↔tester transitions
+max_parallel_features = 4
+max_parallel_specs = 4
+max_spec_handoffs = 5
 spec_eval_threshold = 0.8
 
 [openspec]
@@ -366,6 +365,9 @@ Optional:
 - `DEEP_AGENT_TIMEOUT_SECONDS` — default ceiling for Claude Agent SDK calls (default 600s)
 - `DEEP_AGENT_DEBUG_STDERR` — enable `--debug-to-stderr` on the Claude Agent SDK Node CLI subprocess for verbose diagnostics when investigating silent crashes (default off)
 - `EVAL_MODEL` — override the DeepEval judge model (default `gpt-5.4`)
+- `STORAGE_BACKEND` — `local` (default) or `s3`
+- `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT_URL` — S3 bucket config (required when `STORAGE_BACKEND=s3`)
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` — AWS credentials (or use IAM role)
 - `MAX_PARALLEL_FEATURES`, `MAX_PARALLEL_SPECS`, `MAX_SPEC_HANDOFFS`, `MAX_CODEGEN_HANDOFFS`, `SPEC_EVAL_THRESHOLD`, `ENABLE_SPEC_DECOMPOSITION`, `MAX_SPECS_PER_REQUIREMENT`, `MAX_RECONCILIATION_TURNS`, `RECONCILIATION_TIMEOUT_SECONDS`, `REQUIREMENT_DEDUP_THRESHOLD`, `ENABLE_E2E_VALIDATION`, `MAX_E2E_TURNS`, `E2E_TIMEOUT_SECONDS`, `E2E_BROWSERS`, `ENABLE_EPISODIC_MEMORY`, `MEMORY_DEDUP_THRESHOLD` — pipeline tuning overrides
 
 See `.env.example` for the full list with descriptions.
@@ -419,15 +421,43 @@ Three improvements keep the memory graph clean and the recall path sharp:
 - **Grafana** ships with provisioned datasources and dashboards for pipeline throughput, cost rollups, and error budgets.
 - **Incident table** surfaces errors, warnings, and reconciliation issues in the Run Detail popup with stack traces.
 
-### Deep agent resilience
+### Deep agent architecture
 
-The Claude Agent SDK subprocess can crash silently (OOM, Node segfault, network timeout) with no useful stderr. Three layers of defense:
+The 9 `@tool`-decorated deep-agent functions have been migrated from Claude Agent SDK subprocesses to **direct Anthropic API calls**, eliminating the Node.js subprocess layer and its silent crash failure mode:
 
-1. **`_safe_tool_deep_agent`** — a wrapper used by all 9 `@tool`-decorated deep-agent functions (codegen, dependency analysis, risk assessment, security review, performance review, spec compliance review, unit/integration/edge-case test gen). Catches `Exception` and returns a structured error string instead of crashing the feature swarm. Non-tool callers (reconciliation, doc extraction, E2E validation) still see the exception for their own error handling.
-2. **Stderr capture** — every SDK invocation buffers up to 200 lines / 16 KiB of subprocess stderr via a callback. When a crash occurs, the tail is logged alongside the incident for diagnostics.
-3. **`DEEP_AGENT_DEBUG_STDERR`** — when set to `1`/`true`, the underlying Node CLI is spawned with `--debug-to-stderr` so it emits startup, transport, and protocol-state lines. Operators flip this on while investigating silent exits to see what the subprocess was doing before it died.
+- **Category A** (5 read-only analysis tools: dependency analysis, risk assessment, security/performance/compliance review) — use `_safe_llm_complete()`, a single `AnthropicClient.complete()` call with full observability (per-call token/cost tracking via Prometheus + Postgres).
+- **Category B** (4 file-creating tools: codegen, unit/integration/edge-case test gen) — use `_safe_agentic_call()`, a multi-turn tool-use loop via `run_agentic_loop()` with sandboxed Python-side Read/Write/Edit/Glob/Grep/Bash handlers.
+- **Doc extraction** — also migrated to `run_agentic_loop()` with the upload directory as sandbox.
 
-A source-level regression test (`test_all_tool_decorated_deep_agents_use_safe_wrapper`) verifies that every `@tool` function using `_run_deep_agent` actually calls `_safe_tool_deep_agent`, preventing future tools from bypassing the safety wrapper.
+Both wrappers catch `Exception` and return structured error strings so the LangGraph swarm treats failures as soft tool errors, not feature-killing crashes. A source-level regression test verifies Category A tools use `_safe_llm_complete` and Category B tools use `_safe_agentic_call`.
+
+**Reconciliation** and **E2E validation** still use the Claude Agent SDK subprocess (they benefit from process isolation for 30+ minute extended sessions). For those, `DEEP_AGENT_DEBUG_STDERR=1` enables verbose Node CLI diagnostics, and stderr is buffered (200 lines / 16 KiB) for crash forensics.
+
+Each turn of the agentic loop emits a `deep_agent_turn` progress event to the Agent Logs tab in real-time, and each swarm agent's LLM call emits an `agent_llm_start` event when it begins thinking — so the UI shows live activity instead of silence during long calls.
+
+### Storage backend (local / S3)
+
+Pipeline inputs and outputs are persisted through a pluggable storage backend (`STORAGE_BACKEND=local` or `s3`). Each run is stored under a run-ID-scoped layout:
+
+```
+{run_id}/
+  input/              ← uploaded raw files
+  requirements/       ← parsed Requirement models (JSON, post-ingest)
+  specs/              ← generated Spec models (JSON, post-spec-stage)
+  output/             ← generated code, reports, artifacts
+```
+
+For **local storage** (default), this maps to `./output/{run_id}/...`. For **S3**, objects go directly into the bucket: `s3://my-bucket/{run_id}/input/meeting.docx`.
+
+Data is synced at pipeline checkpoints:
+- **Input files** → synced after Phase 1 Ingest
+- **Requirements** → serialized to JSON after Phase 1 Ingest
+- **Specs** → serialized to JSON after Phase 2 Spec Generation
+- **Output** → dual-written on every `write_file` call + bulk synced after Phase 4 (Swarm), Phase 5 (Reconciliation), and Phase 6 (E2E)
+
+Deep agents operate on a local scratch directory (they need real filesystem tools). For S3, files are downloaded to scratch before the phase and synced back after. For local storage, the scratch directory *is* the storage directory — download/sync are no-ops.
+
+The Output tab in the Run Detail popup reads from the storage backend, so it works identically for both local and S3.
 
 ### Cooperative cancellation
 
@@ -484,7 +514,12 @@ src/dark_factory/
 ├── vector/                # Qdrant client, embeddings, hybrid RRF merge
 ├── metrics/               # Prometheus + Postgres recorder + helpers
 ├── evaluation/            # DeepEval GEval metrics + adaptive thresholds
+├── storage/               # Pluggable storage backend (local / S3)
+│   └── backend.py         # LocalStorage, S3Storage, RunStorage, factory
 ├── llm/                   # Anthropic / OpenAI / LangChain clients
+│   ├── anthropic.py       # Direct Anthropic SDK client with observability
+│   ├── agentic.py         # Multi-turn tool-use loop (replaces SDK subprocess)
+│   └── tool_handlers.py   # Sandboxed Read/Write/Edit/Glob/Grep/Bash handlers
 ├── models/domain.py       # Pydantic domain models
 ├── openspec/              # OpenSpec parser + Jinja2 writer
 ├── config.py              # Settings (TOML + env overrides)
@@ -512,7 +547,7 @@ frontend/
 │   └── main.tsx
 └── vite.config.ts
 
-tests/                        # 635 tests across 38 files
+tests/                        # 715 tests across 41 files
 ```
 
 ---
@@ -520,7 +555,7 @@ tests/                        # 635 tests across 38 files
 ## Development
 
 ```bash
-# Run the full test suite (635 tests)
+# Run the full test suite (715 tests)
 uv run pytest tests/ -v
 
 # Fast subset (skip integration + slow tests)
@@ -563,4 +598,4 @@ This system operates at **L4 (Fully Autonomous / Explorer)** on the [Vellum agen
 
 ## License
 
-Proprietary. © Kevin Quon.
+[MIT](LICENSE)

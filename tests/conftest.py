@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from typing import TypeVar
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import BaseModel
 
 from dark_factory.llm.base import LLMClient
 from dark_factory.models.domain import PipelineContext, Priority, Requirement, Spec
+
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -76,17 +78,21 @@ def fake_llm() -> FakeLLMClient:
 
 
 # ── API test fixtures ──────────────────────────────────────────────────────────
-# L7 fix: shared fixture with proper setup/teardown for API tests.
-# The lifespan creates Neo4j clients — mock them to avoid needing a real DB.
+# Module-scoped TestClient so the expensive lifespan (Neo4j mock, storage
+# init, etc.) runs once per file instead of once per test.
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def api_client():
-    """TestClient with mocked Neo4j/memory — safe to use without external services."""
-    from unittest.mock import MagicMock, patch
+    """Module-scoped TestClient with mocked Neo4j/memory."""
+    from unittest.mock import patch
+
+    from dark_factory.storage.backend import reset_storage
+
+    reset_storage()
 
     with (
-        patch("dark_factory.graph.client.Neo4jClient") as _neo4j_cls,
+        patch("dark_factory.graph.client.Neo4jClient"),
         patch("dark_factory.memory.schema.init_memory_schema"),
         patch("dark_factory.memory.repository.MemoryRepository"),
     ):
@@ -95,4 +101,36 @@ def api_client():
 
         with TestClient(app) as client:
             yield client
-        # TestClient exits lifespan here — cleanup runs automatically
+    reset_storage()
+
+
+@pytest.fixture(autouse=True)
+def _restore_app_state(request):
+    """Reset app.state between tests that use ``api_client``.
+
+    Snapshots mutable state attributes before each test and restores
+    them afterward so mutations in one test don't leak into the next.
+    """
+    if "api_client" not in request.fixturenames:
+        yield
+        return
+
+    from dark_factory.api.app import app
+
+    _attrs = (
+        "settings", "neo4j_client", "memory_repo", "memory_client",
+        "vector_repo", "storage", "watcher", "progress_broker",
+        "metrics_recorder", "metrics_client", "bg_loop_sampler",
+        "run_lock",
+    )
+    saved = {}
+    for attr in _attrs:
+        if hasattr(app.state, attr):
+            saved[attr] = getattr(app.state, attr)
+
+    yield
+
+    for attr, val in saved.items():
+        if isinstance(val, MagicMock):
+            val.reset_mock()
+        setattr(app.state, attr, val)

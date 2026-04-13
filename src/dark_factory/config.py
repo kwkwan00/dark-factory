@@ -31,6 +31,35 @@ class LLMConfig(BaseModel):
     model: str = "claude-sonnet-4-6"
 
 
+class ModelRoutingConfig(BaseModel):
+    """Per-role model overrides for multi-model routing.
+
+    Any field left as ``None`` falls back to ``settings.llm.model``.
+    This lets operators assign cheaper/faster models to simpler tasks
+    and reserve the most capable model for complex ones.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    # Swarm agents
+    planner: str | None = None
+    coder: str | None = None
+    reviewer: str | None = None
+    tester: str | None = None
+
+    # Deep agents (direct API calls)
+    deep_analysis: str | None = None   # Category A: read-only analysis
+    deep_codegen: str | None = None    # Category B: file-creating tools
+
+    # Pipeline stages (non-swarm)
+    spec: str | None = None
+    ingest: str | None = None
+
+    def resolve(self, role: str, fallback: str) -> str:
+        """Return the model for *role*, falling back to *fallback*."""
+        return getattr(self, role, None) or fallback
+
+
 class PipelineConfig(BaseModel):
     # validate_assignment=True so runtime mutations from the Settings tab
     # go through Pydantic validators (range checks below).
@@ -78,6 +107,11 @@ class PipelineConfig(BaseModel):
     # Best-effort — a reconciliation failure does NOT fail the run.
     max_reconciliation_turns: int = Field(default=50, ge=1, le=500)
     reconciliation_timeout_seconds: int = Field(default=1800, ge=60, le=7200)
+
+    # Self-healing: max retry attempts per layer / reconciliation pass.
+    # Set to 0 to disable reflection-based retries entirely.
+    max_layer_retries: int = Field(default=1, ge=0, le=3)
+    max_reconciliation_retries: int = Field(default=1, ge=0, le=3)
 
     # Semantic dedup of requirements prior to spec generation. A real
     # requirements corpus assembled from multiple uploaded documents
@@ -253,6 +287,7 @@ class PrometheusConfig(BaseModel):
 class Settings(BaseModel):
     neo4j: Neo4jConfig = Neo4jConfig()
     llm: LLMConfig = LLMConfig()
+    model_routing: ModelRoutingConfig = ModelRoutingConfig()
     pipeline: PipelineConfig = PipelineConfig()
     logging: LoggingConfig = LoggingConfig()
     openspec: OpenSpecConfig = OpenSpecConfig()
@@ -370,6 +405,10 @@ def load_settings(config_path: Path | None = None) -> Settings:
         settings.pipeline.max_reconciliation_turns = val
     if (val := _env_int("RECONCILIATION_TIMEOUT_SECONDS")) is not None:
         settings.pipeline.reconciliation_timeout_seconds = val
+    if (val := _env_int("MAX_LAYER_RETRIES")) is not None:
+        settings.pipeline.max_layer_retries = val
+    if (val := _env_int("MAX_RECONCILIATION_RETRIES")) is not None:
+        settings.pipeline.max_reconciliation_retries = val
 
     # Semantic requirement dedup threshold
     if (val := _env_float("REQUIREMENT_DEDUP_THRESHOLD")) is not None:
@@ -422,6 +461,21 @@ def load_settings(config_path: Path | None = None) -> Settings:
         settings.llm.model = llm_model
     if eval_model_env := os.getenv("EVAL_MODEL"):
         settings.evaluation.eval_model = eval_model_env
+
+    # Per-role model routing overrides (env vars take precedence over config.toml).
+    _routing_env_map = {
+        "MODEL_PLANNER": "planner",
+        "MODEL_CODER": "coder",
+        "MODEL_REVIEWER": "reviewer",
+        "MODEL_TESTER": "tester",
+        "MODEL_DEEP_ANALYSIS": "deep_analysis",
+        "MODEL_DEEP_CODEGEN": "deep_codegen",
+        "MODEL_SPEC": "spec",
+        "MODEL_INGEST": "ingest",
+    }
+    for env_var, field in _routing_env_map.items():
+        if val := os.getenv(env_var):
+            setattr(settings.model_routing, field, val)
 
     # Push the resolved eval model name into the metrics module global
     # so the DeepEval builders pick it up. Importing here (not at module

@@ -1,4 +1,4 @@
-"""Tests for the AG-UI pipeline bridge and agent streaming endpoint."""
+"""Tests for the AG-UI pipeline bridge (unit-level, no api_client)."""
 
 from __future__ import annotations
 
@@ -51,9 +51,62 @@ def _mock_result():
     }
 
 
+def _fake_e2e_result(status: str = "pass"):
+    """Build a concrete E2EValidationResult for mocking the stage."""
+    from dark_factory.stages.e2e_validation import E2EValidationResult
+
+    return E2EValidationResult(
+        status=status,
+        summary=f"E2E {status}",
+        tests_total=6,
+        tests_passed=6 if status == "pass" else 4,
+        tests_failed=0 if status == "pass" else 2,
+        browsers_run=["chromium", "firefox", "webkit"],
+        agent_output="ran tests",
+        report_path="E2E_REPORT.md",
+        html_report_path="e2e_artifacts/html-report",
+        screenshots=[],
+        duration_seconds=12.3,
+    )
+
+
 @pytest.fixture
 def minimal_settings() -> Settings:
     return Settings()
+
+
+@pytest.fixture(autouse=True)
+def _mock_recon_and_storage():
+    """Prevent real storage init, reconciliation, and reflection LLM calls."""
+    def _skip_recon(self, **kw):
+        from dark_factory.stages.reconciliation import ReconciliationResult
+        return ReconciliationResult(
+            status="clean", summary="mocked clean", agent_output="",
+            report_path=None, duration_seconds=0.0,
+        )
+
+    def _skip_e2e(self, **kw):
+        from dark_factory.stages.e2e_validation import E2EValidationResult
+        return E2EValidationResult(
+            status="skipped", summary="mocked skip", agent_output="",
+            report_path=None, html_report_path=None, screenshots=[],
+            tests_total=0, tests_passed=0, tests_failed=0,
+            browsers_run=[], duration_seconds=0.0,
+        )
+
+    with (
+        patch("dark_factory.storage.backend.get_storage"),
+        patch("dark_factory.api.ag_ui_bridge._reflect_on_reconciliation", return_value=None),
+        patch(
+            "dark_factory.stages.reconciliation.ReconciliationStage.run",
+            new=_skip_recon,
+        ),
+        patch(
+            "dark_factory.stages.e2e_validation.E2EValidationStage.run",
+            new=_skip_e2e,
+        ),
+    ):
+        yield
 
 
 # ── _text_events ──────────────────────────────────────────────────────────────
@@ -139,11 +192,20 @@ def test_stream_ends_with_run_finished(minimal_settings):
     assert types[-1] == "RUN_FINISHED"
 
 
-def test_stream_has_four_phase_steps(minimal_settings):
+def test_stream_has_phase_steps(minimal_settings):
     chunks = _stream_with_mocks(minimal_settings)
     types = [event_type(c) for c in chunks]
-    assert types.count("STEP_STARTED") == 4
-    assert types.count("STEP_FINISHED") == 4
+    # 4 core phases + reconciliation (always runs now that run_id is always set)
+    assert types.count("STEP_STARTED") >= 4
+    assert types.count("STEP_FINISHED") >= 4
+    # Core phases are always present
+    step_names = [
+        parse_event(c).get("stepName")
+        for c in chunks
+        if event_type(c) == "STEP_STARTED"
+    ]
+    for phase in ("Ingest", "Spec Generation", "Knowledge Graph", "Swarm Orchestrator"):
+        assert phase in step_names
 
 
 def test_stream_has_state_snapshot(minimal_settings):
@@ -165,7 +227,8 @@ def test_stream_step_names_match_phases(minimal_settings):
         for c in chunks
         if event_type(c) == "STEP_STARTED"
     ]
-    assert step_names == ["Ingest", "Spec Generation", "Knowledge Graph", "Swarm Orchestrator"]
+    # Core 4 phases always present; Reconciliation also runs now that run_id is always set
+    assert step_names[:4] == ["Ingest", "Spec Generation", "Knowledge Graph", "Swarm Orchestrator"]
 
 
 def test_stream_run_id_in_started_and_finished(minimal_settings):
@@ -485,25 +548,6 @@ def test_stream_reconciliation_crash_does_not_fail_run(minimal_settings):
 
 
 # ── Phase 6: E2E Validation ───────────────────────────────────────────────────
-
-
-def _fake_e2e_result(status: str = "pass"):
-    """Build a concrete E2EValidationResult for mocking the stage."""
-    from dark_factory.stages.e2e_validation import E2EValidationResult
-
-    return E2EValidationResult(
-        status=status,
-        summary=f"E2E {status}",
-        tests_total=6,
-        tests_passed=6 if status == "pass" else 4,
-        tests_failed=0 if status == "pass" else 2,
-        browsers_run=["chromium", "firefox", "webkit"],
-        agent_output="ran tests",
-        report_path="E2E_REPORT.md",
-        html_report_path="e2e_artifacts/html-report",
-        screenshots=[],
-        duration_seconds=12.3,
-    )
 
 
 def test_stream_runs_e2e_phase(minimal_settings):
@@ -912,15 +956,7 @@ def test_agent_run_accepts_optional_api_key_overrides(api_client):
     """Per-run API key overrides are forwarded through to run_pipeline_stream."""
     captured = {}
 
-    async def _fake_stream(
-        settings,
-        requirements_path,
-        thread_id,
-        run_id,
-        accept=None,
-        memory_repo=None,
-        **_kwargs,
-    ):
+    async def _fake_stream(settings, requirements_path, thread_id, run_id, accept=None, memory_repo=None, **_kwargs):
         captured.update(_kwargs)
         encoder = EventEncoder(accept=accept)
         from ag_ui.core import EventType, RunFinishedEvent, RunStartedEvent
@@ -992,11 +1028,7 @@ def test_agent_run_rejects_api_key_with_whitespace(api_client):
 
 def test_agent_run_validation_error_does_not_echo_api_key(api_client):
     """CRITICAL security guardrail: a rejected API key must NOT appear in
-    the 422 response body. Pydantic's default ``input_value`` echoing is
-    disabled on RunRequest via ``hide_input_in_errors=True``, so the raw
-    secret can't leak into browser console logs through
-    describeFailure() on the frontend.
-    """
+    the 422 response body."""
     secret = "sk-ant-SUPER_SECRET_DO_NOT_LEAK_" + "x" * 500
     resp = api_client.post(
         "/api/agent/run",
@@ -1026,6 +1058,9 @@ def test_agent_run_openai_key_also_hidden_in_validation_errors(api_client):
     assert "OPENAI_SECRET" not in resp.text
 
 
+# ── API key injection & leak prevention ──────────────────────────────────────
+
+
 def test_run_pipeline_stream_injects_and_restores_api_keys(
     minimal_settings, monkeypatch, tmp_path
 ):
@@ -1033,15 +1068,12 @@ def test_run_pipeline_stream_injects_and_restores_api_keys(
     previous values are restored even on exception."""
     import os
 
-    # Seed prior env state so we can verify restoration.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "previous-anthropic")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     seen: dict = {}
 
-    # Patch build_llm so it observes the env vars then halts the pipeline
-    # by raising — we only care about env mutation, not the full pipeline.
-    def _fake_llm(_settings):
+    def _fake_llm(_settings, model_override=None):
         seen["anthropic_during_build"] = os.environ.get("ANTHROPIC_API_KEY")
         seen["openai_during_build"] = os.environ.get("OPENAI_API_KEY")
         raise RuntimeError("halt-pipeline-for-test")
@@ -1068,15 +1100,12 @@ def test_run_pipeline_stream_injects_and_restores_api_keys(
 
     assert seen["anthropic_during_build"] == "sk-override-anthropic"
     assert seen["openai_during_build"] == "sk-override-openai"
-    # After the stream exits (even via exception), env vars are restored.
     assert os.environ.get("ANTHROPIC_API_KEY") == "previous-anthropic"
     assert "OPENAI_API_KEY" not in os.environ
 
 
 def test_api_key_override_class_redacts_repr():
-    """H1 guard: the _ApiKeyOverride helper must never expose the
-    secret via repr(), even when the object is serialised by a
-    traceback formatter."""
+    """The _ApiKeyOverride helper must never expose the secret via repr()."""
     from dark_factory.api.ag_ui_bridge import _ApiKeyOverride
 
     override = _ApiKeyOverride(
@@ -1092,26 +1121,20 @@ def test_api_key_override_class_redacts_repr():
 def test_traceback_from_stream_does_not_leak_api_keys(
     minimal_settings, monkeypatch, tmp_path
 ):
-    """H1 guard: if the pipeline stream raises after installing the
-    per-run API key overrides, the resulting traceback (including
-    local-variable inspection via ``traceback.format_exception``) must
-    NOT contain the plain-text key values. The function parameters
-    are cleared immediately after the override helper captures them,
-    and the helper wraps both the new and previous keys in SecretStr
-    so frame introspection can't reach the raw strings."""
+    """If the pipeline stream raises after installing per-run API key
+    overrides, the traceback must NOT contain the plain-text key values."""
     import os
     import traceback
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "previous-anthropic-secret-XXYY")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    # Sentinel key values that should never end up in a traceback.
     override_anthropic = "sk-override-anthropic-SHOULD-NOT-LEAK-aaa111"
     override_openai = "sk-override-openai-SHOULD-NOT-LEAK-bbb222"
 
     captured_traceback: str | None = None
 
-    def _fake_llm(_settings):
+    def _fake_llm(_settings, model_override=None):
         raise RuntimeError("halt-pipeline-for-traceback-test")
 
     monkeypatch.setattr(
@@ -1139,15 +1162,7 @@ def test_traceback_from_stream_does_not_leak_api_keys(
             traceback.format_exception(type(exc), exc, exc.__traceback__)
         )
 
-    # The pipeline catches RuntimeError internally and emits a RUN_ERROR
-    # event instead of re-raising, so the run above may NOT produce an
-    # outer exception. In that case we still want to exercise the key
-    # leak guard via a synthetic traceback inspection of the override
-    # helper itself.
     if captured_traceback is None:
-        # Synthesise the kind of traceback a logger might capture by
-        # constructing an override + rendering its repr — matches the
-        # leak surface a real exception formatter would walk.
         from dark_factory.api.ag_ui_bridge import _ApiKeyOverride
 
         ovr = _ApiKeyOverride(
@@ -1156,12 +1171,9 @@ def test_traceback_from_stream_does_not_leak_api_keys(
         )
         captured_traceback = repr(ovr)
 
-    # Neither the override values nor the previous env var value
-    # should appear anywhere in the captured traceback text.
     assert override_anthropic not in captured_traceback
     assert override_openai not in captured_traceback
     assert "previous-anthropic-secret-XXYY" not in captured_traceback
 
-    # And the normal restore behaviour should still have run.
     assert os.environ.get("ANTHROPIC_API_KEY") == "previous-anthropic-secret-XXYY"
     assert "OPENAI_API_KEY" not in os.environ
