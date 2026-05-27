@@ -25,6 +25,8 @@ create :class:`RunStorage` instances as needed for each run.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 from abc import ABC, abstractmethod
@@ -32,6 +34,8 @@ from pathlib import Path
 from typing import Iterator
 
 import structlog
+
+from dark_factory.log import trace_methods
 
 log = structlog.get_logger()
 
@@ -123,6 +127,7 @@ class StorageBackend(ABC):
 # ── Per-run storage wrapper ───────────────────────────────────────────────────
 
 
+@trace_methods
 class RunStorage:
     """Convenience wrapper that scopes a :class:`StorageBackend` to a
     single pipeline run with four sub-folders::
@@ -144,9 +149,12 @@ class RunStorage:
         store.download_input_to_local(local_dir)
     """
 
+    _MD5_MANIFEST = ".md5-manifest.json"
+
     def __init__(self, backend: StorageBackend, run_id: str) -> None:
         self.backend = backend
         self.run_id = run_id
+        self._md5_cache: dict[str, str] | None = None
 
     def _input_key(self, path: str) -> str:
         return f"{self.run_id}/input/{path}"
@@ -258,15 +266,67 @@ class RunStorage:
         """Yield ``(relative_path, size_bytes)`` for spec files."""
         return self.backend.walk(self.specs_prefix)
 
+    # ── MD5 manifest ─────────────────────────────────────────────────
+
+    def _md5_manifest_key(self) -> str:
+        return self._output_key(self._MD5_MANIFEST)
+
+    def _ensure_md5_cache(self) -> dict[str, str]:
+        if self._md5_cache is None:
+            try:
+                raw = self.backend.read_text(self._md5_manifest_key())
+                self._md5_cache = json.loads(raw)
+            except Exception:
+                self._md5_cache = {}
+        return self._md5_cache
+
+    def _record_md5(self, path: str, data: bytes) -> None:
+        """Record the MD5 hash for a file in the in-memory cache.
+
+        Does NOT flush the manifest to storage — call
+        :meth:`flush_md5_manifest` once after a batch of writes to
+        persist the manifest in a single I/O operation.
+        """
+        cache = self._ensure_md5_cache()
+        cache[path] = hashlib.md5(data).hexdigest()
+
+    def flush_md5_manifest(self) -> None:
+        """Persist the in-memory MD5 cache to storage.
+
+        Call this at the end of a batch of writes (e.g. after
+        ``sync_output_from_local`` or at a ``finalize()`` lifecycle
+        point) so the manifest is written once instead of after every
+        individual file write.
+        """
+        cache = self._ensure_md5_cache()
+        if not cache:
+            return
+        try:
+            self.backend.write_text(
+                self._md5_manifest_key(),
+                json.dumps(cache, sort_keys=True, indent=1),
+            )
+        except Exception:
+            pass  # best-effort
+
+    def get_md5_manifest(self) -> dict[str, str]:
+        """Return the MD5 manifest {path: hex_hash} for this run's output."""
+        return dict(self._ensure_md5_cache())
+
     # ── Output operations ─────────────────────────────────────────────
 
     def write_output(self, path: str, content: str) -> None:
         """Write a text file to the run's output area."""
+        data = content.encode("utf-8")
         self.backend.write_text(self._output_key(path), content)
+        self._record_md5(path, data)
+        self.flush_md5_manifest()
 
     def write_output_bytes(self, path: str, data: bytes) -> None:
         """Write binary data to the run's output area."""
         self.backend.write_bytes(self._output_key(path), data)
+        self._record_md5(path, data)
+        self.flush_md5_manifest()
 
     def read_output(self, path: str) -> str:
         """Read a text file from the run's output area."""
@@ -281,8 +341,27 @@ class RunStorage:
         return self.backend.exists(self._output_key(path))
 
     def sync_output_from_local(self, local_dir: Path) -> int:
-        """Sync a local scratch directory into the run's output area."""
-        return self.backend.sync_local_to_storage(local_dir, self.output_prefix)
+        """Sync a local scratch directory into the run's output area.
+
+        Also computes MD5 hashes for all synced files and writes the
+        manifest so future diff operations can compare without re-reading.
+        """
+        count = self.backend.sync_local_to_storage(local_dir, self.output_prefix)
+
+        # Build MD5 manifest from the local files we just synced
+        if count > 0:
+            cache = self._ensure_md5_cache()
+            for src in local_dir.rglob("*"):
+                if not src.is_file():
+                    continue
+                rel = str(src.relative_to(local_dir))
+                try:
+                    data = src.read_bytes()
+                    cache[rel] = hashlib.md5(data).hexdigest()
+                except Exception:
+                    pass
+            self.flush_md5_manifest()
+        return count
 
     def download_output_to_local(self, local_dir: Path) -> None:
         """Download all output files to a local directory."""
@@ -293,8 +372,14 @@ class RunStorage:
         return self.backend.list_keys(self.output_prefix)
 
     def walk_output(self) -> Iterator[tuple[str, int]]:
-        """Yield ``(relative_path, size_bytes)`` for output files."""
-        return self.backend.walk(self.output_prefix)
+        """Yield ``(relative_path, size_bytes)`` for output files.
+
+        Excludes the internal MD5 manifest file.
+        """
+        for rel, size in self.backend.walk(self.output_prefix):
+            if rel == self._MD5_MANIFEST:
+                continue
+            yield rel, size
 
     def presign_output(self, path: str, expires: int = 3600) -> str | None:
         """Return a presigned URL for an output file."""
@@ -310,6 +395,7 @@ class RunStorage:
 # ── Local filesystem implementation ───────────────────────────────────────────
 
 
+@trace_methods
 class LocalStorage(StorageBackend):
     """Store files on the local filesystem under a root directory."""
 
@@ -317,7 +403,16 @@ class LocalStorage(StorageBackend):
         self.root = root.resolve()
 
     def _abs(self, key: str) -> Path:
-        return self.root / key
+        # Resolve the candidate path and verify it stays under root.
+        # Defends against future regex relaxation on the route side
+        # and pre-existing symlinks under root that point outside it
+        # (callers' write paths would otherwise follow the symlink).
+        candidate = (self.root / key).resolve()
+        if not candidate.is_relative_to(self.root):
+            raise ValueError(
+                f"Storage key resolves outside root: {key!r}"
+            )
+        return candidate
 
     # ── Single file ───────────────────────────────────────────────────
 
@@ -400,13 +495,25 @@ class LocalStorage(StorageBackend):
         shutil.copy2(str(local_path), str(dest))
 
     def sync_local_to_storage(self, local_dir: Path, prefix: str) -> int:
-        # No-op when the source is the same directory as the target.
         target = self._abs(prefix)
-        if target.resolve() == local_dir.resolve():
+        local_resolved = local_dir.resolve()
+        target_resolved = target.resolve()
+        # No-op when the source is the same directory as the target.
+        if target_resolved == local_resolved:
             return 0
+        # Check if target is inside local_dir — skip files under target
+        # to prevent recursive copy loops (e.g. syncing /output/run-X
+        # into /output/run-X/output/ would otherwise re-copy endlessly).
+        target_is_nested = str(target_resolved).startswith(str(local_resolved) + os.sep)
         count = 0
         for src in local_dir.rglob("*"):
             if not src.is_file():
+                continue
+            src_resolved = str(src.resolve())
+            if target_is_nested and (
+                src_resolved == str(target_resolved)
+                or src_resolved.startswith(str(target_resolved) + os.sep)
+            ):
                 continue
             rel = src.relative_to(local_dir)
             dest = self._abs(f"{prefix}/{rel}")
@@ -430,6 +537,7 @@ class LocalStorage(StorageBackend):
 # ── S3 implementation ─────────────────────────────────────────────────────────
 
 
+@trace_methods
 class S3Storage(StorageBackend):
     """Store files in a dedicated AWS S3 bucket.
 
@@ -589,9 +697,186 @@ class S3Storage(StorageBackend):
                     yield rel, obj.get("Size", 0)
 
 
+# ── Replicated (local + S3) implementation ─────────────────────────────────────
+
+
+@trace_methods
+class ReplicatedStorage(StorageBackend):
+    """Write to both local disk and S3; read from local.
+
+    Local is the primary (fast, always available). S3 is the replica
+    (durable, off-host).  S3 write failures are best-effort: logged as
+    warnings but never propagated, so an S3 outage cannot break the
+    pipeline.  Reads always come from local — S3 is write-only from
+    the pipeline's perspective (the API layer can serve downloads from
+    either via :class:`RunStorage`).
+    """
+
+    def __init__(self, primary: LocalStorage, replica: S3Storage) -> None:
+        self.primary = primary
+        self.replica = replica
+        log.info(
+            "replicated_storage_init",
+            local_root=str(primary.root),
+            s3_bucket=replica.bucket,
+        )
+
+    # ── helpers ────────────────────────────────────────────────────────
+
+    def _replicate(self, op: str, fn, *args, **kwargs) -> None:
+        """Call *fn* on the replica, swallowing any exception."""
+        try:
+            fn(*args, **kwargs)
+        except Exception as exc:
+            log.warning("s3_replicate_failed", operation=op, error=str(exc))
+            try:
+                from dark_factory.metrics.helpers import record_s3_replication_failure
+                record_s3_replication_failure(operation=op)
+            except Exception:
+                pass
+
+    # ── Single file ───────────────────────────────────────────────────
+
+    def read_text(self, key: str) -> str:
+        try:
+            return self.primary.read_text(key)
+        except FileNotFoundError:
+            return self.replica.read_text(key)
+
+    def read_bytes(self, key: str) -> bytes:
+        try:
+            return self.primary.read_bytes(key)
+        except FileNotFoundError:
+            return self.replica.read_bytes(key)
+
+    def write_text(self, key: str, content: str) -> None:
+        self.primary.write_text(key, content)
+        self._replicate("write_text", self.replica.write_text, key, content)
+
+    def write_bytes(self, key: str, data: bytes) -> None:
+        self.primary.write_bytes(key, data)
+        self._replicate("write_bytes", self.replica.write_bytes, key, data)
+
+    def exists(self, key: str) -> bool:
+        return self.primary.exists(key) or self.replica.exists(key)
+
+    def delete(self, key: str) -> None:
+        self.primary.delete(key)
+        self._replicate("delete", self.replica.delete, key)
+
+    # ── Prefix ────────────────────────────────────────────────────────
+
+    def list_keys(self, prefix: str) -> list[str]:
+        keys = self.primary.list_keys(prefix)
+        if keys:
+            return keys
+        try:
+            return self.replica.list_keys(prefix)
+        except Exception:
+            return []
+
+    def delete_prefix(self, prefix: str) -> None:
+        self.primary.delete_prefix(prefix)
+        self._replicate("delete_prefix", self.replica.delete_prefix, prefix)
+
+    # ── Bulk transfer ─────────────────────────────────────────────────
+
+    def download_to_local(self, key: str, local_path: Path) -> None:
+        try:
+            self.primary.download_to_local(key, local_path)
+        except FileNotFoundError:
+            self.replica.download_to_local(key, local_path)
+
+    def download_prefix_to_local(self, prefix: str, local_dir: Path) -> None:
+        self.primary.download_prefix_to_local(prefix, local_dir)
+        # If local had nothing, try S3
+        if not any(local_dir.rglob("*")):
+            try:
+                self.replica.download_prefix_to_local(prefix, local_dir)
+            except Exception:
+                pass
+
+    def upload_from_local(self, local_path: Path, key: str) -> None:
+        self.primary.upload_from_local(local_path, key)
+        self._replicate("upload_from_local", self.replica.upload_from_local, local_path, key)
+
+    def sync_local_to_storage(self, local_dir: Path, prefix: str) -> int:
+        # Snapshot which files exist BEFORE the local copy, so we only
+        # upload the original source files to S3 — not the copies that
+        # LocalStorage creates inside the nested target directory.
+        source_files: list[tuple[Path, str]] = []
+        local_resolved = local_dir.resolve()
+        target_resolved = self.primary._abs(prefix).resolve()
+        target_is_nested = str(target_resolved).startswith(
+            str(local_resolved) + os.sep
+        )
+        for src in local_dir.rglob("*"):
+            if not src.is_file():
+                continue
+            if target_is_nested:
+                src_str = str(src.resolve())
+                if src_str == str(target_resolved) or src_str.startswith(
+                    str(target_resolved) + os.sep
+                ):
+                    continue
+            rel = src.relative_to(local_dir)
+            source_files.append((src, f"{prefix}/{rel}"))
+
+        count = self.primary.sync_local_to_storage(local_dir, prefix)
+        # Upload the pre-snapshot files to S3 — avoids uploading the
+        # local-to-local copies that the primary just created.
+        self._replicate(
+            "sync_local_to_storage",
+            self._upload_file_list, source_files,
+        )
+        return count
+
+    def _upload_file_list(
+        self, files: list[tuple[Path, str]],
+    ) -> None:
+        """Upload a pre-computed list of (local_path, s3_key) pairs."""
+        for local_path, key in files:
+            self.replica.upload_from_local(local_path, key)
+
+    # ── Presigned URLs ────────────────────────────────────────────────
+
+    def presign_url(self, key: str, expires: int = 3600) -> str | None:
+        return self.replica.presign_url(key, expires)
+
+    # ── Walk ──────────────────────────────────────────────────────────
+
+    def walk(self, prefix: str) -> Iterator[tuple[str, int]]:
+        entries = list(self.primary.walk(prefix))
+        if entries:
+            return iter(entries)
+        # Local is empty — fall back to S3
+        try:
+            return self.replica.walk(prefix)
+        except Exception:
+            return iter([])
+
+
 # ── Factory ───────────────────────────────────────────────────────────────────
 
 _singleton: StorageBackend | None = None
+
+
+def _build_s3(
+    bucket: str | None = None,
+) -> S3Storage:
+    """Construct an S3Storage from environment variables."""
+    bucket = bucket or os.getenv("S3_BUCKET", "")
+    if not bucket:
+        raise ValueError(
+            "S3_BUCKET environment variable is required for S3 storage"
+        )
+    return S3Storage(
+        bucket=bucket,
+        region=os.getenv("S3_REGION", "us-east-1").strip(),
+        access_key=os.getenv("AWS_ACCESS_KEY_ID"),
+        secret_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        endpoint_url=os.getenv("S3_ENDPOINT_URL"),
+    )
 
 
 def get_storage(local_root: Path | None = None) -> StorageBackend:
@@ -600,8 +885,11 @@ def get_storage(local_root: Path | None = None) -> StorageBackend:
     Reads ``STORAGE_BACKEND`` env var:
 
     - ``local`` (default) → :class:`LocalStorage` rooted at
-      *local_root* (defaults to ``./output``).
+      *local_root* (defaults to ``./output``).  **If ``S3_BUCKET`` is
+      also set**, automatically wraps in :class:`ReplicatedStorage` so
+      writes go to both local disk and S3.
     - ``s3`` → :class:`S3Storage` with bucket from ``S3_BUCKET``.
+      No local copy is kept.
 
     The *local_root* parameter is only used on first call (when the
     singleton is created).  Subsequent calls return the cached instance.
@@ -612,25 +900,33 @@ def get_storage(local_root: Path | None = None) -> StorageBackend:
 
     backend = os.getenv("STORAGE_BACKEND", "local").strip().lower()
     if backend == "s3":
-        bucket = os.getenv("S3_BUCKET", "")
-        if not bucket:
-            raise ValueError(
-                "S3_BUCKET environment variable is required when "
-                "STORAGE_BACKEND=s3"
-            )
-        _singleton = S3Storage(
-            bucket=bucket,
-            region=os.getenv("S3_REGION", "us-east-1").strip(),
-            access_key=os.getenv("AWS_ACCESS_KEY_ID"),
-            secret_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-            endpoint_url=os.getenv("S3_ENDPOINT_URL"),
-        )
+        _singleton = _build_s3()
     else:
         root = local_root or Path("./output")
         root.mkdir(parents=True, exist_ok=True)
-        _singleton = LocalStorage(root=root.resolve())
+        local = LocalStorage(root=root.resolve())
 
-    log.info("storage_backend_initialized", backend=backend)
+        # Auto-replicate to S3 when S3_BUCKET is configured alongside
+        # local storage.  This gives the pipeline fast local I/O with
+        # durable off-host persistence — the most common production
+        # setup.  S3 init failures are non-fatal: the pipeline falls
+        # back to local-only and logs a warning.
+        s3_bucket = os.getenv("S3_BUCKET", "").strip()
+        if s3_bucket:
+            try:
+                s3 = _build_s3(bucket=s3_bucket)
+                _singleton = ReplicatedStorage(primary=local, replica=s3)
+            except Exception as exc:
+                log.warning(
+                    "s3_replica_init_failed_falling_back_to_local",
+                    bucket=s3_bucket,
+                    error=str(exc),
+                )
+                _singleton = local
+        else:
+            _singleton = local
+
+    log.info("storage_backend_initialized", backend=type(_singleton).__name__)
     return _singleton
 
 

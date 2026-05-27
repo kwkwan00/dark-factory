@@ -12,77 +12,18 @@ log = structlog.get_logger()
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
-from dark_factory.llm.base import LLMClient
+from dark_factory.llm.anthropic import _backoff_sleep, _is_transient, _record_llm_call
+from dark_factory.llm.base import DEFAULT_MODEL, LLMClient
+from dark_factory.log import trace_methods
 
 T = TypeVar("T", bound=BaseModel)
 
 
-def _record_langchain_call(
-    *,
-    model: str,
-    started_at: float,
-    prompt_chars: int | None = None,
-    system_prompt_chars: int | None = None,
-    completion_chars: int | None = None,
-    input_tokens: int | None = None,
-    output_tokens: int | None = None,
-    error: str | None = None,
-) -> None:
-    """Best-effort write to BOTH Prometheus and the Postgres recorder."""
-    latency_seconds = time.time() - started_at
-    cost_usd: float | None = None
-    try:
-        from dark_factory.metrics.rates import compute_cost_usd
-
-        cost_usd = compute_cost_usd(
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
-    except Exception:  # pragma: no cover
-        pass
-
-    try:
-        from dark_factory.metrics.prometheus import observe_llm_call
-
-        observe_llm_call(
-            client="langchain",
-            model=model,
-            latency_seconds=latency_seconds,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost_usd=cost_usd,
-            error=error,
-        )
-    except Exception:  # pragma: no cover
-        pass
-
-    try:
-        from dark_factory.agents import tools as _tools_mod
-
-        recorder = _tools_mod._metrics_recorder
-        if recorder is None:
-            return
-        recorder.record_llm_call(
-            client="langchain",
-            model=model,
-            prompt_chars=prompt_chars,
-            completion_chars=completion_chars,
-            system_prompt_chars=system_prompt_chars,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            latency_seconds=latency_seconds,
-            cost_usd=cost_usd,
-            error=error,
-        )
-    except Exception:  # pragma: no cover
-        pass
-
-
+@trace_methods
 class LangChainClient(LLMClient):
     """LLM client backed by LangChain's ChatAnthropic."""
 
-    def __init__(self, api_key: str | None = None, model: str = "claude-sonnet-4-6") -> None:
+    def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL) -> None:
         kwargs: dict = {"model": model}
         if api_key:
             kwargs["api_key"] = api_key
@@ -113,17 +54,33 @@ class LangChainClient(LLMClient):
         # seconds}`` runnable config. Pass the effective timeout so
         # hung calls fail fast rather than blocking a worker thread.
         invoke_config = {"timeout": effective_timeout}
-        try:
-            response = self.llm.invoke(messages, config=invoke_config)
-        except Exception as exc:
-            _record_langchain_call(
-                model=self.model,
-                started_at=started_at,
-                prompt_chars=len(prompt),
-                system_prompt_chars=len(system) if system else None,
-                error=str(exc),
-            )
-            raise
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                response = self.llm.invoke(messages, config=invoke_config)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                _record_llm_call(
+                    client="langchain",
+                    model=self.model,
+                    started_at=started_at,
+                    prompt_chars=len(prompt),
+                    system_prompt_chars=len(system) if system else None,
+                    error=str(exc),
+                )
+                if not _is_transient(exc):
+                    raise
+                if attempt < 1:
+                    log.warning(
+                        "langchain_complete_retry",
+                        attempt=attempt + 1,
+                        error=str(exc)[:200],
+                    )
+                    _backoff_sleep(attempt, exc)
+        if last_exc is not None:
+            raise last_exc
         content = response.content
         # LangChain sometimes returns a list of content chunks
         if isinstance(content, list):
@@ -132,7 +89,8 @@ class LangChainClient(LLMClient):
                 for c in content
             )
         usage = getattr(response, "usage_metadata", None) or {}
-        _record_langchain_call(
+        _record_llm_call(
+            client="langchain",
             model=self.model,
             started_at=started_at,
             prompt_chars=len(prompt),
@@ -175,11 +133,17 @@ class LangChainClient(LLMClient):
                 return structured_llm.invoke(messages, config=invoke_config)
             except Exception as exc:
                 last_error = exc
+                transient = _is_transient(exc)
                 log.warning(
                     "structured_parse_retry",
                     client="langchain",
                     attempt=attempt + 1,
+                    transient=transient,
                     error=str(exc),
                 )
+                if not transient:
+                    raise
+                if attempt < 1:
+                    _backoff_sleep(attempt, exc)
         assert last_error is not None
         raise last_error

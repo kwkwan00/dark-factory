@@ -36,19 +36,18 @@ def test_build_test_case() -> None:
 
 
 def test_build_metrics_use_openai_model() -> None:
-    """Verify metric builders pass the configured eval model (dynamic)."""
-    with patch("dark_factory.evaluation.metrics.GEval") as mock_geval:
-        from dark_factory.evaluation.metrics import (
-            build_correctness_metric,
-            get_eval_model,
-        )
+    """Verify metric builders pass a GPTModel wrapping the configured eval model."""
+    from unittest.mock import MagicMock
+
+    mock_llm = MagicMock()
+    with patch("dark_factory.evaluation.metrics._build_eval_llm", return_value=mock_llm), \
+         patch("dark_factory.evaluation.metrics.GEval") as mock_geval:
+        from dark_factory.evaluation.metrics import build_correctness_metric
 
         build_correctness_metric()
         call_kwargs = mock_geval.call_args.kwargs
         assert call_kwargs["name"] == "Test Correctness"
-        # Builder must call get_eval_model() at construction time so
-        # runtime Settings-tab changes propagate.
-        assert call_kwargs["model"] == get_eval_model()
+        assert call_kwargs["model"] is mock_llm
 
 
 def test_build_spec_test_case() -> None:
@@ -63,17 +62,18 @@ def test_build_spec_test_case() -> None:
 
 
 def test_build_spec_metrics_use_openai() -> None:
-    """Verify spec metric builders pass the configured eval model (dynamic)."""
-    with patch("dark_factory.evaluation.metrics.GEval") as mock_geval:
-        from dark_factory.evaluation.metrics import (
-            build_spec_correctness_metric,
-            get_eval_model,
-        )
+    """Verify spec metric builders pass a GPTModel wrapping the configured eval model."""
+    from unittest.mock import MagicMock
+
+    mock_llm = MagicMock()
+    with patch("dark_factory.evaluation.metrics._build_eval_llm", return_value=mock_llm), \
+         patch("dark_factory.evaluation.metrics.GEval") as mock_geval:
+        from dark_factory.evaluation.metrics import build_spec_correctness_metric
 
         build_spec_correctness_metric()
         call_kwargs = mock_geval.call_args.kwargs
         assert call_kwargs["name"] == "Spec Correctness"
-        assert call_kwargs["model"] == get_eval_model()
+        assert call_kwargs["model"] is mock_llm
 
 
 def test_set_eval_model_propagates_to_builders() -> None:
@@ -81,7 +81,11 @@ def test_set_eval_model_propagates_to_builders() -> None:
     call. Regression test for the ``set_eval_model`` refactor — the
     previous ``EVAL_MODEL`` constant was captured at import time and
     never picked up Settings-tab PATCHes."""
-    with patch("dark_factory.evaluation.metrics.GEval") as mock_geval:
+    from unittest.mock import MagicMock
+
+    mock_llm = MagicMock()
+    with patch("dark_factory.evaluation.metrics._build_eval_llm", return_value=mock_llm), \
+         patch("dark_factory.evaluation.metrics.GEval") as mock_geval:
         from dark_factory.evaluation.metrics import (
             build_spec_correctness_metric,
             get_eval_model,
@@ -92,7 +96,7 @@ def test_set_eval_model_propagates_to_builders() -> None:
         try:
             set_eval_model("gpt-test-override-1234")
             build_spec_correctness_metric()
-            assert mock_geval.call_args.kwargs["model"] == "gpt-test-override-1234"
+            assert mock_geval.call_args.kwargs["model"] is mock_llm
         finally:
             set_eval_model(original)
 

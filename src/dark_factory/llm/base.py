@@ -18,6 +18,10 @@ T = TypeVar("T", bound=BaseModel)
 # hung request stall a worker thread indefinitely.
 DEFAULT_LLM_TIMEOUT_SECONDS = 300.0
 
+# Canonical default model used across all LLM clients when no override is
+# provided via config.toml, env var, or constructor argument.
+DEFAULT_MODEL = "claude-sonnet-4-6"
+
 
 class LLMClient(ABC):
     """Provider-agnostic interface for LLM interactions."""

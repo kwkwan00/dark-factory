@@ -12,6 +12,7 @@ import pytest
 
 from dark_factory.storage.backend import (
     LocalStorage,
+    ReplicatedStorage,
     RunStorage,
     S3Storage,
     StorageBackend,
@@ -491,11 +492,12 @@ class TestS3RunStorage:
 
         client.reset_mock()
         rs.write_output("main.py", "code")
-        client.put_object.assert_called_with(
-            Bucket="dark-factory-bucket",
-            Key="run-20260412-051047-9677/output/main.py",
-            Body=b"code",
-        )
+        # write_output also writes the MD5 manifest, so check that
+        # the code file was written (not just the last call)
+        calls = client.put_object.call_args_list
+        code_call = [c for c in calls if c.kwargs.get("Key", c.args[1] if len(c.args) > 1 else "") == "run-20260412-051047-9677/output/main.py"]
+        assert len(code_call) == 1, f"Expected 1 code write, got {len(code_call)}: {calls}"
+        assert code_call[0].kwargs["Body"] == b"code"
 
     def test_delete_run_uses_run_prefix(self):
         s, client = TestS3Storage()._make_storage()
@@ -528,11 +530,13 @@ class TestGetStorage:
     def test_default_is_local(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("STORAGE_BACKEND", None)
+            os.environ.pop("S3_BUCKET", None)
             s = get_storage()
             assert isinstance(s, LocalStorage)
 
     def test_explicit_local(self):
-        with patch.dict(os.environ, {"STORAGE_BACKEND": "local"}):
+        with patch.dict(os.environ, {"STORAGE_BACKEND": "local"}, clear=False):
+            os.environ.pop("S3_BUCKET", None)
             s = get_storage()
             assert isinstance(s, LocalStorage)
 
@@ -545,6 +549,166 @@ class TestGetStorage:
     def test_singleton(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("STORAGE_BACKEND", None)
+            os.environ.pop("S3_BUCKET", None)
             a = get_storage()
             b = get_storage()
             assert a is b
+
+    def test_local_with_s3_bucket_creates_replicated(self):
+        """When STORAGE_BACKEND=local and S3_BUCKET is set, get_storage()
+        returns a ReplicatedStorage wrapping LocalStorage + S3Storage."""
+        env = {
+            "STORAGE_BACKEND": "local",
+            "S3_BUCKET": "my-bucket",
+            "S3_REGION": "us-west-2",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch("dark_factory.storage.backend.S3Storage") as mock_s3_cls:
+                mock_s3_cls.return_value = MagicMock(spec=S3Storage)
+                mock_s3_cls.return_value.bucket = "my-bucket"
+                s = get_storage()
+                assert isinstance(s, ReplicatedStorage)
+                assert isinstance(s.primary, LocalStorage)
+                mock_s3_cls.assert_called_once()
+
+    def test_local_with_s3_failure_falls_back(self):
+        """If S3 init fails, get_storage() falls back to plain LocalStorage."""
+        env = {
+            "STORAGE_BACKEND": "local",
+            "S3_BUCKET": "bad-bucket",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch(
+                "dark_factory.storage.backend._build_s3",
+                side_effect=RuntimeError("no creds"),
+            ):
+                s = get_storage()
+                assert isinstance(s, LocalStorage)
+
+
+# ── ReplicatedStorage ────────────────────────────────────────────────────────
+
+
+class TestReplicatedStorage:
+    def _make_replicated(self, tmp_path: Path) -> tuple[ReplicatedStorage, LocalStorage, MagicMock]:
+        primary = LocalStorage(tmp_path)
+        replica = MagicMock(spec=S3Storage)
+        replica.bucket = "test-bucket"
+        rs = ReplicatedStorage(primary=primary, replica=replica)
+        return rs, primary, replica
+
+    def test_write_text_goes_to_both(self, tmp_path: Path):
+        rs, primary, replica = self._make_replicated(tmp_path)
+        rs.write_text("a/b.txt", "hello")
+        # Local write succeeded
+        assert primary.read_text("a/b.txt") == "hello"
+        # S3 replica was called
+        replica.write_text.assert_called_once_with("a/b.txt", "hello")
+
+    def test_write_bytes_goes_to_both(self, tmp_path: Path):
+        rs, primary, replica = self._make_replicated(tmp_path)
+        rs.write_bytes("bin.dat", b"\x00\x01")
+        assert primary.read_bytes("bin.dat") == b"\x00\x01"
+        replica.write_bytes.assert_called_once_with("bin.dat", b"\x00\x01")
+
+    def test_read_comes_from_primary(self, tmp_path: Path):
+        rs, primary, replica = self._make_replicated(tmp_path)
+        primary.write_text("x.txt", "local")
+        assert rs.read_text("x.txt") == "local"
+        replica.read_text.assert_not_called()
+
+    def test_s3_write_failure_does_not_propagate(self, tmp_path: Path):
+        rs, primary, replica = self._make_replicated(tmp_path)
+        replica.write_text.side_effect = RuntimeError("S3 down")
+        # Should not raise — local write succeeds, S3 failure is swallowed
+        rs.write_text("safe.txt", "content")
+        assert primary.read_text("safe.txt") == "content"
+
+    def test_exists_checks_primary_then_replica(self, tmp_path: Path):
+        rs, primary, replica = self._make_replicated(tmp_path)
+        # Not in local — falls through to replica
+        replica.exists.return_value = False
+        assert not rs.exists("nope.txt")
+        # In local — primary returns True, replica not needed for True result
+        rs.write_text("yep.txt", "hi")
+        assert rs.exists("yep.txt")
+
+    def test_delete_goes_to_both(self, tmp_path: Path):
+        rs, primary, replica = self._make_replicated(tmp_path)
+        rs.write_text("del.txt", "bye")
+        rs.delete("del.txt")
+        assert not primary.exists("del.txt")
+        replica.delete.assert_called_once_with("del.txt")
+
+    def test_list_keys_reads_primary(self, tmp_path: Path):
+        rs, primary, replica = self._make_replicated(tmp_path)
+        rs.write_text("run/a.txt", "a")
+        rs.write_text("run/b.txt", "b")
+        keys = rs.list_keys("run")
+        assert "run/a.txt" in keys
+        assert "run/b.txt" in keys
+        replica.list_keys.assert_not_called()
+
+    def test_upload_from_local_goes_to_both(self, tmp_path: Path):
+        rs, primary, replica = self._make_replicated(tmp_path)
+        local_file = tmp_path / "upload_src.txt"
+        local_file.write_text("uploaded")
+        rs.upload_from_local(local_file, "dest/file.txt")
+        assert primary.read_text("dest/file.txt") == "uploaded"
+        replica.upload_from_local.assert_called_once_with(local_file, "dest/file.txt")
+
+    def test_sync_local_to_storage_goes_to_both(self, tmp_path: Path):
+        rs, primary, replica = self._make_replicated(tmp_path)
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "a.txt").write_text("a")
+        (src_dir / "sub").mkdir()
+        (src_dir / "sub" / "b.txt").write_text("b")
+        count = rs.sync_local_to_storage(src_dir, "run/output")
+        assert count == 2
+        assert primary.read_text("run/output/a.txt") == "a"
+        # Replica gets individual upload_from_local calls for each file
+        assert replica.upload_from_local.call_count == 2
+        uploaded_keys = {
+            call.args[1] for call in replica.upload_from_local.call_args_list
+        }
+        assert uploaded_keys == {"run/output/a.txt", "run/output/sub/b.txt"}
+
+    def test_sync_excludes_nested_target_from_s3(self, tmp_path: Path):
+        """When LocalStorage target is nested inside local_dir, S3 should
+        only get the original source files — not the copies LocalStorage
+        creates in the nested target."""
+        rs, primary, replica = self._make_replicated(tmp_path)
+        # Simulate the real layout: local_dir = root/run-xxx,
+        # prefix = run-xxx/output, so target = root/run-xxx/output
+        run_dir = tmp_path / "run-xxx"
+        run_dir.mkdir()
+        (run_dir / "feature").mkdir()
+        (run_dir / "feature" / "main.py").write_text("code")
+        # Pre-existing output subdir (from a previous write_output call)
+        (run_dir / "output").mkdir()
+        (run_dir / "output" / "old.py").write_text("old")
+
+        count = rs.sync_local_to_storage(run_dir, "run-xxx/output")
+        # LocalStorage should sync feature/main.py (not output/old.py since
+        # it's already under the target)
+        assert count == 1
+        assert primary.read_text("run-xxx/output/feature/main.py") == "code"
+        # S3 should get feature/main.py only — not the nested output/ files
+        assert replica.upload_from_local.call_count == 1
+        uploaded_key = replica.upload_from_local.call_args.args[1]
+        assert uploaded_key == "run-xxx/output/feature/main.py"
+
+    def test_presign_url_delegates_to_replica(self, tmp_path: Path):
+        rs, primary, replica = self._make_replicated(tmp_path)
+        replica.presign_url.return_value = "https://s3.example.com/signed"
+        url = rs.presign_url("run/output/file.py")
+        assert url == "https://s3.example.com/signed"
+
+    def test_walk_reads_primary(self, tmp_path: Path):
+        rs, primary, replica = self._make_replicated(tmp_path)
+        rs.write_text("run/a.txt", "a")
+        entries = list(rs.walk("run"))
+        assert len(entries) == 1
+        assert entries[0][0] == "a.txt"
+        replica.walk.assert_not_called()

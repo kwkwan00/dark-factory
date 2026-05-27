@@ -607,3 +607,165 @@ def test_recall_episodes_tolerates_qdrant_failure():
     finally:
         tools_mod._memory_repo = prev_m
         tools_mod._vector_repo = prev_v
+
+
+# ── Fix #1: Episodes include recalled memory IDs ─────────────────────────────
+
+
+def test_episode_from_feature_result_includes_recalled_ids():
+    """recalled_memory_ids passed to episode_from_feature_result
+    end up on the Episode model."""
+    result = {
+        "feature": "auth",
+        "spec_ids": ["spec-1"],
+        "status": "success",
+        "stats": {},
+        "eval_scores": {},
+    }
+    episode = episode_from_feature_result(
+        run_id="run-1",
+        feature_result=result,
+        started_at=datetime.now(timezone.utc),
+        progress_events=[],
+        llm=None,
+        recalled_memory_ids=["pattern-abc", "ep-xyz"],
+    )
+    assert episode.recalled_memory_ids == ["pattern-abc", "ep-xyz"]
+
+
+def test_synthesize_episode_includes_recalled_in_prompt():
+    """The synthesis prompt should mention recalled memory IDs so the
+    LLM can reference them in the narrative."""
+    from dark_factory.memory.episodes import _build_synthesis_prompt
+
+    prompt = _build_synthesis_prompt(
+        feature="auth",
+        spec_ids=["spec-1"],
+        outcome="success",
+        turns_used=5,
+        duration_seconds=30.0,
+        final_eval_scores={"coherence": 0.9},
+        agents_visited=["planner", "coder"],
+        tool_calls_summary={"write_file": 3},
+        progress_events=[],
+        recalled_memory_ids=["pattern-abc", "strategy-def"],
+    )
+    assert "pattern-abc" in prompt
+    assert "strategy-def" in prompt
+    assert "Recalled memories (2)" in prompt
+
+
+def test_episode_writer_passes_new_fields_to_qdrant():
+    """EpisodeWriter should pass spec_ids, eval_scores, and
+    recalled_memory_ids to the Qdrant upsert."""
+    mock_repo = MagicMock()
+    mock_vector = MagicMock()
+    mock_embeddings = MagicMock()
+    mock_embeddings.embed_batch.return_value = [[0.1, 0.2, 0.3]]
+
+    writer = EpisodeWriter(
+        memory_repo=mock_repo,
+        vector_repo=mock_vector,
+        embeddings=mock_embeddings,
+    )
+    ep = Episode(
+        id="ep-test",
+        run_id="run-1",
+        feature="auth",
+        outcome="success",
+        summary="Test episode",
+        spec_ids=["spec-1", "spec-2"],
+        final_eval_scores={"coherence": 0.9},
+        recalled_memory_ids=["pattern-abc"],
+        started_at=datetime.now(timezone.utc),
+        ended_at=datetime.now(timezone.utc),
+    )
+    writer.write(ep)
+
+    # Check Qdrant upsert was called with new fields
+    mock_vector.upsert_episode.assert_called_once()
+    call_kwargs = mock_vector.upsert_episode.call_args.kwargs
+    assert call_kwargs["spec_ids"] == ["spec-1", "spec-2"]
+    assert call_kwargs["final_eval_scores"] == {"coherence": 0.9}
+    assert call_kwargs["recalled_memory_ids"] == ["pattern-abc"]
+
+
+# ── Fix #6: Per-feature vs per-eval ID tracking ─────────────────────────────
+
+
+def test_feature_recalled_ids_survive_eval_clear():
+    """Per-feature recalled IDs should accumulate across multiple
+    recall + eval cycles and survive clear_recalled_memories()."""
+    import dark_factory.agents.tools as tools_mod
+
+    # Start clean
+    tools_mod.clear_feature_recalled_memories()
+    tools_mod.clear_recalled_memories()
+
+    # Planner recalls memories
+    tools_mod.add_recalled_memory_ids(["pattern-1", "strategy-2"])
+    assert set(tools_mod.get_feature_recalled_memory_ids()) == {"pattern-1", "strategy-2"}
+
+    # Eval clears per-eval set
+    tools_mod.clear_recalled_memories()
+    assert tools_mod.get_recalled_memory_ids() == []
+    # But feature set survives
+    assert set(tools_mod.get_feature_recalled_memory_ids()) == {"pattern-1", "strategy-2"}
+
+    # Coder recalls more memories
+    tools_mod.add_recalled_memory_ids(["pattern-3"])
+    # Feature set now has all three
+    assert set(tools_mod.get_feature_recalled_memory_ids()) == {"pattern-1", "strategy-2", "pattern-3"}
+
+    # Another eval clear
+    tools_mod.clear_recalled_memories()
+    assert set(tools_mod.get_feature_recalled_memory_ids()) == {"pattern-1", "strategy-2", "pattern-3"}
+
+    # Feature end clears everything
+    tools_mod.clear_feature_recalled_memories()
+    assert tools_mod.get_feature_recalled_memory_ids() == []
+
+
+# ── Fix #3: Cross-feature recall ─────────────────────────────────────────────
+
+
+def test_recall_memories_includes_cross_feature_results():
+    """recall_memories should search Qdrant both with and without
+    the source_feature filter, merging results via RRF."""
+    import dark_factory.agents.tools as tools_mod
+
+    fake_memory = MagicMock()
+    fake_memory.get_related_memories.return_value = [
+        {"id": "pattern-local", "description": "local pattern", "relevance_score": 0.8},
+    ]
+    fake_memory.increment_recall_counts = MagicMock()
+
+    # search_memories called twice: once with source_feature, once without
+    call_count = [0]
+
+    def mock_search_memories(**kwargs):
+        call_count[0] += 1
+        if kwargs.get("source_feature"):
+            return [{"id": "pattern-local", "score": 0.9, "description": "local"}]
+        else:
+            return [{"id": "pattern-cross", "score": 0.7, "description": "cross-feature"}]
+
+    fake_vector = MagicMock()
+    fake_vector.search_memories.side_effect = mock_search_memories
+
+    prev_m = tools_mod._memory_repo
+    prev_v = tools_mod._vector_repo
+    tools_mod._memory_repo = fake_memory
+    tools_mod._vector_repo = fake_vector
+    try:
+        raw = tools_mod.recall_memories.invoke({"feature_name": "auth"})
+        parsed = json.loads(raw)
+        ids = {m["id"] for m in parsed}
+        # Should contain both feature-scoped and cross-feature results
+        assert "pattern-local" in ids
+        assert "pattern-cross" in ids
+        # search_memories should have been called twice
+        assert call_count[0] == 2
+    finally:
+        tools_mod._memory_repo = prev_m
+        tools_mod._vector_repo = prev_v

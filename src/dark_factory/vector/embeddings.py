@@ -5,11 +5,14 @@ from __future__ import annotations
 import openai
 import structlog
 
+from dark_factory.log import trace_methods
+
 log = structlog.get_logger()
 
 MAX_CHARS = 30_000  # ~8000 tokens safe limit for text-embedding-3-large
 
 
+@trace_methods
 class EmbeddingService:
     """Generate embeddings via OpenAI API."""
 

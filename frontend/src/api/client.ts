@@ -208,13 +208,15 @@ export interface PipelineSettings {
   reconciliation_timeout_seconds: number;
   requirement_dedup_threshold: number;
   enable_e2e_validation: boolean;
-  max_e2e_turns: number;
   e2e_timeout_seconds: number;
   e2e_browsers: string[];
   enable_episodic_memory: boolean;
   memory_dedup_threshold: number;
   llm_model: string;
+  planning_model: string;
   eval_model: string;
+  refinery_model: string;
+  refinery_reasoning_effort: string;
   output_dir: string;
 }
 
@@ -231,13 +233,15 @@ export interface PipelineSettingsUpdate {
   reconciliation_timeout_seconds?: number;
   requirement_dedup_threshold?: number;
   enable_e2e_validation?: boolean;
-  max_e2e_turns?: number;
   e2e_timeout_seconds?: number;
   e2e_browsers?: string[];
   enable_episodic_memory?: boolean;
   memory_dedup_threshold?: number;
   llm_model?: string;
+  planning_model?: string;
   eval_model?: string;
+  refinery_model?: string;
+  refinery_reasoning_effort?: string;
 }
 
 /** Eval browser data shapes (returned by GET /api/eval). */
@@ -291,49 +295,381 @@ export interface ProgressEvent {
   [key: string]: unknown;
 }
 
-/** Payload from GET /api/graph/gaps — actionable gaps in the knowledge graph. */
-export interface UnplannedRequirement {
-  id: string;
-  title: string | null;
-  priority: string | null;
-  source_file: string | null;
-}
-
+/** Payload from GET /api/graph/gaps/{run_id} — run-scoped gap analysis. */
 export interface SpecWithoutArtifacts {
   id: string;
   title: string | null;
   capability: string | null;
-  requirement_ids: string[];
 }
 
 export interface SpecFailingEval {
   id: string;
   title: string | null;
   capability: string | null;
-  requirement_ids: string[];
-  metric_name: string;
-  score: number;
-  last_eval_at: string | null;
+  eval_scores: Record<string, number>;
 }
 
-export interface StaleRequirement {
+export interface UnimplementedRequirement {
   id: string;
-  spec_count: number;
-  last_eval_at: string | null;
+  title: string | null;
+  priority: string | null;
+  reason: string;
 }
 
-export interface GraphGaps {
-  enabled_postgres: boolean;
-  postgres_error?: string;
-  stale_days: number;
-  unplanned_requirements: UnplannedRequirement[];
+export interface BrokenDependency {
+  spec_id: string;
+  spec_title: string | null;
+  missing_dep_id: string;
+}
+
+export interface CapabilityIsland {
+  capability: string;
+  total_specs: number;
+  disconnected_specs: string[];
+}
+
+export interface MissingEpisode {
+  feature: string;
+  spec_count: number;
+}
+
+export interface RunGaps {
+  run_id: string;
   specs_without_artifacts: SpecWithoutArtifacts[];
   specs_failing_evals: SpecFailingEval[];
-  stale_requirements: StaleRequirement[];
+  unimplemented_requirements: UnimplementedRequirement[];
+  broken_dependencies: BrokenDependency[];
+  capability_islands: CapabilityIsland[];
+  missing_episodes: MissingEpisode[];
   totals: {
     requirements: number;
     specs: number;
   };
+}
+
+// ── Requirements Refinery ─────────────────────────────────────────────────
+
+export interface RequirementRelationship {
+  target_id: string;
+  type: string;
+  rationale: string;
+}
+
+export interface SuggestedSpec {
+  title: string;
+  capability: string;
+  description: string;
+  acceptance_criteria: string[];
+}
+
+export interface RefinedRequirement {
+  id: string;
+  original_title: string;
+  original_description: string;
+  title: string;
+  description: string;
+  priority: string;
+  tags: string[];
+  relationships: RequirementRelationship[];
+  suggested_specs: SuggestedSpec[];
+  changes: string[];
+  pass_context: string;
+  // Phase 8/9 convergence metadata — optional; null on legacy payloads.
+  convergence_status?: "converged" | "short_circuited" | "aborted" | null;
+  /** 0..1 progress signal: 0 = no debate occurred, 1 = converged,
+   *  anything between = debated but threshold-short. Lets operators
+   *  gauge how much more detail a requirement still needs. */
+  convergence_score?: number;
+  unresolved_points?: string[];
+  open_questions?: string[];
+  explicit_tradeoffs?: string[];
+  /** Per-debate summary surfaced under the Description disclosure. Set by
+   *  the runner from ``final_trace``; legacy carry-forward paths leave
+   *  this null so the disclosure renders only when there is something to
+   *  show. The shape is intentionally flat (no typed contract import) so
+   *  the wire format stays stable as the trace grows. */
+  debate?: {
+    rounds_executed?: number;
+    convergence_status?: string | null;
+    termination_reason?: string;
+    escalation_level?: number;
+    research_calls_used?: number;
+    critiques_by_round?: Record<string, Array<{
+      role: string;
+      severity: string;
+      dimension: string;
+      finding: string;
+      proposed_fix: string;
+    }>>;
+    rebuttals_by_round?: Record<string, {
+      accepted_count: number;
+      rejected_count: number;
+      mode: string;
+    }>;
+    scores_by_round?: Record<string, {
+      overall?: number | null;
+      passed?: boolean | null;
+      dimensions?: Record<string, number>;
+    }>;
+    /** Per-requirement Debate Episode — the operator-readable narrative
+     *  of one debate, built deterministically from the trace. Acts both
+     *  as documentation (rendered markdown) and as the structured record
+     *  the Episodes tab groups by. */
+    episode?: {
+      requirement_id: string;
+      refinery_run_id: string;
+      title: string;
+      outcome: string;
+      rounds_executed: number;
+      escalation_level: number;
+      research_calls_used: number;
+      summary: string;
+      final_overall_score?: number | null;
+      final_dimensions?: Record<string, number>;
+      convergence_score?: number;
+      key_events?: Array<{
+        order: number;
+        round_number: number;
+        actor: string;
+        kind: string;
+        headline: string;
+        detail?: string;
+      }>;
+      unresolved_points?: string[];
+      open_questions?: string[];
+      explicit_tradeoffs?: string[];
+      participants?: string[];
+      duration_seconds?: number;
+    };
+    episode_markdown?: string;
+  } | null;
+}
+
+export interface SuggestedMemory {
+  type: string;
+  description: string;
+  context: string;
+  applicability: string;
+  source_feature: string;
+  rationale: string;
+  /** V2 fields — optional for backward compat. ``kind`` is the canonical
+   *  5-bucket label (decision/incident/pattern/constraint/conflict) the UI
+   *  groups by. ``validation_status`` drives the auto-save default in the
+   *  Apply split-action. Producers populate when available; legacy LLM-emitted
+   *  memories carry only ``type`` and the UI infers a kind. */
+  kind?: string | null;
+  validation_status?: string | null;
+  summary?: string;
+  source_role?: string;
+  source_requirement_id?: string | null;
+}
+
+export interface RefineryResponse {
+  summary: string;
+  pass_summaries: string[];
+  refined_requirements: RefinedRequirement[];
+  suggested_memories: SuggestedMemory[];
+  new_relationships_count: number;
+  requirements_modified_count: number;
+  requirements_unchanged_count: number;
+  source_run_id: string | null;
+  methodology: string;
+  evidence_summary: string;
+  risk_areas: string[];
+}
+
+export interface RefineryHistoryItem {
+  id: string;
+  timestamp: string;
+  source_run_id: string | null;
+  source_mode: string;
+  requirements_count: number;
+  requirements_modified: number;
+  requirements_unchanged: number;
+  relationships_count: number;
+  suggested_memories_count: number;
+  duration_seconds: number;
+}
+
+/** A refinery run that didn't complete cleanly and is resumable
+ *  via ``POST /api/refinery/resume/{refinery_run_id}``. */
+export interface ResumableRefineryRun {
+  refinery_run_id: string;
+  source_mode: string;
+  source_run_id: string | null;
+  requirements_count: number;
+  started_at: string | null;
+  status: "in_progress" | "cancelled" | "failed" | string;
+}
+
+export interface MemoryDedupResult {
+  is_duplicate: boolean;
+  existing_id: string | null;
+  existing_description: string | null;
+  similarity: number | null;
+}
+
+/** Phase 5 goal-generation output — proposed additional requirements
+ *  the operator can approve / dismiss individually. */
+export interface ProposedRequirement {
+  title: string;
+  description: string;
+  priority: string;
+  tags: string[];
+  rationale: string;
+  related_to: string[];
+  confidence: number;
+}
+
+export interface ProposedAdditions {
+  summary: string;
+  proposals: ProposedRequirement[];
+}
+
+export interface RefinerySSEEvent {
+  phase:
+    | "gathering"
+    | "refining"
+    | "reconciling"
+    | "planning"
+    | "proposed_additions"
+    | "done"
+    | "error";
+  step?: string;
+  turn?: number;
+  max_turns?: number;
+  message?: string;
+  tools?: string[];
+  text?: string;
+  requirement_id?: string;
+  data?: RefineryResponse | ProposedAdditions;
+  result_id?: string;
+  requirement_count?: number;
+  duration_seconds?: number;
+  proposals_count?: number;
+  summary?: string;
+  // Per-agent debate-graph event fields. Emitted by the LangGraph
+  // debate subgraph (one event per node transition); the timeline UI
+  // renders them as a live agent log.
+  debate_event?:
+    | "generator_started"
+    | "draft_ready"
+    | "critic_started"
+    | "critic_ready"
+    | "critic_placeholder"
+    | "synthesize_started"
+    | "synthesis_ready"
+    | "score_started"
+    | "score_ready"
+    | "research_started"
+    | "research_ready"
+    | "escalation"
+    | "reconcile_started"
+    | "reconcile_ready"
+    | "finalized";
+  role?: string;
+  round?: number;
+  severity?: string;
+  dimension?: string;
+  overall?: number;
+  passed?: boolean;
+  insights?: number;
+  source_tier_mix?: number[];
+  escalation_level?: number;
+  new_tier?: string;
+  unresolved_count?: number;
+  convergence_status?: string;
+  rounds?: number;
+  rebuttals_accepted?: number;
+  reason?: string;
+  // Single-shot LLM call events (refinery_llm_started / _ready / _failed).
+  // Routed back into the refinery SSE stream by the shared LLM helper so
+  // the in-flight panel activity is visible inline on RefineryTab as well
+  // as on the Agent Log tab.
+  event?: string;
+  provider?: string;
+  model?: string;
+  reasoning_effort?: string;
+  latency_ms?: number;
+  tokens_in?: number;
+  tokens_out?: number;
+  error?: string;
+}
+
+// ── Run Diff ──────────────────────────────────────────────────────────────
+
+export interface DiffFile {
+  path: string;
+  status: "added" | "removed" | "modified" | "unchanged" | "binary" | "error";
+  diff?: string;
+}
+
+export interface RunDiffResponse {
+  run_a: string;
+  run_b: string;
+  files: DiffFile[];
+  stats: { added: number; removed: number; modified: number; unchanged: number };
+}
+
+// ── Run Compare ──────────────────────────────────────────────────────────
+
+export interface RunCompareResponse {
+  run_a: Record<string, unknown>;
+  run_b: Record<string, unknown>;
+}
+
+// ── Traceability ─────────────────────────────────────────────────────────
+
+export interface TraceabilityFile {
+  path: string;
+  preview_url: string;
+  s3_url?: string;
+}
+
+export interface TraceabilitySpec {
+  id: string;
+  title: string | null;
+  capability: string | null;
+  files: TraceabilityFile[];
+  test_files: TraceabilityFile[];
+  eval_scores: Record<string, number>;
+  all_passed: boolean | null;
+}
+
+export interface TraceabilityRow {
+  requirement: { id: string; title: string | null; priority: string | null };
+  specs: TraceabilitySpec[];
+  overall_status: "pass" | "fail" | "no_specs" | "no_evals";
+}
+
+export interface TraceabilityResponse {
+  run_id: string;
+  rows: TraceabilityRow[];
+}
+
+// ── Graph Topology ───────────────────────────────────────────────────────
+
+export interface TopologyNode {
+  id: string;
+  type: "requirement" | "spec";
+  label: string;
+  priority?: string;
+  capability?: string;
+  status?: string;
+  file_count?: number;
+  test_count?: number;
+}
+
+export interface TopologyEdge {
+  id: string;
+  source: string;
+  target: string;
+  type: "IMPLEMENTS" | "DEPENDS_ON";
+}
+
+export interface GraphTopologyResponse {
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
 }
 
 /** Postgres metrics store data shapes (returned by /api/metrics/*). */
@@ -835,13 +1171,144 @@ export interface HistoryRun {
 }
 
 export const api = {
-  /** Gap finder: actionable insights about what's missing, failed,
-   * or stale in the knowledge graph. */
-  graphGaps: (staleDays = 7) =>
-    get<GraphGaps>(`/api/graph/gaps?stale_days=${staleDays}`),
+  /** Run-scoped gap finder (used internally by refinery). */
+  runGaps: (runId: string) =>
+    get<RunGaps>(`/api/graph/gaps/${encodeURIComponent(runId)}`),
+
+  /** Requirements Refinery — SSE stream.
+   *
+   * Three input modes (exactly one must be set):
+   * - ``run_id``     — refine a historical run's evidence bundle
+   * - ``input_path`` — refine from uploaded requirement documents
+   * - ``direct``     — Phase 6 direct-input mode (one typed requirement)
+   */
+  streamRefinery: (
+    body: {
+      run_id?: string;
+      input_path?: string;
+      direct?: {
+        title: string;
+        description?: string;
+        priority?: string;
+        tags?: string[];
+      };
+    },
+    signal?: AbortSignal,
+  ) =>
+    fetch(`/api/refinery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    }),
+
+  /** PATCH a single requirement in Neo4j.
+   *
+   * Phase 9 atomic write-back: include ``apply_memories`` in the body
+   * to save selected suggested memories inside the same Postgres +
+   * Neo4j transaction. Legacy callers that don't supply
+   * ``apply_memories`` get today's behaviour unchanged.
+   */
+  patchRequirement: (reqId: string, body: Record<string, unknown>) =>
+    fetch(`/api/graph/requirements/${encodeURIComponent(reqId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => {
+      if (!r.ok) throw new Error(`Patch failed: ${r.status}`);
+      return r.json();
+    }),
+
+  /** List historical refinery results. */
+  refineryHistory: (limit = 20) =>
+    get<{ results: RefineryHistoryItem[] }>(`/api/refinery/history?limit=${limit}`),
+
+  /** List refinery runs that didn't complete cleanly and can be
+   *  resumed via ``streamResumeRefinery``. */
+  refineryResumable: (limit = 20) =>
+    get<{ results: ResumableRefineryRun[]; message?: string }>(
+      `/api/refinery/resumable?limit=${limit}`,
+    ),
+
+  /** Resume an interrupted refinery run. Same SSE shape as
+   *  ``streamRefinery``; the orchestrator hydrates state from the
+   *  resume registry and replays cached debate completions. */
+  streamResumeRefinery: (refineryRunId: string, signal?: AbortSignal) =>
+    fetch(`/api/refinery/resume/${encodeURIComponent(refineryRunId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal,
+    }),
+
+  /** Dismiss a resumable refinery run (tombstones status → cancelled).
+   *  Removes it from the resumable list without dropping forensic
+   *  telemetry. Use this for runs you no longer intend to resume.
+   *  Throws on 404 (unknown id) or 409 (run is already completed). */
+  dismissResumableRefinery: (refineryRunId: string) =>
+    fetch(`/api/refinery/resumable/${encodeURIComponent(refineryRunId)}`, {
+      method: "DELETE",
+    }).then((r) => {
+      if (!r.ok) throw new Error(`Dismiss failed: ${r.status}`);
+      return r.json() as Promise<{ refinery_run_id: string; status: string }>;
+    }),
+
+  /** Load a saved refinery result. */
+  loadRefineryResult: (resultId: string) =>
+    get<RefineryResponse>(`/api/refinery/${encodeURIComponent(resultId)}`),
+
+  /** Delete a saved refinery result. */
+  deleteRefineryResult: (resultId: string) =>
+    fetch(`/api/refinery/${encodeURIComponent(resultId)}`, { method: "DELETE" })
+      .then((r) => { if (!r.ok) throw new Error(`Delete failed: ${r.status}`); return r.json(); }),
+
+  /** Check if a memory is a semantic duplicate before saving.
+   *
+   * Phase 9 kind-scoped dedup: the optional ``kind`` field scopes the
+   * check to the specified refinery memory kind. Legacy callers
+   * (passing only ``type``) keep today's scoping.
+   */
+  checkMemoryDuplicate: (body: {
+    type: string;
+    description: string;
+    context?: string;
+    kind?: "decision" | "incident" | "pattern" | "constraint" | "conflict";
+  }) => post<MemoryDedupResult>("/api/memory/check-duplicate", body),
+
+  /** Export all requirements as JSON (for re-ingestion). */
+  requirementsExportUrl: () => "/api/graph/requirements/export",
+
+  /** Export refinery results as a ZIP (report + individual requirement files). */
+  exportRefineryZip: (response: RefineryResponse) =>
+    fetch("/api/refinery/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(response),
+    }).then((r) => {
+      if (!r.ok) throw new Error(`Export failed: ${r.status}`);
+      return r.blob();
+    }),
 
   history: (limit = 20) =>
-    get<{ runs: HistoryRun[] }>(`/api/history?limit=${limit}`),
+    get<{ runs: HistoryRun[]; message?: string }>(`/api/history?limit=${limit}`),
+
+  deleteRun: (runId: string) =>
+    fetch(`/api/history/${encodeURIComponent(runId)}`, { method: "DELETE" })
+      .then((r) => { if (!r.ok) throw new Error(`Delete failed: ${r.status}`); return r.json(); }),
+
+  runDownloadUrl: (runId: string) =>
+    `/api/runs/${encodeURIComponent(runId)}/download`,
+
+  runDiff: (runA: string, runB: string) =>
+    get<RunDiffResponse>(`/api/runs/diff?run_a=${encodeURIComponent(runA)}&run_b=${encodeURIComponent(runB)}`),
+
+  runCompare: (runA: string, runB: string) =>
+    get<RunCompareResponse>(`/api/runs/compare?run_a=${encodeURIComponent(runA)}&run_b=${encodeURIComponent(runB)}`),
+
+  traceability: (runId: string) =>
+    get<TraceabilityResponse>(`/api/traceability/${encodeURIComponent(runId)}`),
+
+  graphTopology: (runId: string) =>
+    get<GraphTopologyResponse>(`/api/graph/topology/${encodeURIComponent(runId)}`),
 
   /** Episodes: per-feature autobiographical records written after
    * every swarm run. Used by the Run Detail popup's Episodes tab
@@ -866,6 +1333,57 @@ export const api = {
   memoryList: (type = "all", limit = 100) =>
     get<{ results: Array<Record<string, unknown>>; total: number; type: string }>(
       `/api/memory/list?type=${type}&limit=${limit}`
+    ),
+
+  deleteMemory: (memoryId: string) =>
+    fetch(`/api/memory/${encodeURIComponent(memoryId)}`, { method: "DELETE" })
+      .then((r) => { if (!r.ok) throw new Error(`Delete failed: ${r.status}`); return r.json(); }),
+
+  importMemories: (memories: Array<Record<string, unknown>>) =>
+    post<{ imported: number; skipped: number; total: number }>(
+      "/api/memory/import",
+      { memories },
+    ),
+
+  /** Active-learning loop: tell the backend the operator decided
+   * (accepted | dismissed | edited) on a suggested memory. Best-effort
+   * — the response carries flags for which sinks succeeded but the UI
+   * action proceeds regardless. */
+  submitMemoryFeedback: (
+    memoryId: string,
+    body: {
+      decision: "accepted" | "dismissed" | "edited";
+      memory_kind: string;
+      refinery_run_id?: string;
+      source_role?: string;
+      reason?: string;
+    },
+  ) =>
+    post<{
+      ok: boolean;
+      telemetry_recorded?: boolean;
+      relevance_adjusted?: boolean;
+      conflict_emitted?: boolean;
+      reason?: string;
+    }>(`/api/refinery/memory/${encodeURIComponent(memoryId)}/feedback`, body),
+
+  /** Active-learning loop: tell the backend which way the operator
+   * decided on a refined requirement. Drives the Judge confidence-
+   * calibration multiplier on subsequent runs. Best-effort — the
+   * response carries a flag for whether telemetry landed but the UI
+   * action proceeds regardless. */
+  submitRequirementDecision: (
+    refineryRunId: string,
+    requirementId: string,
+    body: {
+      decision: "accepted" | "dismissed" | "edited";
+      judge_overall_score?: number | null;
+      convergence_status?: "converged" | "short_circuited" | "aborted" | null;
+    },
+  ) =>
+    post<{ ok: boolean; telemetry_recorded?: boolean; reason?: string }>(
+      `/api/refinery/${encodeURIComponent(refineryRunId)}/requirement/${encodeURIComponent(requirementId)}/decision`,
+      body,
     ),
 
   /** List Claude models available to the configured API key. Pass an

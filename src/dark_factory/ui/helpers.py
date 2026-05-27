@@ -79,6 +79,9 @@ def get_memory_repo(settings: Settings):
         database=settings.memory.database,
         user=settings.neo4j.user,
         password=settings.neo4j.password,
+        connection_timeout=settings.neo4j.connection_timeout,
+        connection_acquisition_timeout=settings.neo4j.connection_acquisition_timeout,
+        max_connection_pool_size=settings.neo4j.max_connection_pool_size,
     )
     client = Neo4jClient(mem_config)
     init_memory_schema(client)

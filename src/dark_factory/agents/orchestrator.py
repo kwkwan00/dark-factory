@@ -20,6 +20,7 @@ from dark_factory.agents.swarm import (
     FeatureResult,
     build_feature_swarm,
     init_swarm_context,
+    make_feature_result,
 )
 from dark_factory.config import Settings
 from dark_factory.graph.repository import GraphRepository
@@ -402,17 +403,43 @@ def make_execute_layer_node(
                 from dark_factory.memory.episodes import (
                     episode_from_feature_result,
                 )
+                from dark_factory.agents.tools import (
+                    get_feature_recalled_memory_ids,
+                    clear_feature_recalled_memories,
+                )
 
                 feature_name = feature_result.get("feature", "?")
                 started_at = feature_start_times.get(feature_name)
+
+                # Fetch progress events for this feature from the broker
+                # so the LLM summariser has the actual trajectory to
+                # synthesise into a narrative episode.
+                progress_events: list[dict[str, Any]] = []
+                try:
+                    from dark_factory.agents.tools import _progress_broker
+                    if _progress_broker is not None and hasattr(_progress_broker, "get_history"):
+                        progress_events = _progress_broker.get_history(feature=feature_name)
+                except Exception:
+                    pass  # best-effort — empty list is the safe fallback
+
+                # Collect all memory IDs recalled during this feature's
+                # lifecycle (planner + coder + reviewer + tester) so the
+                # episode records which memories influenced the outcome.
+                recalled_ids = get_feature_recalled_memory_ids()
+
                 episode = episode_from_feature_result(
                     run_id=run_id,
                     feature_result=dict(feature_result),
                     started_at=started_at,
-                    progress_events=[],
+                    progress_events=progress_events,
                     llm=episode_llm,
+                    recalled_memory_ids=recalled_ids,
                 )
                 episode_writer.write(episode)
+
+                # Clear the per-feature accumulator now that we've
+                # captured it in the episode.
+                clear_feature_recalled_memories()
             except Exception as exc:
                 # Any failure in the episode-write path is swallowed —
                 # losing an episode is acceptable; breaking the
@@ -424,29 +451,37 @@ def make_execute_layer_node(
                     error=str(exc),
                 )
 
-        # Build cross-feature briefing from this run's learnings so far
-        run_context = ""
-        if _memory_repo and run_id:
+        def _build_run_context(exclude_feature: str = "") -> str:
+            """Build cross-feature briefing from this run's learnings so far.
+
+            Excludes memories from *exclude_feature* so a retried feature
+            doesn't see its own prior mistakes as "learnings from earlier
+            features" (they're already surfaced by recall_memories).
+            """
+            if not _memory_repo or not run_id:
+                return ""
             try:
-                learnings = _memory_repo.get_run_learnings(run_id, limit=20)
-                if learnings:
-                    lines = []
-                    for mem in learnings:
-                        mtype = mem.get("type", "?")
-                        desc = mem.get("description", "")[:100]
-                        feat = mem.get("source_feature", "?")
-                        lines.append(f"[{mtype.upper()} from {feat}] {desc}")
-                    run_context = "\n".join(lines)[:2000]
+                learnings = _memory_repo.get_run_learnings(
+                    run_id, exclude_feature=exclude_feature, limit=20,
+                )
+                if not learnings:
+                    return ""
+                lines = []
+                for mem in learnings:
+                    mtype = mem.get("type", "?")
+                    desc = mem.get("description", "")[:100]
+                    feat = mem.get("source_feature", "?")
+                    lines.append(f"[{mtype.upper()} from {feat}] {desc}")
+                return "\n".join(lines)[:2000]
             except Exception as exc:
-                # Memory repo failures here are non-fatal: we proceed with an
-                # empty run_context rather than aborting the layer. Log so a
-                # flaky memory DB shows up in diagnostics instead of silently
-                # degrading cross-feature learning quality.
                 log.warning(
                     "run_learnings_fetch_failed",
                     run_id=run_id,
                     error=str(exc),
                 )
+                return ""
+
+        from dark_factory.agents.tools import emit_progress as _emit
 
         # Collect features to run (filtering skipped)
         to_run: list[tuple[str, list[str]]] = []
@@ -457,28 +492,17 @@ def make_execute_layer_node(
             deps_of_feature = _get_deps_from_completed(feature_name, state)
             if deps_of_feature & failed_features:
                 log.warning("feature_skipped", feature=feature_name, reason="dependency_failed")
-                from dark_factory.agents.tools import emit_progress as _emit
-
                 _emit(
                     "feature_skipped",
                     feature=feature_name,
                     reason=f"dependency in {sorted(deps_of_feature & failed_features)} failed",
                 )
-                completed.append(
-                    FeatureResult(
-                        feature=feature_name,
-                        spec_ids=spec_ids,
-                        status="skipped",
-                        artifacts=[],
-                        tests=[],
-                        error=f"Skipped: dependency in {deps_of_feature & failed_features} failed",
-                        eval_scores={},
-                    )
-                )
+                completed.append(make_feature_result(
+                    feature_name, spec_ids, "skipped",
+                    error=f"Skipped: dependency in {deps_of_feature & failed_features} failed",
+                ))
                 continue
             to_run.append((feature_name, spec_ids))
-
-        from dark_factory.agents.tools import emit_progress as _emit
 
         _emit(
             "layer_started",
@@ -516,11 +540,20 @@ def make_execute_layer_node(
             # Capture wall-clock start for Episode.started_at — the
             # swarm stats carry duration but not start timestamp.
             feature_start_times[feature_name] = datetime.now(timezone.utc)
+            # Per-feature context excludes the feature's own prior
+            # memories so retried features don't see redundant data.
+            run_context = _build_run_context(exclude_feature=feature_name)
             try:
+                feature_timeout = (
+                    settings.pipeline.swarm_feature_timeout_seconds
+                    if settings is not None
+                    else 600
+                )
                 result = run_feature_swarm(
                     compiled_for_layer, spec_ids, feature_name,
                     run_context=run_context,
                     max_handoffs=max_handoffs,
+                    timeout_seconds=feature_timeout,
                 )
             except Exception:
                 # B1 fix: was ``except BaseException`` which caught
@@ -544,9 +577,7 @@ def make_execute_layer_node(
                             worker_crashes_with_inflight_agents_total,
                         )
 
-                        worker_crashes_with_inflight_agents_total.labels(
-                            feature=feature_name
-                        ).inc()
+                        worker_crashes_with_inflight_agents_total.inc()
                     except Exception:  # pragma: no cover — defensive
                         pass
                     log.warning(
@@ -605,14 +636,9 @@ def make_execute_layer_node(
                         if pending_future is future or pending_future.done():
                             continue
                         if pending_future.cancel():
-                            _skipped = FeatureResult(
-                                feature=pending_name,
-                                spec_ids=groups.get(pending_name, []),
-                                status="skipped",
-                                artifacts=[],
-                                tests=[],
-                                error="Cancelled by user",
-                                eval_scores={},
+                            _skipped = make_feature_result(
+                                pending_name, groups.get(pending_name, []),
+                                "skipped", error="Cancelled by user",
                             )
                             completed.append(_skipped)
                             _write_episode(_skipped)
@@ -630,14 +656,9 @@ def make_execute_layer_node(
                             feature=fname,
                             error=str(exc),
                         )
-                        _cancelled = FeatureResult(
-                            feature=fname,
-                            spec_ids=groups.get(fname, []),
-                            status="skipped",
-                            artifacts=[],
-                            tests=[],
-                            error="Cancelled by user",
-                            eval_scores={},
+                        _cancelled = make_feature_result(
+                            fname, groups.get(fname, []),
+                            "skipped", error="Cancelled by user",
                         )
                         completed.append(_cancelled)
                         _write_episode(_cancelled)
@@ -651,7 +672,9 @@ def make_execute_layer_node(
                     completed.append(_result)
                     _write_episode(_result)
                 except Exception as exc:
-                    log.error("feature_worker_crashed", feature=fname, error=str(exc))
+                    _is_timeout = isinstance(exc, TimeoutError)
+                    _error_label = "feature_worker_timeout" if _is_timeout else "feature_worker_crashed"
+                    log.error(_error_label, feature=fname, error=str(exc))
                     try:
                         from dark_factory.metrics.helpers import record_incident
                         from dark_factory.metrics.prometheus import observe_worker_crash
@@ -660,30 +683,27 @@ def make_execute_layer_node(
                         record_incident(
                             category="pipeline",
                             severity="error",
-                            message=f"feature worker crashed: {exc}"[:500],
+                            message=f"feature worker {'timed out' if _is_timeout else 'crashed'}: {exc}"[:500],
                             phase="swarm",
                             feature=fname,
                         )
                     except Exception:  # pragma: no cover — defensive
                         pass
-                    _crashed = FeatureResult(
-                        feature=fname,
-                        spec_ids=groups.get(fname, []),
-                        status="error",
-                        artifacts=[],
-                        tests=[],
-                        error=f"Worker crashed: {exc}",
-                        eval_scores={},
+                    _error_msg = f"Timed out: {exc}" if _is_timeout else f"Worker crashed: {exc}"
+                    _crashed = make_feature_result(
+                        fname, groups.get(fname, []),
+                        "timeout" if _is_timeout else "error",
+                        error=_error_msg,
                     )
                     completed.append(_crashed)
                     _write_episode(_crashed)
                     _emit(
                         "feature_completed",
                         feature=fname,
-                        status="error",
+                        status="timeout" if _is_timeout else "error",
                         artifacts=0,
                         tests=0,
-                        error=f"Worker crashed: {exc}",
+                        error=_error_msg,
                         layer=layer_idx + 1,
                         worker_crash_count=1,
                     )
@@ -798,8 +818,22 @@ def make_adjust_strategy_node(threshold: float = 0.5, max_layer_retries: int = 1
             if layer_rate < threshold:
                 attempt = layer_retries.get(prev_layer_idx, 0)
 
+                # Features that timed out are excluded from reflection-driven
+                # retry: re-running them with the same wall-clock budget will
+                # just time out again. Mark them terminal so the retry list
+                # only contains features that failed for recoverable reasons.
+                timed_out_features = {
+                    r["feature"] for r in layer_results if r.get("status") == "timeout"
+                }
+                if timed_out_features:
+                    log.warning(
+                        "layer_features_timed_out",
+                        layer=prev_layer_idx,
+                        features=sorted(timed_out_features),
+                    )
+
                 # ── Self-healing: reflection + retry ──────────────────
-                if attempt < max_layer_retries and layer_rate < 1.0:
+                if attempt < max_layer_retries:
                     from dark_factory.agents.tools import emit_progress as _emit
 
                     _emit(
@@ -819,7 +853,9 @@ def make_adjust_strategy_node(threshold: float = 0.5, max_layer_retries: int = 1
                     )
 
                     if reflection and reflection.get("retryable_features"):
-                        retryable = set(reflection["retryable_features"])
+                        # Remove any features that timed out from the retryable
+                        # set — they need a larger budget, not a retry.
+                        retryable = set(reflection["retryable_features"]) - timed_out_features
                         diagnosis = reflection.get("diagnosis", "")
                         strategy = reflection.get("strategy", {})
 
@@ -838,12 +874,12 @@ def make_adjust_strategy_node(threshold: float = 0.5, max_layer_retries: int = 1
                         if strategy.get("prompt_hint"):
                             overrides["prompt_hint"] = strategy["prompt_hint"]
 
-                        # Remove failed results for retryable features so
-                        # they get re-run. Keep terminal failures.
+                        # Remove results for retryable features so they
+                        # get re-run. Everything else (terminal failures,
+                        # results from other layers) is kept.
                         completed = [
                             r for r in completed
                             if r["feature"] not in retryable
-                            or r["feature"] not in layer_features
                         ]
 
                         layer_retries[prev_layer_idx] = attempt + 1
@@ -1076,10 +1112,22 @@ def run_orchestrator(settings: Settings, spec_ids: list[str]) -> OrchestratorSta
             )
             set_current_run_id(run_id)
 
+        # Reset per-run tracking (dedup boost cap) before a new run
+        if shared_memory_repo:
+            shared_memory_repo.reset_run_state()
+
         # Always run memory decay (it's a separate concern from create_run)
         if memory_client and settings.memory.enabled and shared_memory_repo:
-            decayed = shared_memory_repo.decay_all_relevance(factor=settings.evaluation.decay_factor)
+            decayed = shared_memory_repo.decay_all_relevance(
+                factor=settings.evaluation.decay_factor,
+                grace_days=settings.evaluation.decay_grace_days,
+            )
             log.info("memory_decayed", count=decayed, factor=settings.evaluation.decay_factor)
+            # Prune memories that have decayed below usefulness to
+            # prevent unbounded graph/Qdrant growth.
+            pruned = shared_memory_repo.prune_low_relevance(threshold=0.05)
+            if pruned:
+                log.info("memory_pruned", count=pruned)
 
             # If the bridge created the run with spec_count=0, bump it now
             # to the actual count so the History tab shows accurate numbers

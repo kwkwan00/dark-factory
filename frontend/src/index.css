@@ -8,7 +8,7 @@ body {
   background: #0d1117;
   color: #e6edf3;
   font-size: 14px;
-  line-height: 1.5;
+  line-height: 1.55;
 }
 
 #root {
@@ -91,10 +91,67 @@ body {
 }
 
 .card-title {
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 600;
   color: #e6edf3;
   margin: 0 0 12px 0;
+}
+
+/* ── Form inputs ──
+ * Shared dark-theme styling for the refinery input forms (DirectInput,
+ * InlineEditor, etc.). One class so future theme changes touch one place
+ * rather than the dozen inline-style copies that previously bypassed CSS. */
+.form-input,
+.form-textarea,
+.form-select {
+  background: #0d1117;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  font-size: 12px;
+  padding: 6px 10px;
+  font-family: inherit;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.form-input:focus,
+.form-textarea:focus,
+.form-select:focus {
+  outline: none;
+  border-color: #58a6ff;
+}
+
+.form-textarea {
+  resize: vertical;
+}
+
+.form-label {
+  display: block;
+  font-size: 11px;
+  color: #8b949e;
+  margin-bottom: 4px;
+}
+
+/* ── Whitepaper print layout ──
+ * Mark every card / callout / figure as page-break-avoidant so native
+ * browser print + the html-to-image PDF export produce cleaner cuts.
+ * page-break-inside is the legacy spelling kept for older renderers;
+ * break-inside is the modern equivalent. */
+.about-whitepaper .card,
+.about-whitepaper .callout,
+.about-whitepaper figure {
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+@media print {
+  .about-whitepaper .card,
+  .about-whitepaper .callout,
+  .about-whitepaper figure {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
 }
 
 /* ── Steps ── */
@@ -123,7 +180,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 11px;
+  font-size: 12px;
   flex-shrink: 0;
   margin-top: 2px;
 }
@@ -139,11 +196,11 @@ body {
 }
 
 .step-body { flex: 1; }
-.step-name { font-weight: 600; font-size: 13px; }
+.step-name { font-weight: 600; font-size: 14px; }
 .step-messages { margin-top: 4px; }
 
 .step-message {
-  font-size: 12px;
+  font-size: 13px;
   color: #8b949e;
   padding: 2px 0;
   font-family: "SF Mono", Consolas, monospace;
@@ -162,7 +219,7 @@ body {
   border: 1px solid #30363d;
   border-radius: 6px;
   color: #e6edf3;
-  font-size: 13px;
+  font-size: 14px;
   padding: 8px 12px;
 }
 
@@ -177,7 +234,7 @@ body {
   border-radius: 6px;
   color: #fff;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
   padding: 8px 16px;
   transition: background 0.15s;
@@ -206,7 +263,7 @@ body {
 .table th {
   text-align: left;
   color: #8b949e;
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -217,7 +274,7 @@ body {
 .table td {
   padding: 10px 12px;
   border-bottom: 1px solid #21262d;
-  font-size: 13px;
+  font-size: 14px;
   vertical-align: top;
 }
 
@@ -238,7 +295,7 @@ code, .mono {
   border: 1px solid #30363d;
   border-radius: 4px;
   padding: 1px 5px;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 /* ── Message log ── */
@@ -253,7 +310,7 @@ code, .mono {
 
 .message-log p {
   margin: 4px 0;
-  font-size: 13px;
+  font-size: 14px;
   font-family: "SF Mono", Consolas, monospace;
   color: #8b949e;
 }
@@ -268,7 +325,7 @@ code, .mono {
   max-height: 600px;
   overflow-y: auto;
   font-family: "SF Mono", Consolas, "Liberation Mono", monospace;
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.6;
   padding: 8px 0;
 }
@@ -301,14 +358,14 @@ code, .mono {
 .log-time {
   color: #6e7681;
   white-space: nowrap;
-  font-size: 11px;
+  font-size: 12px;
   flex-shrink: 0;
   padding-top: 1px;
 }
 
 .log-badge {
   display: inline-block;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.5px;
   padding: 1px 6px;
@@ -324,13 +381,14 @@ code, .mono {
   color: #c9d1d9;
   word-break: break-word;
   flex: 1;
+  font-size: 13px;
 }
 
 .log-footer {
   background: #161b22;
   border-top: 1px solid #30363d;
   padding: 8px 16px;
-  font-size: 11px;
+  font-size: 12px;
   color: #8b949e;
   font-family: "SF Mono", Consolas, monospace;
   border-radius: 0 0 8px 8px;
@@ -384,7 +442,7 @@ code, .mono {
 
 .dropzone-hint {
   color: #8b949e;
-  font-size: 12px;
+  font-size: 13px;
 }
 
 /* ── Empty state ── */
@@ -433,8 +491,70 @@ code, .mono {
 }
 
 .stat-label {
-  font-size: 11px;
+  font-size: 12px;
   color: #8b949e;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+}
+
+/* ── About whitepaper theme ── */
+.about-whitepaper {
+  background: #ffffff;
+  color: #1a1a2e;
+  padding: 24px;
+  margin: -16px;
+  border-radius: 8px;
+  min-height: 100%;
+}
+.about-whitepaper .card {
+  background: #f8f9fa;
+  border-color: #d0d7de;
+  color: #1a1a2e;
+}
+.about-whitepaper .card-title {
+  color: #1a1a2e;
+}
+.about-whitepaper code, .about-whitepaper .mono {
+  background: #eef1f5;
+  border-color: #d0d7de;
+  color: #0550ae;
+}
+.about-whitepaper p, .about-whitepaper div {
+  color: inherit;
+}
+.about-whitepaper .table th {
+  color: #57606a;
+  border-bottom-color: #d0d7de;
+}
+.about-whitepaper .table td {
+  color: #1a1a2e;
+  border-bottom-color: #eef1f5;
+}
+.about-whitepaper .badge-success { color: #1a7f37; }
+.about-whitepaper .badge-error   { color: #cf222e; }
+.about-whitepaper .badge-warn    { color: #9a6700; }
+.about-whitepaper .badge-info    { color: #0550ae; }
+.about-whitepaper a { color: #0969da; }
+
+/* Traceability info popup */
+.trace-info-popup {
+  display: none;
+  position: absolute;
+  right: 0;
+  top: 100%;
+  margin-top: 4px;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  padding: 8px 10px;
+  font-size: 12px;
+  color: #c9d1d9;
+  white-space: nowrap;
+  z-index: 100;
+  min-width: 200px;
+}
+.trace-info-trigger:hover + .trace-info-popup,
+.trace-info-popup:hover {
+  display: block;
 }

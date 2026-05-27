@@ -31,6 +31,7 @@ log = structlog.get_logger()
 # `403 model not found`, change the value via the Settings tab (or set
 # ``EVAL_MODEL=gpt-4.1`` etc. in the environment at boot).
 _eval_model: str = os.getenv("EVAL_MODEL", "gpt-5.4")
+_eval_reasoning_effort: str = os.getenv("EVAL_REASONING_EFFORT", "high")
 
 
 def get_eval_model() -> str:
@@ -52,6 +53,29 @@ def set_eval_model(name: str) -> None:
     log.info("eval_model_updated", model=name)
 
 
+def _build_eval_llm():
+    """Build a DeepEval GPTModel with reasoning_effort for supported models.
+
+    gpt-5.4 and o-series models require temperature=1 and support
+    reasoning_effort. Older chat models (gpt-4.1, gpt-4o) use the
+    default temperature=0 with no reasoning_effort.
+    """
+    from deepeval.models import GPTModel
+
+    model_name = get_eval_model()
+    is_reasoning = any(
+        model_name.startswith(p)
+        for p in ("o1", "o3", "o4", "gpt-5")
+    )
+    if is_reasoning:
+        return GPTModel(
+            model=model_name,
+            temperature=1,
+            generation_kwargs={"reasoning_effort": _eval_reasoning_effort},
+        )
+    return GPTModel(model=model_name)
+
+
 # ── Metric builders ──────────────────────────────────────────────────
 
 
@@ -70,7 +94,7 @@ def build_correctness_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.EXPECTED_OUTPUT,
         ],
         threshold=threshold,
-        model=get_eval_model(),
+        model=_build_eval_llm(),
     )
 
 
@@ -88,7 +112,7 @@ def build_coherence_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.ACTUAL_OUTPUT,
         ],
         threshold=threshold,
-        model=get_eval_model(),
+        model=_build_eval_llm(),
     )
 
 
@@ -108,25 +132,7 @@ def build_completeness_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.INPUT,
         ],
         threshold=threshold,
-        model=get_eval_model(),
-    )
-
-
-def build_code_quality_metric(threshold: float = 0.5) -> GEval:
-    """Generated code follows best practices and handles edge cases."""
-    return GEval(
-        name="Code Quality",
-        criteria=(
-            "Assess whether the generated code follows language best practices, "
-            "handles edge cases, includes proper error handling, and uses "
-            "appropriate data structures and algorithms."
-        ),
-        evaluation_params=[
-            LLMTestCaseParams.ACTUAL_OUTPUT,
-            LLMTestCaseParams.EXPECTED_OUTPUT,
-        ],
-        threshold=threshold,
-        model=get_eval_model(),
+        model=_build_eval_llm(),
     )
 
 
@@ -149,7 +155,7 @@ def build_spec_correctness_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.INPUT,
         ],
         threshold=threshold,
-        model=get_eval_model(),
+        model=_build_eval_llm(),
     )
 
 
@@ -167,7 +173,7 @@ def build_spec_coherence_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.ACTUAL_OUTPUT,
         ],
         threshold=threshold,
-        model=get_eval_model(),
+        model=_build_eval_llm(),
     )
 
 
@@ -188,7 +194,7 @@ def build_spec_instruction_following_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.INPUT,
         ],
         threshold=threshold,
-        model=get_eval_model(),
+        model=_build_eval_llm(),
     )
 
 
@@ -210,7 +216,7 @@ def build_spec_safety_metric(threshold: float = 0.5) -> GEval:
             LLMTestCaseParams.INPUT,
         ],
         threshold=threshold,
-        model=get_eval_model(),
+        model=_build_eval_llm(),
     )
 
 

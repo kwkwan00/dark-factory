@@ -11,6 +11,8 @@ from __future__ import annotations
 import structlog
 from fastapi import APIRouter, HTTPException, Query, Request
 
+from dark_factory.api.validators import RUN_ID_RE
+
 log = structlog.get_logger()
 
 router = APIRouter()
@@ -284,9 +286,7 @@ def _is_valid_run_id(run_id: str) -> bool:
     variant for flexibility. Rejects slashes, dots, and whitespace so
     it's safe to use in path params and in filesystem joins later.
     """
-    import re
-
-    return bool(re.fullmatch(r"[A-Za-z0-9_\-]{1,128}", run_id))
+    return bool(RUN_ID_RE.match(run_id))
 
 
 @router.get("/metrics/memory")

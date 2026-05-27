@@ -391,3 +391,209 @@ def test_complete_structured_raises_when_no_tool_use_block_returned():
         client = AnthropicClient(api_key="sk-fake")
         with pytest.raises(RuntimeError, match="no tool_use block"):
             client.complete_structured(prompt="x", response_model=Spec)
+
+
+# ── _is_transient / _backoff_sleep unit tests ────────────────────────────────
+
+
+def test_is_transient_true_for_api_timeout():
+    from dark_factory.llm.anthropic import _is_transient
+    import httpx
+    exc = anthropic.APITimeoutError(request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    assert _is_transient(exc) is True
+
+
+def test_is_transient_true_for_connection_error():
+    from dark_factory.llm.anthropic import _is_transient
+    import httpx
+    exc = anthropic.APIConnectionError(request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+    assert _is_transient(exc) is True
+
+
+def test_is_transient_false_for_runtime_error():
+    from dark_factory.llm.anthropic import _is_transient
+    assert _is_transient(RuntimeError("bad schema")) is False
+
+
+def test_is_transient_false_for_value_error():
+    from dark_factory.llm.anthropic import _is_transient
+    assert _is_transient(ValueError("invalid")) is False
+
+
+def test_is_transient_true_for_500_http_status():
+    from dark_factory.llm.anthropic import _is_transient
+    exc = RuntimeError("server error")
+    exc.status_code = 500  # type: ignore[attr-defined]
+    assert _is_transient(exc) is True
+
+
+def test_backoff_sleep_uses_retry_after_header():
+    """When the exception response has a Retry-After header, _backoff_sleep
+    should sleep for that many seconds (capped at 30)."""
+    import time
+    from unittest.mock import patch
+    from dark_factory.llm.anthropic import _backoff_sleep
+
+    headers = {"retry-after": "3"}
+    response_ns = SimpleNamespace(headers=headers)
+    exc = RuntimeError("rate limited")
+    exc.response = response_ns  # type: ignore[attr-defined]
+
+    with patch("dark_factory.llm.anthropic.time.sleep") as mock_sleep:
+        _backoff_sleep(0, exc)
+
+    mock_sleep.assert_called_once()
+    slept = mock_sleep.call_args[0][0]
+    assert slept == 3.0
+
+
+def test_backoff_sleep_uses_exponential_when_no_header():
+    """Without a Retry-After header, sleep should be ~2^attempt seconds."""
+    from unittest.mock import patch
+    from dark_factory.llm.anthropic import _backoff_sleep
+
+    exc = RuntimeError("connection error")
+
+    with patch("dark_factory.llm.anthropic.time.sleep") as mock_sleep:
+        _backoff_sleep(0, exc)  # attempt 0 → base=1s
+
+    slept = mock_sleep.call_args[0][0]
+    assert 0.8 <= slept <= 1.2 + 0.2 * 1.2  # 1s ± 20% jitter
+
+
+def test_backoff_sleep_caps_at_30s():
+    """Backoff should never exceed 30 seconds."""
+    from unittest.mock import patch
+    from dark_factory.llm.anthropic import _backoff_sleep
+
+    headers = {"retry-after": "9999"}
+    response_ns = SimpleNamespace(headers=headers)
+    exc = RuntimeError("throttled")
+    exc.response = response_ns  # type: ignore[attr-defined]
+
+    with patch("dark_factory.llm.anthropic.time.sleep") as mock_sleep:
+        _backoff_sleep(0, exc)
+
+    slept = mock_sleep.call_args[0][0]
+    assert slept <= 30.0
+
+
+# ── complete() retry loop tests ──────────────────────────────────────────────
+
+
+def _make_ok_stream():
+    """Return a fake successful stream context for complete()."""
+    class _FakeStream:
+        text_stream = ["hello ", "world"]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get_final_message(self):
+            return SimpleNamespace(
+                stop_reason="end_turn",
+                content=[],
+                usage=SimpleNamespace(
+                    input_tokens=5,
+                    output_tokens=3,
+                    cache_read_input_tokens=None,
+                    cache_creation_input_tokens=None,
+                ),
+            )
+
+    return _FakeStream()
+
+
+def test_complete_retries_once_on_transient_then_succeeds():
+    """complete() should retry once when the first streaming call raises
+    a transient APIConnectionError, succeeding on the second attempt."""
+    import httpx
+    transient = anthropic.APIConnectionError(
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    )
+
+    with patch("dark_factory.llm.anthropic.anthropic.Anthropic") as mock_cls, \
+         patch("dark_factory.llm.anthropic._backoff_sleep"):
+        mock_sdk = MagicMock()
+        fail_cm = MagicMock()
+        fail_cm.__enter__.side_effect = transient
+        fail_cm.__exit__.return_value = False
+        mock_sdk.messages.stream.side_effect = [fail_cm, _make_ok_stream()]
+        mock_cls.return_value = mock_sdk
+
+        client = AnthropicClient(api_key="sk-fake")
+        result = client.complete(prompt="hi")
+
+    assert result == "hello world"
+    assert mock_sdk.messages.stream.call_count == 2
+
+
+def test_complete_does_not_retry_on_permanent_error():
+    """complete() should bail immediately on permanent (non-transient) errors."""
+    with patch("dark_factory.llm.anthropic.anthropic.Anthropic") as mock_cls:
+        mock_sdk = MagicMock()
+        fail_cm = MagicMock()
+        fail_cm.__enter__.side_effect = ValueError("bad prompt")
+        fail_cm.__exit__.return_value = False
+        mock_sdk.messages.stream.return_value = fail_cm
+        mock_cls.return_value = mock_sdk
+
+        client = AnthropicClient(api_key="sk-fake")
+        with pytest.raises(ValueError, match="bad prompt"):
+            client.complete(prompt="hi")
+
+    assert mock_sdk.messages.stream.call_count == 1
+
+
+def test_complete_raises_after_exhausting_retries():
+    """If both attempts hit transient errors, the last error is re-raised."""
+    import httpx
+    transient = anthropic.APIConnectionError(
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    )
+
+    with patch("dark_factory.llm.anthropic.anthropic.Anthropic") as mock_cls, \
+         patch("dark_factory.llm.anthropic._backoff_sleep"):
+        mock_sdk = MagicMock()
+        fail_cm = MagicMock()
+        fail_cm.__enter__.side_effect = transient
+        fail_cm.__exit__.return_value = False
+        mock_sdk.messages.stream.return_value = fail_cm
+        mock_cls.return_value = mock_sdk
+
+        client = AnthropicClient(api_key="sk-fake")
+        with pytest.raises(anthropic.APIConnectionError):
+            client.complete(prompt="hi")
+
+    assert mock_sdk.messages.stream.call_count == 2
+
+
+def test_complete_structured_calls_backoff_on_transient():
+    """complete_structured() should call _backoff_sleep between attempts."""
+    import httpx
+    transient = anthropic.APIConnectionError(
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    )
+    tool_input = {
+        "id": "s1", "title": "T", "description": "d",
+        "requirement_ids": ["r1"], "acceptance_criteria": ["c"],
+        "dependencies": [], "scenarios": [], "capability": "cap",
+    }
+
+    with patch("dark_factory.llm.anthropic.anthropic.Anthropic") as mock_cls, \
+         patch("dark_factory.llm.anthropic._backoff_sleep") as mock_backoff:
+        mock_sdk = MagicMock()
+        fail_cm = MagicMock()
+        fail_cm.__enter__.side_effect = transient
+        fail_cm.__exit__.return_value = False
+        ok_cm = _mock_stream_context(_mock_final_message(tool_input))
+        mock_sdk.messages.stream.side_effect = [fail_cm, ok_cm]
+        mock_cls.return_value = mock_sdk
+
+        client = AnthropicClient(api_key="sk-fake")
+        client.complete_structured(prompt="x", response_model=Spec)
+
+    mock_backoff.assert_called_once()

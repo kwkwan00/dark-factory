@@ -52,6 +52,7 @@ dependencies = [
     { name = "python-docx" },
     { name = "python-multipart" },
     { name = "qdrant-client" },
+    { name = "snakemd" },
     { name = "sse-starlette" },
     { name = "striprtf" },
     { name = "structlog" },
@@ -88,7 +89,7 @@ requires-dist = [
     { name = "langgraph-swarm", specifier = ">=0.1,<1.0" },
     { name = "lxml", specifier = ">=5.2,<7.0" },
     { name = "neo4j", specifier = ">=5.0,<7.0" },
-    { name = "openai", specifier = ">=1.0,<3.0" },
+    { name = "openai", specifier = ">=2.32.0" },
     { name = "openpyxl", specifier = ">=3.1,<4.0" },
     { name = "prometheus-client", specifier = ">=0.20,<1.0" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2,<4.0" },
@@ -97,6 +98,7 @@ requires-dist = [
     { name = "python-docx", specifier = ">=1.1,<2.0" },
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "qdrant-client", specifier = ">=1.9,<2.0" },
+    { name = "snakemd", specifier = ">=2.4.0" },
     { name = "sse-starlette", specifier = ">=2.0" },
     { name = "striprtf", specifier = ">=0.0.26,<1.0" },
     { name = "structlog", specifier = ">=24.0" },
@@ -1536,7 +1538,7 @@ wheels = [
 
 [[package]]
 name = "openai"
-version = "2.30.0"
+version = "2.32.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -1548,9 +1550,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/88/15/52580c8fbc16d0675d516e8749806eda679b16de1e4434ea06fb6feaa610/openai-2.30.0.tar.gz", hash = "sha256:92f7661c990bda4b22a941806c83eabe4896c3094465030dd882a71abe80c885", size = 676084, upload-time = "2026-03-25T22:08:59.96Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ed/59/bdcc6b759b8c42dd73afaf5bf8f902c04b37987a5514dbc1c64dba390fef/openai-2.32.0.tar.gz", hash = "sha256:c54b27a9e4cb8d51f0dd94972ffd1a04437efeb259a9e60d8922b8bd26fe55e0", size = 693286, upload-time = "2026-04-15T22:28:19.434Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2a/9e/5bfa2270f902d5b92ab7d41ce0475b8630572e71e349b2a4996d14bdda93/openai-2.30.0-py3-none-any.whl", hash = "sha256:9a5ae616888eb2748ec5e0c5b955a51592e0b201a11f4262db920f2a78c5231d", size = 1146656, upload-time = "2026-03-25T22:08:58.2Z" },
+    { url = "https://files.pythonhosted.org/packages/1e/c1/d6e64ccd0536bf616556f0cad2b6d94a8125f508d25cfd814b1d2db4e2f1/openai-2.32.0-py3-none-any.whl", hash = "sha256:4dcc9badeb4bf54ad0d187453742f290226d30150890b7890711bda4f32f192f", size = 1162570, upload-time = "2026-04-15T22:28:17.714Z" },
 ]
 
 [[package]]
@@ -2495,6 +2497,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+
+[[package]]
+name = "snakemd"
+version = "2.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2e/83/b28313615fdf4ff77b8cef401bb2d1df0f77fc917b471b3a1594a38a52e6/snakemd-2.4.0.tar.gz", hash = "sha256:1450fae445049e07b37f26c46b076fa24293417a197ba0ee4d00d5b8255868e4", size = 24279, upload-time = "2025-10-26T21:42:14.055Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/52/86/e3bf1ca6a9c94c38fa86e79d4d15b0d1da0663d26527f26b4f0ad868f700/snakemd-2.4.0-py3-none-any.whl", hash = "sha256:89c7f4e126e53f79f267d3502600f6f19c2c54e9a0a7489a569f3b53210c3c37", size = 24768, upload-time = "2025-10-26T21:42:12.88Z" },
 ]
 
 [[package]]

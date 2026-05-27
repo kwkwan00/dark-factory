@@ -28,10 +28,13 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 from typing import Any, Coroutine, TypeVar
 
 import structlog
+
+from dark_factory.log import trace_methods
 
 log = structlog.get_logger()
 
@@ -69,6 +72,7 @@ def _silence_closed_loop_errors(
     loop.default_exception_handler(context)
 
 
+@trace_methods
 class BackgroundLoop:
     """Process-wide singleton: an asyncio loop running in a daemon thread."""
 
@@ -191,6 +195,15 @@ class BackgroundLoop:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
             return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            # Cancel the underlying asyncio task so the coroutine is
+            # interrupted and any subprocess it holds is cleaned up.
+            # Without this, the coroutine keeps running on the
+            # BackgroundLoop after the caller has given up waiting,
+            # leaving Claude Agent SDK subprocesses alive and writing
+            # files while the next pipeline phase has already started.
+            future.cancel()
+            raise
         finally:
             self._completed_count += 1
 

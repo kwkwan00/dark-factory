@@ -15,10 +15,14 @@ This module exposes both:
 
 from __future__ import annotations
 
+import re
+import time
 from typing import Any
 
 import structlog
 from langchain.agents import create_agent
+from langchain.agents.middleware.types import AgentMiddleware, ModelRequest, ModelResponse
+from langchain_core.messages import AIMessage
 from langgraph_swarm import create_handoff_tool, create_swarm
 from typing_extensions import TypedDict
 
@@ -66,13 +70,35 @@ class FeatureResult(TypedDict, total=False):
 
     feature: str
     spec_ids: list[str]
-    status: str  # "success" | "error" | "skipped"
+    status: str  # "success" | "error" | "skipped" | "timeout"
     artifacts: list[dict[str, Any]]
     tests: list[dict[str, Any]]
     error: str | None
     eval_scores: dict[str, Any]
     # Telemetry (optional, only populated when the swarm runs)
     stats: dict[str, Any]
+
+
+def make_feature_result(
+    feature: str,
+    spec_ids: list[str],
+    status: str,
+    error: str | None = None,
+    stats: dict[str, Any] | None = None,
+) -> FeatureResult:
+    """Construct a ``FeatureResult`` with consistent defaults."""
+    result = FeatureResult(
+        feature=feature,
+        spec_ids=spec_ids,
+        status=status,
+        artifacts=[],
+        tests=[],
+        error=error,
+        eval_scores={},
+    )
+    if stats is not None:
+        result["stats"] = stats
+    return result
 
 
 # ── Message inspection helpers ───────────────────────────────────────
@@ -164,10 +190,8 @@ class _SwarmStats:
     """
 
     def __init__(self, feature: str) -> None:
-        import time as _time
-
         self.feature = feature
-        self.started_at = _time.time()
+        self.started_at = time.time()
         self.ended_at: float | None = None
 
         self.agent_transitions = 0
@@ -227,8 +251,6 @@ class _SwarmStats:
             pass
 
     def note_tool_call(self, tool: str, agent: str, tool_call_id: str) -> None:
-        import time as _time
-
         self.tool_call_count += 1
         if tool in _DEEP_AGENT_TOOLS:
             self.deep_agent_invocations += 1
@@ -241,7 +263,7 @@ class _SwarmStats:
         if agent:
             self._agent_bucket(agent)["tool_calls"] += 1
         if tool_call_id:
-            self.pending_tool_calls[tool_call_id] = (_time.time(), tool, agent)
+            self.pending_tool_calls[tool_call_id] = (time.time(), tool, agent)
 
     def note_tool_result(
         self,
@@ -252,8 +274,6 @@ class _SwarmStats:
         is_error: bool,
         run_id: str | None,
     ) -> None:
-        import time as _time
-
         from dark_factory.metrics.helpers import record_tool_call
 
         latency: float | None = None
@@ -261,7 +281,7 @@ class _SwarmStats:
         pending = self.pending_tool_calls.pop(tool_call_id, None)
         if pending is not None:
             started_at, pending_tool, pending_agent = pending
-            latency = _time.time() - started_at
+            latency = time.time() - started_at
             if tool_name == "?" or not tool_name:
                 tool_name = pending_tool
             agent = pending_agent
@@ -280,9 +300,7 @@ class _SwarmStats:
         )
 
     def finalize(self) -> dict[str, Any]:
-        import time as _time
-
-        self.ended_at = _time.time()
+        self.ended_at = time.time()
         return {
             "feature": self.feature,
             "started_at": self.started_at,
@@ -438,6 +456,35 @@ def _build_coder(model: "str | Any", prompt_suffix: str = ""):
     )
 
 
+_STRATEGY_OVERRIDE_RE = re.compile(r"STRATEGY OVERRIDE:.*?(?=\n\n|\Z)", re.DOTALL)
+
+
+class _StripStrategyOverrides(AgentMiddleware):
+    """Scrub STRATEGY OVERRIDE blocks from AIMessages before the reviewer LLM
+    sees them.  The coder LLM can echo coder-only directives (e.g. 'Use
+    claude_agent_codegen for ALL specs') in its responses, which would otherwise
+    mislead the reviewer into attempting code generation.
+    """
+
+    def wrap_model_call(
+        self,
+        request: "ModelRequest",
+        handler: "Any",
+    ) -> "ModelResponse":
+        cleaned: list[Any] = []
+        modified = False
+        for msg in request.messages:
+            if isinstance(msg, AIMessage) and isinstance(msg.content, str):
+                scrubbed = _STRATEGY_OVERRIDE_RE.sub("", msg.content).strip()
+                if scrubbed != msg.content:
+                    msg = AIMessage(content=scrubbed, name=msg.name, id=msg.id)
+                    modified = True
+            cleaned.append(msg)
+        if not modified:
+            return handler(request)
+        return handler(request.override(messages=cleaned))
+
+
 def _build_reviewer(model: "str | Any"):
     handoff_to_coder = create_handoff_tool(
         agent_name="coder",
@@ -452,6 +499,7 @@ def _build_reviewer(model: "str | Any"):
         tools=[*GRAPH_READ_TOOLS, read_file, *EVAL_TOOLS, *EVAL_HISTORY_TOOLS, *DEEP_REVIEWER_TOOLS, *MEMORY_READ_TOOLS, *MEMORY_WRITE_MISTAKE, handoff_to_coder, handoff_to_tester],
         system_prompt=get_prompt("swarm_reviewer", "system"),
         name="reviewer",
+        middleware=[_StripStrategyOverrides()],
     )
 
 
@@ -462,7 +510,7 @@ def _build_tester(model: "str | Any"):
     )
     return create_agent(
         model,
-        tools=[*TESTGEN_TOOLS, *EVAL_TOOLS, *DEEP_TESTER_TOOLS, *MEMORY_READ_TOOLS, *MEMORY_WRITE_MISTAKE, handoff_to_planner],
+        tools=[*TESTGEN_TOOLS, *EVAL_TOOLS, *EVAL_HISTORY_TOOLS, *DEEP_TESTER_TOOLS, *MEMORY_READ_TOOLS, *MEMORY_WRITE_MISTAKE, handoff_to_planner],
         system_prompt=get_prompt("swarm_tester", "system"),
         name="tester",
     )
@@ -531,6 +579,9 @@ def init_swarm_context(
             database=settings.memory.database,
             user=settings.neo4j.user,
             password=settings.neo4j.password,
+            connection_timeout=settings.neo4j.connection_timeout,
+            connection_acquisition_timeout=settings.neo4j.connection_acquisition_timeout,
+            max_connection_pool_size=settings.neo4j.max_connection_pool_size,
         )
         memory_client = Neo4jClient(mem_config)
         init_memory_schema(memory_client)
@@ -797,6 +848,7 @@ def run_feature_swarm(
     feature_name: str,
     run_context: str = "",
     max_handoffs: int = MAX_HANDOFFS,
+    timeout_seconds: int = 3600,
 ) -> FeatureResult:
     """Stream a compiled swarm with an isolated message history.
 
@@ -870,9 +922,25 @@ def run_feature_swarm(
         # doesn't cause N² re-emission of already-seen messages.
         seen_message_ids: set[int] = set()
 
+        _swarm_start = time.monotonic()
+
         for chunk in compiled.stream(
             initial, stream_mode="updates", config=stream_config
         ):
+            # Wall-clock timeout: checked once per LangGraph chunk so a
+            # hung LLM call inside a graph node can't stall forever.
+            _elapsed = time.monotonic() - _swarm_start
+            if _elapsed > timeout_seconds:
+                log.error(
+                    "feature_swarm_timeout",
+                    feature=feature_name,
+                    elapsed_seconds=round(_elapsed, 1),
+                    timeout_seconds=timeout_seconds,
+                )
+                raise TimeoutError(
+                    f"Feature swarm '{feature_name}' exceeded {timeout_seconds}s "
+                    f"wall-clock timeout after {_elapsed:.0f}s"
+                )
             # Cancellation check between swarm stream chunks. This is the
             # tightest loop where checking is cheap (once per LangGraph
             # update, typically once per tool call or agent turn) and where
@@ -948,56 +1016,26 @@ def run_feature_swarm(
         )
         _emit_agent_stats(stats, run_id=run_id)
         if not wrote_code:
-            return FeatureResult(
-                feature=feature_name,
-                spec_ids=spec_ids,
-                status="error",
-                artifacts=[],
-                tests=[],
+            return make_feature_result(
+                feature_name, spec_ids, "error",
                 error="Swarm completed without writing any code (no write_file or claude_agent_codegen calls).",
-                eval_scores={},
                 stats=stats.finalize(),
             )
 
-        return FeatureResult(
-            feature=feature_name,
-            spec_ids=spec_ids,
-            status="success",
-            artifacts=[],
-            tests=[],
-            error=None,
-            eval_scores={},
-            stats=stats.finalize(),
-        )
+        return make_feature_result(feature_name, spec_ids, "success", stats=stats.finalize())
     except PipelineCancelled as exc:
-        # Kill-switch path: return a skipped result rather than an error
-        # so the orchestrator's aggregate doesn't flag this as a crash.
         log.warning("feature_swarm_cancelled_clean", feature=feature_name)
         _emit_agent_stats(stats, run_id=run_id)
-        return FeatureResult(
-            feature=feature_name,
-            spec_ids=spec_ids,
-            status="skipped",
-            artifacts=[],
-            tests=[],
-            error="Cancelled by user",
-            eval_scores={},
-            stats=stats.finalize(),
-        )
+        return make_feature_result(feature_name, spec_ids, "skipped", error="Cancelled by user", stats=stats.finalize())
+    except TimeoutError as exc:
+        log.error("feature_swarm_timeout_exit", feature=feature_name, error=str(exc))
+        _emit_agent_stats(stats, run_id=run_id)
+        return make_feature_result(feature_name, spec_ids, "timeout", error=str(exc), stats=stats.finalize())
     except Exception as exc:
         log.error("feature_swarm_failed", feature=feature_name, error=str(exc))
         stats.worker_crashed = True
         _emit_agent_stats(stats, run_id=run_id)
-        return FeatureResult(
-            feature=feature_name,
-            spec_ids=spec_ids,
-            status="error",
-            artifacts=[],
-            tests=[],
-            error=str(exc),
-            eval_scores={},
-            stats=stats.finalize(),
-        )
+        return make_feature_result(feature_name, spec_ids, "error", error=str(exc), stats=stats.finalize())
     finally:
         # L16 fix: clear thread-local state so a reused worker thread
         # doesn't carry stale feature/recall context into the next swarm.

@@ -312,6 +312,277 @@ CREATE TABLE IF NOT EXISTS background_loop_samples (
 
 CREATE INDEX IF NOT EXISTS idx_background_loop_samples_timestamp ON background_loop_samples (timestamp DESC);
 
+-- ════════════════════════════════════════════════════════════════════════
+-- Refinery v2 (adversarial debate) — forensic tables
+-- ════════════════════════════════════════════════════════════════════════
+-- All tables FK back to ``pipeline_runs`` via ``source_run_id`` where
+-- applicable, with ON DELETE SET NULL so deleting a pipeline run does not
+-- wipe refinery history. Rows land here in addition to the existing
+-- ``llm_calls`` table (dual-write: ``refinery_llm_calls`` carries role +
+-- requirement_id + round_number + tool_calls that ``llm_calls`` does not).
+
+-- One row per refinery invocation.
+CREATE TABLE IF NOT EXISTS refinery_runs (
+    refinery_run_id        TEXT PRIMARY KEY,
+    source_mode            TEXT NOT NULL,
+    source_run_id          TEXT REFERENCES pipeline_runs(run_id) ON DELETE SET NULL,
+    requirements_count     INTEGER NOT NULL DEFAULT 0,
+    converged_count        INTEGER NOT NULL DEFAULT 0,
+    short_circuited_count  INTEGER NOT NULL DEFAULT 0,
+    aborted_count          INTEGER NOT NULL DEFAULT 0,
+    started_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ended_at               TIMESTAMPTZ,
+    duration_seconds       DOUBLE PRECISION,
+    total_cost_usd         DOUBLE PRECISION NOT NULL DEFAULT 0,
+    total_tokens_in        BIGINT NOT NULL DEFAULT 0,
+    total_tokens_out       BIGINT NOT NULL DEFAULT 0,
+    settings_snapshot      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    applied_to_graph       BOOLEAN NOT NULL DEFAULT FALSE,
+    applied_at             TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_refinery_runs_started_at ON refinery_runs (started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_refinery_runs_source_run ON refinery_runs (source_run_id);
+CREATE INDEX IF NOT EXISTS idx_refinery_runs_source_mode ON refinery_runs (source_mode);
+
+-- ── Resume support (V1 — requirement-level) ────────────────────────────────
+-- ``status`` tracks the run's lifecycle so the resume endpoint can find
+-- runs that didn't complete cleanly. ``input_snapshot`` captures the
+-- original input payload (run_id / input_path / direct + the gathered
+-- requirements list) so a resumed run can skip Phase 1. Both columns
+-- are added idempotently so existing deployments migrate in place.
+
+ALTER TABLE refinery_runs
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'in_progress';
+
+ALTER TABLE refinery_runs
+    ADD COLUMN IF NOT EXISTS input_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_refinery_runs_status ON refinery_runs (status);
+
+-- One row per per-requirement debate.
+CREATE TABLE IF NOT EXISTS refinery_debates (
+    id                     BIGSERIAL PRIMARY KEY,
+    refinery_run_id        TEXT NOT NULL REFERENCES refinery_runs(refinery_run_id) ON DELETE CASCADE,
+    requirement_id         TEXT NOT NULL,
+    convergence_status     TEXT NOT NULL,
+    final_overall_score    DOUBLE PRECISION,
+    final_dimension_scores JSONB NOT NULL DEFAULT '{}'::jsonb,
+    rounds_executed        INTEGER NOT NULL DEFAULT 0,
+    escalation_level       INTEGER NOT NULL DEFAULT 0,
+    research_calls_used    INTEGER NOT NULL DEFAULT 0,
+    disagreement_score_max DOUBLE PRECISION,
+    duration_seconds       DOUBLE PRECISION,
+    cost_usd               DOUBLE PRECISION NOT NULL DEFAULT 0,
+    termination_reason     TEXT,
+    reconcile_invoked      BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_refinery_debates_run ON refinery_debates (refinery_run_id);
+CREATE INDEX IF NOT EXISTS idx_refinery_debates_status ON refinery_debates (convergence_status);
+CREATE INDEX IF NOT EXISTS idx_refinery_debates_req ON refinery_debates (requirement_id);
+
+-- Archetype columns feed the adaptive max_rounds loop. Bucketed by
+-- (priority, source_mode-from-runs, primary_tag) so per-archetype
+-- convergence behaviour can be aggregated without re-parsing payloads.
+ALTER TABLE refinery_debates
+    ADD COLUMN IF NOT EXISTS priority TEXT;
+ALTER TABLE refinery_debates
+    ADD COLUMN IF NOT EXISTS tags JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_refinery_debates_priority
+    ON refinery_debates (priority);
+
+-- ── Per-debate output cache (resume V1) ──────────────────────────────────
+-- A separate table from the forensic ``refinery_debates`` (which can have
+-- multiple rows per (run, req) for retried debates) — this one is the
+-- canonical "this debate is done, here's its output" cache. Resumed runs
+-- look up by (refinery_run_id, requirement_id) and replay completed
+-- debates without re-invoking the panel.
+CREATE TABLE IF NOT EXISTS refinery_debate_completions (
+    refinery_run_id        TEXT NOT NULL REFERENCES refinery_runs(refinery_run_id) ON DELETE CASCADE,
+    requirement_id         TEXT NOT NULL,
+    convergence_status     TEXT NOT NULL,
+    refined_payload        JSONB NOT NULL,
+    suggested_memories     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    completed_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (refinery_run_id, requirement_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_refinery_debate_completions_run
+    ON refinery_debate_completions (refinery_run_id);
+
+-- One row per round of a debate.
+CREATE TABLE IF NOT EXISTS refinery_debate_rounds (
+    id                    BIGSERIAL PRIMARY KEY,
+    debate_id             BIGINT NOT NULL REFERENCES refinery_debates(id) ON DELETE CASCADE,
+    round_number          INTEGER NOT NULL,
+    critic_count          INTEGER NOT NULL DEFAULT 0,
+    critic_blockers_count INTEGER NOT NULL DEFAULT 0,
+    critic_warnings_count INTEGER NOT NULL DEFAULT 0,
+    rule_violations_count INTEGER NOT NULL DEFAULT 0,
+    rule_warnings_count   INTEGER NOT NULL DEFAULT 0,
+    judge_overall         DOUBLE PRECISION,
+    judge_dimensions      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    disagreement_score    DOUBLE PRECISION,
+    router_decision       TEXT NOT NULL,
+    duration_seconds      DOUBLE PRECISION,
+    UNIQUE (debate_id, round_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_refinery_rounds_debate ON refinery_debate_rounds (debate_id);
+
+-- Extends llm_calls with refinery-specific columns. Dual-write contract:
+-- every refinery LLM call also lands in ``llm_calls`` with
+-- ``phase = 'refinery.{role}.{kind}'`` so existing cost dashboards auto-
+-- include refinery without modification.
+CREATE TABLE IF NOT EXISTS refinery_llm_calls (
+    id                BIGSERIAL PRIMARY KEY,
+    refinery_run_id   TEXT NOT NULL REFERENCES refinery_runs(refinery_run_id) ON DELETE CASCADE,
+    requirement_id    TEXT,
+    round_number      INTEGER,
+    role              TEXT NOT NULL,
+    kind              TEXT NOT NULL,
+    model             TEXT NOT NULL,
+    reasoning_effort  TEXT,
+    tokens_in         INTEGER,
+    tokens_out        INTEGER,
+    cache_read_tokens INTEGER,
+    latency_ms        INTEGER,
+    cost_usd          DOUBLE PRECISION,
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    error             TEXT,
+    tool_calls        JSONB NOT NULL DEFAULT '[]'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_refinery_llm_run ON refinery_llm_calls (refinery_run_id);
+CREATE INDEX IF NOT EXISTS idx_refinery_llm_role ON refinery_llm_calls (role);
+CREATE INDEX IF NOT EXISTS idx_refinery_llm_model ON refinery_llm_calls (model);
+
+-- One row per rule violation.
+CREATE TABLE IF NOT EXISTS refinery_rule_violations (
+    id                   BIGSERIAL PRIMARY KEY,
+    debate_id            BIGINT NOT NULL REFERENCES refinery_debates(id) ON DELETE CASCADE,
+    round_number         INTEGER NOT NULL,
+    rule_id              TEXT NOT NULL,
+    severity             TEXT NOT NULL,
+    dimension            TEXT NOT NULL,
+    finding              TEXT NOT NULL,
+    suggested_fix        TEXT,
+    injected_as_critique BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_refinery_rule_viol_rule ON refinery_rule_violations (rule_id);
+CREATE INDEX IF NOT EXISTS idx_refinery_rule_viol_dim ON refinery_rule_violations (dimension);
+
+-- Research provenance: one row per Source returned by a research call.
+CREATE TABLE IF NOT EXISTS refinery_research_sources (
+    id                 BIGSERIAL PRIMARY KEY,
+    debate_id          BIGINT NOT NULL REFERENCES refinery_debates(id) ON DELETE CASCADE,
+    round_number       INTEGER NOT NULL,
+    tier               SMALLINT NOT NULL,
+    provider           TEXT NOT NULL,
+    url                TEXT,
+    title              TEXT,
+    fetched_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    propagated         BOOLEAN NOT NULL,
+    insight_confidence DOUBLE PRECISION
+);
+
+CREATE INDEX IF NOT EXISTS idx_refinery_research_tier ON refinery_research_sources (tier);
+
+-- ``compute_provider_stats`` aggregates over a time window
+-- (``WHERE fetched_at >= NOW() - interval``) — backstop the scan
+-- with an index so frequent operator dashboard hits don't degrade
+-- as ``refinery_research_sources`` grows.
+CREATE INDEX IF NOT EXISTS idx_refinery_research_fetched_at
+    ON refinery_research_sources (fetched_at DESC);
+
+-- Memory lifecycle — refinery-specific audit row per suggested memory.
+CREATE TABLE IF NOT EXISTS refinery_memory_audits (
+    id                          BIGSERIAL PRIMARY KEY,
+    debate_id                   BIGINT REFERENCES refinery_debates(id) ON DELETE SET NULL,
+    refinery_run_id             TEXT NOT NULL REFERENCES refinery_runs(refinery_run_id) ON DELETE CASCADE,
+    suggested_memory_id         TEXT NOT NULL,
+    kind                        TEXT NOT NULL,
+    source_role                 TEXT NOT NULL,
+    validation_status           TEXT NOT NULL,
+    outcome                     TEXT NOT NULL,
+    existing_memory_id          TEXT,
+    similarity                  DOUBLE PRECISION,
+    provenance_source_tier_mix  SMALLINT[] NOT NULL DEFAULT ARRAY[]::SMALLINT[],
+    provenance_confidence       DOUBLE PRECISION,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    user_decision_at            TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_refinery_mem_run ON refinery_memory_audits (refinery_run_id);
+CREATE INDEX IF NOT EXISTS idx_refinery_mem_kind ON refinery_memory_audits (kind);
+CREATE INDEX IF NOT EXISTS idx_refinery_mem_outcome ON refinery_memory_audits (outcome);
+
+
+-- ── Active-learning: user feedback on suggested memories ─────────────────
+-- One row per operator decision (save / dismiss / edit). Cross-run
+-- aggregation feeds the role-weighting module and re-ranks future
+-- retrieval (boost on save, demote on dismiss).
+CREATE TABLE IF NOT EXISTS refinery_memory_feedback (
+    id                  BIGSERIAL PRIMARY KEY,
+    refinery_run_id     TEXT REFERENCES refinery_runs(refinery_run_id) ON DELETE SET NULL,
+    memory_id           TEXT NOT NULL,
+    memory_kind         TEXT NOT NULL,
+    source_role         TEXT,
+    decision            TEXT NOT NULL,           -- accepted | dismissed | edited
+    reason              TEXT,
+    decided_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_refinery_mem_fb_memory ON refinery_memory_feedback (memory_id);
+CREATE INDEX IF NOT EXISTS idx_refinery_mem_fb_role ON refinery_memory_feedback (source_role);
+CREATE INDEX IF NOT EXISTS idx_refinery_mem_fb_decided ON refinery_memory_feedback (decided_at DESC);
+
+
+-- ── Adaptive role weighting: critique dispositions ───────────────────────
+-- One row per (round, critique) showing how the Judge disposed of it
+-- in its rebuttal — accepted vs. rejected vs. deferred. The aggregator
+-- computes per-role acceptance rates and converts them into bounded
+-- multipliers applied at synthesis time.
+CREATE TABLE IF NOT EXISTS refinery_critique_dispositions (
+    id                BIGSERIAL PRIMARY KEY,
+    refinery_run_id   TEXT NOT NULL REFERENCES refinery_runs(refinery_run_id) ON DELETE CASCADE,
+    requirement_id    TEXT NOT NULL,
+    round_number      INTEGER NOT NULL,
+    role              TEXT NOT NULL,
+    severity          TEXT NOT NULL,             -- info | warning | blocker
+    dimension         TEXT,
+    action            TEXT NOT NULL,             -- accepted | rejected | deferred
+    recorded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_refinery_crit_disp_role ON refinery_critique_dispositions (role);
+CREATE INDEX IF NOT EXISTS idx_refinery_crit_disp_recorded ON refinery_critique_dispositions (recorded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_refinery_crit_disp_run ON refinery_critique_dispositions (refinery_run_id);
+
+
+-- ── Judge confidence calibration: per-requirement operator decisions ─────
+-- One row per operator decision (apply / dismiss / edit) on a refined
+-- requirement. Joined against ``refinery_debates.final_overall_score``
+-- by the calibration aggregator: high score + frequent dismiss →
+-- Judge overconfident; low score + frequent apply → underconfident.
+CREATE TABLE IF NOT EXISTS refinery_requirement_decisions (
+    id                  BIGSERIAL PRIMARY KEY,
+    refinery_run_id     TEXT NOT NULL REFERENCES refinery_runs(refinery_run_id) ON DELETE CASCADE,
+    requirement_id      TEXT NOT NULL,
+    decision            TEXT NOT NULL,             -- accepted | dismissed | edited
+    judge_overall_score DOUBLE PRECISION,
+    convergence_status  TEXT,
+    decided_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_refinery_req_dec_run ON refinery_requirement_decisions (refinery_run_id);
+CREATE INDEX IF NOT EXISTS idx_refinery_req_dec_decided ON refinery_requirement_decisions (decided_at DESC);
+CREATE INDEX IF NOT EXISTS idx_refinery_req_dec_decision ON refinery_requirement_decisions (decision);
+
+
 -- ── Views / rollups ──────────────────────────────────────────────────────
 
 CREATE OR REPLACE VIEW v_cost_per_run AS

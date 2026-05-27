@@ -22,6 +22,8 @@ from typing import Any, NamedTuple
 
 import structlog
 
+from dark_factory.log import trace_methods
+
 log = structlog.get_logger()
 
 
@@ -38,6 +40,7 @@ class _Subscriber(NamedTuple):
     created_at: float
 
 
+@trace_methods
 class ProgressBroker:
     """Fan-out broker for swarm progress events.
 
@@ -173,6 +176,19 @@ class ProgressBroker:
         log.debug("broker_unsubscribed", subscribers=len(self._subscribers))
 
     # ── Maintenance ──────────────────────────────────────────────────────────
+
+    def get_history(self, *, feature: str | None = None) -> list[dict[str, Any]]:
+        """Return a snapshot of the history buffer as a plain list.
+
+        If *feature* is given, only events whose ``feature`` field matches
+        are returned.  This is safe to call from any thread (no event-loop
+        required).
+        """
+        with self._lock:
+            events = list(self._history)
+        if feature is not None:
+            events = [e for e in events if e.get("feature") == feature]
+        return events
 
     def clear_history(self) -> None:
         """Drop all events from the history ring buffer.

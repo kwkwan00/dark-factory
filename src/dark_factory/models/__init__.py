@@ -5,7 +5,6 @@ from dark_factory.models.domain import (
     PipelineContext,
     Requirement,
     Spec,
-    TestCase,
 )
 
-__all__ = ["CodeArtifact", "PipelineContext", "Requirement", "Spec", "TestCase"]
+__all__ = ["CodeArtifact", "PipelineContext", "Requirement", "Spec"]

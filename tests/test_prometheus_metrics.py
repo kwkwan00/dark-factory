@@ -141,24 +141,24 @@ def test_observe_agent_activation():
 
 
 def test_observe_memory_op():
-    """observe_memory_op increments memory_ops_total."""
-    baseline = _counter_value(prom.memory_ops_total, operation="create", memory_type="pattern")
+    """observe_memory_op delegates create to memory_writes_total."""
+    baseline = _counter_value(prom.memory_writes_total, type="pattern", outcome="created")
     prom.observe_memory_op(operation="create", memory_type="pattern")
-    assert _counter_value(prom.memory_ops_total, operation="create", memory_type="pattern") - baseline == 1.0
+    assert _counter_value(prom.memory_writes_total, type="pattern", outcome="created") - baseline == 1.0
 
 
 def test_observe_memory_op_recall_hit():
     """observe_memory_op with operation=recall and count>0 records a hit."""
-    baseline = _counter_value(prom.memory_recall_total, outcome="hit")
+    baseline = _counter_value(prom.memory_recalls_total, type="pattern", hit="yes")
     prom.observe_memory_op(operation="recall", memory_type="pattern", count=3, latency_seconds=0.05)
-    assert _counter_value(prom.memory_recall_total, outcome="hit") - baseline == 1.0
+    assert _counter_value(prom.memory_recalls_total, type="pattern", hit="yes") - baseline == 1.0
 
 
 def test_observe_memory_op_recall_miss():
     """observe_memory_op with operation=recall and count=0 records a miss."""
-    baseline = _counter_value(prom.memory_recall_total, outcome="miss")
+    baseline = _counter_value(prom.memory_recalls_total, type="pattern", hit="no")
     prom.observe_memory_op(operation="recall", memory_type="pattern", count=0)
-    assert _counter_value(prom.memory_recall_total, outcome="miss") - baseline == 1.0
+    assert _counter_value(prom.memory_recalls_total, type="pattern", hit="no") - baseline == 1.0
 
 
 def test_observe_spec_plan_success():

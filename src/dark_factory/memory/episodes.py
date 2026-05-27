@@ -56,6 +56,7 @@ import structlog
 from pydantic import BaseModel, Field
 
 from dark_factory.agents.cancellation import PipelineCancelled
+from dark_factory.log import trace_methods
 
 if TYPE_CHECKING:
     from dark_factory.llm.base import LLMClient
@@ -132,6 +133,11 @@ class Episode(BaseModel):
     """Map of tool_name → call count, capped to the top 10 most-used
     tools so the Qdrant payload stays bounded."""
 
+    recalled_memory_ids: list[str] = Field(default_factory=list)
+    """IDs of semantic memories and prior episodes that were recalled
+    during this feature's swarm execution. Links the episode back to
+    the procedural knowledge that influenced the outcome."""
+
     started_at: datetime
     ended_at: datetime
 
@@ -139,19 +145,26 @@ class Episode(BaseModel):
         """Build the text we actually embed for semantic retrieval.
 
         Includes the feature name + outcome + summary + a compact
-        key-event list. Embedding just the summary alone loses the
-        structural cues (outcome, feature name) that make hybrid
+        key-event list + recalled memory IDs. Embedding just the
+        summary alone loses the structural cues (outcome, feature
+        name, which memories influenced the run) that make hybrid
         recall work well, so we concatenate.
         """
         key_events_text = " · ".join(
-            f"{ke.agent}:{ke.event}" for ke in self.key_events[:6]
+            f"{ke.agent}:{ke.event}" for ke in self.key_events[:15]
         )
-        return (
+        # Include recalled memory IDs so vector search can discover
+        # "which episodes used pattern-abc?" via semantic similarity.
+        recalled_text = " ".join(self.recalled_memory_ids[:20]) if self.recalled_memory_ids else ""
+        parts = [
             f"feature={self.feature} outcome={self.outcome} "
-            f"turns={self.turns_used} duration={self.duration_seconds:.0f}s\n"
-            f"{self.summary}\n"
-            f"key_events: {key_events_text}"
-        )
+            f"turns={self.turns_used} duration={self.duration_seconds:.0f}s",
+            self.summary,
+            f"key_events: {key_events_text}",
+        ]
+        if recalled_text:
+            parts.append(f"recalled_memories: {recalled_text}")
+        return "\n".join(parts)
 
 
 # ── LLM summariser ──────────────────────────────────────────────────────────
@@ -162,18 +175,18 @@ class _EpisodeSynthesis(BaseModel):
 
     summary: str = Field(
         description=(
-            "200-word prose narrative of what happened during this "
+            "Up to 300-word prose narrative of what happened during this "
             "feature execution. Focus on the trajectory of decisions: "
             "what strategy was chosen, what blocked progress, how it "
             "was resolved, what the final outcome was. Do NOT repeat "
             "the raw event list — synthesise it into a story a "
-            "future Planner can skim in 10 seconds."
+            "future Planner can skim in 15 seconds."
         )
     )
     key_events: list[EpisodeKeyEvent] = Field(
         default_factory=list,
         description=(
-            "3-8 turning-point events in order. Skip routine handoffs "
+            "3-15 turning-point events in order. Skip routine handoffs "
             "and routine tool calls; include only the events a future "
             "Planner would care about (strategy picks, rejections, "
             "pivots, test passes/failures)."
@@ -198,6 +211,7 @@ def _build_synthesis_prompt(
     tool_calls_summary: dict[str, int],
     progress_events: list[dict[str, Any]],
     error: str | None = None,
+    recalled_memory_ids: list[str] | None = None,
 ) -> str:
     # Cap the progress event list so a pathologically long run can't
     # blow up the prompt. The summariser only needs the salient slice;
@@ -221,6 +235,9 @@ def _build_synthesis_prompt(
 
     error_block = f"\n\nError: {error}" if error else ""
 
+    recalled_ids = recalled_memory_ids or []
+    memories_text = ", ".join(recalled_ids[:20]) if recalled_ids else "(none)"
+
     return f"""\
 Feature: {feature}
 Outcome: {outcome}
@@ -229,12 +246,15 @@ Duration: {duration_seconds:.1f}s
 Specs attempted: {', '.join(spec_ids) or '(none)'}
 Agents visited: {', '.join(agents_visited) or '(none)'}
 Tool calls (top 10): {tools_text}
-Final eval scores: {scores_text}{error_block}
+Final eval scores: {scores_text}
+Recalled memories ({len(recalled_ids)}): {memories_text}{error_block}
 
 Progress events (latest {len(capped)} of {len(progress_events)}):
 {events_text or '  (no progress events captured)'}
 
-Write the summary and key_events now."""
+Write the summary and key_events now. If specific recalled memories
+(patterns, strategies, or past episodes) contributed to the outcome,
+name them by ID in the summary so future Planners know what worked."""
 
 
 def _fallback_summary(
@@ -275,6 +295,7 @@ def synthesize_episode(
     progress_events: list[dict[str, Any]],
     llm: "LLMClient | None",
     error: str | None = None,
+    recalled_memory_ids: list[str] | None = None,
 ) -> Episode:
     """Assemble an Episode from a completed feature's in-memory state.
 
@@ -285,6 +306,8 @@ def synthesize_episode(
     """
     key_events: list[EpisodeKeyEvent] = []
     summary = ""
+
+    resolved_recalled = recalled_memory_ids or []
 
     if llm is not None:
         prompt = _build_synthesis_prompt(
@@ -298,6 +321,7 @@ def synthesize_episode(
             tool_calls_summary=tool_calls_summary,
             progress_events=progress_events,
             error=error,
+            recalled_memory_ids=resolved_recalled,
         )
         try:
             synthesis = llm.complete_structured(
@@ -383,6 +407,7 @@ def synthesize_episode(
         final_eval_scores=final_eval_scores,
         agents_visited=agents_visited,
         tool_calls_summary=capped_tools,
+        recalled_memory_ids=resolved_recalled,
         started_at=started_at,
         ended_at=ended_at,
     )
@@ -391,6 +416,7 @@ def synthesize_episode(
 # ── Writer ──────────────────────────────────────────────────────────────────
 
 
+@trace_methods
 class EpisodeWriter:
     """Persist episodes to Neo4j + Qdrant, best-effort.
 
@@ -452,6 +478,9 @@ class EpisodeWriter:
                     vector=vector,
                     turns_used=episode.turns_used,
                     duration_seconds=episode.duration_seconds,
+                    spec_ids=episode.spec_ids,
+                    final_eval_scores=episode.final_eval_scores,
+                    recalled_memory_ids=episode.recalled_memory_ids,
                 )
             except Exception as exc:
                 log.warning(
@@ -474,6 +503,7 @@ def episode_from_feature_result(
     started_at: datetime | None,
     progress_events: list[dict[str, Any]],
     llm: "LLMClient | None",
+    recalled_memory_ids: list[str] | None = None,
 ) -> Episode:
     """Shorthand: build an Episode from the orchestrator's
     ``FeatureResult`` shape.
@@ -490,7 +520,16 @@ def episode_from_feature_result(
     stats = feature_result.get("stats") or {}
     turns_used = int(stats.get("agent_transitions", 0) or 0)
     duration = float(stats.get("duration_seconds", 0.0) or 0.0)
-    agents_visited = list(stats.get("unique_agents_visited") or [])
+    raw_agents = stats.get("unique_agents_visited")
+    if isinstance(raw_agents, (list, tuple, set)):
+        agents_visited = list(raw_agents)
+    else:
+        # Swarm stats store the count (int), not the list of names.
+        # Reconstruct agent names from the per-role call counts.
+        agents_visited = [
+            role for role in ("planner", "coder", "reviewer", "tester")
+            if stats.get(f"{role}_calls", 0) > 0
+        ]
     tool_calls = _extract_tool_call_counts(stats)
 
     final_scores = _flatten_eval_scores(feature_result.get("eval_scores") or {})
@@ -517,6 +556,7 @@ def episode_from_feature_result(
         progress_events=progress_events,
         llm=llm,
         error=feature_result.get("error"),
+        recalled_memory_ids=recalled_memory_ids or [],
     )
 
 

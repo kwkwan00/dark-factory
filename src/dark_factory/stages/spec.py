@@ -35,6 +35,7 @@ import structlog
 from pydantic import BaseModel, Field
 
 from dark_factory.llm.base import LLMClient
+from dark_factory.log import trace_methods
 from dark_factory.models.domain import PipelineContext, Requirement, Spec
 from dark_factory.stages.base import Stage
 
@@ -88,6 +89,7 @@ class _SpecPlan(BaseModel):
     specs: list[_PlannedSpec] = Field(default_factory=list)
 
 
+@trace_methods
 class SpecStage(Stage):
     name = "spec"
 
@@ -140,6 +142,60 @@ class SpecStage(Stage):
         if not requirements:
             context.specs = []
             return context
+
+        # ── Early-exit preflight ──────────────────────────────────────────────
+        # Before spending LLM budget on the planner, do a quick Neo4j
+        # check: can we load existing specs for ALL requirements?  When
+        # the pipeline is re-run on unchanged inputs this avoids the
+        # decomposition LLM calls entirely.
+        if (
+            self.reuse_existing_specs
+            and self.graph_repo is not None
+        ):
+            try:
+                # Query specs linked to these requirements via IMPLEMENTS
+                from dark_factory.graph.repository import GraphRepository
+
+                all_req_ids = [r.id for r in requirements]
+                loaded = self._try_load_all_specs_for_requirements(all_req_ids)
+                if loaded is not None:
+                    log.info(
+                        "spec_preflight_full_reuse",
+                        requirements=len(requirements),
+                        specs=len(loaded),
+                    )
+                    emit_progress(
+                        "spec_gen_layer_started",
+                        total=len(requirements),
+                        parallel=0,
+                        max_handoffs=self.max_handoffs,
+                        eval_threshold=self.eval_threshold,
+                        decomposition_enabled=self.enable_decomposition,
+                        planned_sub_specs=len(loaded),
+                        reused_from_graph=len(loaded),
+                        pending=0,
+                    )
+                    for i, spec in enumerate(loaded):
+                        emit_progress(
+                            "spec_gen_skipped",
+                            requirement_id=spec.requirement_ids[0] if spec.requirement_ids else "",
+                            target_spec_id=spec.id,
+                            reason="spec_already_exists",
+                            index=i,
+                            total=len(loaded),
+                        )
+                    emit_progress(
+                        "spec_gen_layer_completed",
+                        total=len(loaded),
+                        failed=0,
+                    )
+                    log.info("spec_complete", count=len(loaded), failed=0, reused=len(loaded))
+                    context.specs = loaded
+                    self._reused_count = len(loaded)
+                    return context
+            except Exception as exc:
+                log.debug("spec_early_preflight_failed", error=str(exc))
+                # Fall through to the normal path
 
         # ── Phase A: planning ────────────────────────────────────────────────
         # When decomposition is on, each requirement is first split into
@@ -304,9 +360,49 @@ class SpecStage(Stage):
         if failures and not completed:
             raise failures[0][1]
 
-        log.info("spec_complete", count=len(completed), failed=len(failures))
+        log.info("spec_complete", count=len(completed), failed=len(failures), reused=len(reused_indices))
         context.specs = completed
+        self._reused_count = len(reused_indices)
         return context
+
+    def _try_load_all_specs_for_requirements(
+        self, requirement_ids: list[str],
+    ) -> list[Spec] | None:
+        """Attempt to load all existing specs for the given requirements.
+
+        Returns the full list of Spec objects if EVERY requirement has
+        at least one spec in Neo4j.  Returns ``None`` if any requirement
+        is uncovered or the query fails — caller falls through to the
+        normal plan + refine path.
+        """
+        if not self.graph_repo:
+            return None
+
+        with self.graph_repo.client.session() as session:
+            result = session.run(
+                """
+                UNWIND $req_ids AS rid
+                OPTIONAL MATCH (s:Spec)-[:IMPLEMENTS]->(r:Requirement {id: rid})
+                RETURN rid, collect(s.id) AS spec_ids
+                """,
+                req_ids=requirement_ids,
+            )
+            all_spec_ids: list[str] = []
+            for record in result:
+                sids = record["spec_ids"]
+                if not sids or all(s is None for s in sids):
+                    # This requirement has no specs — can't do full reuse
+                    return None
+                all_spec_ids.extend(s for s in sids if s)
+
+        if not all_spec_ids:
+            return None
+
+        specs = self.graph_repo.get_specs(all_spec_ids)
+        if not specs:
+            return None
+
+        return specs
 
     # ── Planning phase ───────────────────────────────────────────────────────
 
@@ -807,7 +903,11 @@ class SpecStage(Stage):
         # ── Vector index the BEST spec only ──
         if best_spec is not None and self.vector_repo:
             try:
-                self.vector_repo.upsert_spec(spec=best_spec)
+                self.vector_repo.upsert_spec(
+                    spec=best_spec,
+                    eval_score=best_score,
+                    attempts=attempt,
+                )
             except Exception as exc:
                 log.warning(
                     "vector_spec_index_failed",

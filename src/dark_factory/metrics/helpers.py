@@ -239,3 +239,60 @@ def record_background_loop_sample(**fields: Any) -> None:
         rec.record_background_loop_sample(**fields)
     except Exception:
         pass
+
+
+# ── Ingest ────────────────────────────────────────────────────────────────
+
+
+def record_ingest(**fields: Any) -> None:
+    try:
+        from dark_factory.metrics.prometheus import observe_ingest
+
+        observe_ingest(**fields)
+    except Exception:
+        pass
+
+
+# ── Spec reconciliation ──────────────────────────────────────────────────
+
+
+def record_spec_reconciliation(**fields: Any) -> None:
+    try:
+        from dark_factory.metrics.prometheus import observe_spec_reconciliation
+
+        observe_spec_reconciliation(**fields)
+    except Exception:
+        pass
+
+
+# ── Graph write ──────────────────────────────────────────────────────────
+
+
+def record_graph_write(**fields: Any) -> None:
+    try:
+        from dark_factory.metrics.prometheus import observe_graph_write
+
+        observe_graph_write(**fields)
+    except Exception:
+        pass
+
+
+# ── Storage sync ─────────────────────────────────────────────────────────
+
+
+def record_storage_sync(*, area: str, files_count: int = 0) -> None:
+    try:
+        from dark_factory.metrics.prometheus import observe_storage_sync
+
+        observe_storage_sync(area=area, files_count=files_count)
+    except Exception:
+        pass
+
+
+def record_s3_replication_failure(*, operation: str) -> None:
+    try:
+        from dark_factory.metrics.prometheus import observe_s3_replication_failure
+
+        observe_s3_replication_failure(operation=operation)
+    except Exception:
+        pass

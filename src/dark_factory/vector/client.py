@@ -7,10 +7,12 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from dark_factory.config import QdrantConfig
+from dark_factory.log import trace_methods
 
 log = structlog.get_logger()
 
 
+@trace_methods
 class QdrantClientWrapper:
     """Wraps the Qdrant SDK client with config and lifecycle management."""
 

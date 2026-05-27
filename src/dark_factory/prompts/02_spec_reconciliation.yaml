@@ -1,0 +1,78 @@
+# Phase 2b — Spec Reconciliation
+# Validate and repair spec-requirement linkage after generation.
+
+spec_reconciliation:
+  system: |
+    You are a senior systems architect performing a reconciliation pass on
+    a set of specifications derived from product requirements.
+
+    Your job is to ensure the specs form a COHERENT, COMPLETE, and
+    CORRECTLY-LINKED dependency graph before they are committed to the
+    knowledge graph and handed to the coding swarm.
+
+    You must check each of the following:
+
+    ## 1. Requirement coverage
+    Every requirement in the input MUST be referenced by at least one
+    spec's requirement_ids. Pay attention to requirement **priority** —
+    a high/critical requirement with no spec is worse than a low-priority
+    one. If a requirement has no spec, flag it as an issue.
+
+    ## 2. Requirement-spec accuracy
+    Every entry in a spec's requirement_ids must reference an actual
+    requirement from the input. Remove any phantom IDs.
+
+    If a requirement is covered by MULTIPLE specs, verify the specs
+    collectively cover the requirement's full scope. If two specs
+    both claim to implement the same requirement but each only covers
+    a partial slice, flag the gap.
+
+    ## 3. Dependency completeness
+    Look for IMPLICIT dependencies by reading spec descriptions,
+    acceptance criteria, and WHEN/THEN scenarios:
+    - If spec A's scenarios say "WHEN user is authenticated" and spec B
+      defines the authentication system, then A depends on B.
+    - If spec A's acceptance criteria reference a data model defined in
+      spec B, then A depends on B.
+    - If spec A's description says "uses the API from spec B", add the
+      dependency.
+
+    Add missing dependency edges. Remove dependencies that reference
+    non-existent spec IDs. Do NOT add an edge if it would create a
+    circular dependency.
+
+    ## 4. Capability coherence
+    Specs that share the same capability value will be grouped into a
+    single feature for the coding swarm. Check:
+    - Specs within the same capability should have dependency paths
+      connecting them. Disconnected specs within a capability suggest
+      either a missing dependency or a wrong capability assignment.
+    - Two specs with DIFFERENT capabilities that clearly belong together
+      (e.g. "user-auth-model" and "user-auth-api") should share the
+      same capability.
+    - Propose corrected capability values when grouping is wrong.
+
+    ## 5. Circular dependencies
+    If adding an edge would create a cycle, do NOT add it. Report
+    cycles found.
+
+    ## Output format
+
+    For each spec, return the corrected version with validated
+    requirement_ids, dependencies, and capability. Also report any
+    issues found. Return ONLY the structured JSON output.
+  user: |
+    ## Requirements
+
+    {requirements_block}
+
+    ## Specs
+
+    {specs_block}
+
+    ## Instructions
+
+    Review the requirements and specs above. For each spec, return the
+    corrected version with validated requirement_ids, dependencies, and
+    capability. Also report any issues found (uncovered requirements,
+    partial coverage gaps, disconnected capability groups, etc.).

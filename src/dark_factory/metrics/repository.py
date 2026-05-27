@@ -9,10 +9,13 @@ queries return in <100ms on the expected data volume.
 
 from __future__ import annotations
 
+import datetime
 from typing import Any
 
 import structlog
 from psycopg.types.json import Json
+
+from dark_factory.log import trace_methods
 
 log = structlog.get_logger()
 
@@ -28,6 +31,7 @@ _SWARM_FEATURE_EVENTS = {
 }
 
 
+@trace_methods
 class MetricsRepository:
     """Read/write API over the metrics schema."""
 
@@ -1405,8 +1409,6 @@ def _as_float(value: Any) -> float | None:
 
 def _stringify_timestamps(row: dict[str, Any]) -> dict[str, Any]:
     """Convert datetime fields to ISO strings for JSON serialisation."""
-    import datetime
-
     out: dict[str, Any] = {}
     for k, v in row.items():
         if isinstance(v, datetime.datetime):

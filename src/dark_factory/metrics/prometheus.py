@@ -320,25 +320,14 @@ subprocess_spawns_total = Counter(
 
 
 # ── Memory metrics ──────────────────────────────────────────────────────────
-
-
-memory_ops_total = Counter(
-    "dark_factory_memory_ops_total",
-    "Procedural memory operations.",
-    ["operation", "memory_type"],  # operation = create|recall|boost|demote|decay
-)
-
-memory_recall_total = Counter(
-    "dark_factory_memory_recall_total",
-    "Memory recall calls split by outcome.",
-    ["outcome"],  # outcome = hit | miss
-)
-
-memory_recall_latency_seconds = Histogram(
-    "dark_factory_memory_recall_latency_seconds",
-    "Memory recall latency in seconds.",
-    buckets=_LATENCY_BUCKETS_TOOL,
-)
+#
+# Consolidated: the Tier A counters (memory_writes_total,
+# memory_recalls_total, memory_relevance_adjustments_total) in the
+# "Memory (procedural memory graph)" section above are the canonical
+# set. The former memory_ops_total / memory_recall_total /
+# memory_recall_latency_seconds collectors have been removed to
+# eliminate overlapping metrics. observe_memory_op now delegates to
+# the Tier A helpers.
 
 
 # ── Spec decomposition + eval metrics ──────────────────────────────────────
@@ -408,6 +397,99 @@ artifact_bytes_written = Histogram(
 )
 
 
+# ── Ingest metrics ─────────────────────────────────────────────────────────
+
+
+ingest_requirements_total = Counter(
+    "dark_factory_ingest_requirements_total",
+    "Requirements extracted during ingest.",
+)
+
+ingest_dedup_total = Counter(
+    "dark_factory_ingest_dedup_total",
+    "Ingest-phase dedup outcomes.",
+    ["outcome"],  # kept | removed
+)
+
+ingest_documents_total = Counter(
+    "dark_factory_ingest_documents_total",
+    "Documents processed during ingest.",
+)
+
+
+# ── Spec reconciliation metrics ───────────────────────────────────────────
+
+
+spec_recon_phantom_refs_removed_total = Counter(
+    "dark_factory_spec_recon_phantom_refs_removed_total",
+    "Phantom references removed during spec reconciliation.",
+    ["kind"],  # requirement | dependency
+)
+
+spec_recon_cycles_broken_total = Counter(
+    "dark_factory_spec_recon_cycles_broken_total",
+    "Circular dependency cycles broken during spec reconciliation.",
+)
+
+spec_recon_deps_added_total = Counter(
+    "dark_factory_spec_recon_deps_added_total",
+    "Missing dependency edges added by LLM during spec reconciliation.",
+)
+
+spec_recon_req_links_added_total = Counter(
+    "dark_factory_spec_recon_req_links_added_total",
+    "Requirement-spec links added by LLM during spec reconciliation.",
+)
+
+spec_recon_uncovered_requirements = Gauge(
+    "dark_factory_spec_recon_uncovered_requirements",
+    "Requirements with no implementing spec after reconciliation.",
+)
+
+spec_recon_capability_islands = Gauge(
+    "dark_factory_spec_recon_capability_islands",
+    "Disconnected capability groups detected during reconciliation.",
+)
+
+
+# ── Graph write metrics ───────────────────────────────────────────────────
+
+
+graph_nodes_written_total = Counter(
+    "dark_factory_graph_nodes_written_total",
+    "Neo4j nodes created or updated during graph stage.",
+    ["label"],  # Requirement | Spec
+)
+
+graph_edges_written_total = Counter(
+    "dark_factory_graph_edges_written_total",
+    "Neo4j edges created during graph stage.",
+    ["type"],  # IMPLEMENTS | DEPENDS_ON
+)
+
+graph_write_duration_seconds = Histogram(
+    "dark_factory_graph_write_duration_seconds",
+    "Duration of the graph write stage.",
+    buckets=[0.1, 0.5, 1, 2, 5, 10, 30, 60],
+)
+
+
+# ── Storage / S3 replication metrics ──────────────────────────────────────
+
+
+storage_sync_files_total = Counter(
+    "dark_factory_storage_sync_files_total",
+    "Files synced to durable storage.",
+    ["area"],  # input | requirements | specs | output
+)
+
+s3_replication_failures_total = Counter(
+    "dark_factory_s3_replication_failures_total",
+    "S3 replication operations that failed (best-effort).",
+    ["operation"],  # write_text | write_bytes | sync_local_to_storage | upload_from_local | delete
+)
+
+
 # ── System / infrastructure gauges ──────────────────────────────────────────
 
 
@@ -465,7 +547,6 @@ metrics_events_dropped_by_kind_total = Counter(
 worker_crashes_with_inflight_agents_total = Counter(
     "dark_factory_worker_crashes_with_inflight_agents_total",
     "Feature worker crashes where deep-agent calls were still in-flight.",
-    ["feature"],
 )
 
 # L5 fix: Postgres pool depth gauges. Sampled every 10s by the
@@ -932,15 +1013,20 @@ def observe_memory_op(
     latency_seconds: float | None = None,
     **_ignored: Any,
 ) -> None:
+    """Route legacy _metric_memory_op calls to the Tier A counters."""
     op_label = _label(operation)
     type_label = _label(memory_type, default="none")
-    memory_ops_total.labels(operation=op_label, memory_type=type_label).inc()
 
-    if op_label == "recall":
-        outcome = "hit" if (count or 0) > 0 else "miss"
-        memory_recall_total.labels(outcome=outcome).inc()
-        if latency_seconds is not None and latency_seconds >= 0:
-            memory_recall_latency_seconds.observe(latency_seconds)
+    if op_label == "create":
+        memory_writes_total.labels(type=type_label, outcome="created").inc()
+    elif op_label == "recall":
+        hit = (count or 0) > 0
+        memory_recalls_total.labels(type=type_label, hit="yes" if hit else "no").inc()
+    elif op_label in ("boost", "demote", "decay"):
+        adj_count = max(1, count or 1)
+        memory_relevance_adjustments_total.labels(
+            type=type_label, direction=op_label,
+        ).inc(adj_count)
 
 
 @_safe
@@ -1056,3 +1142,394 @@ def observe_postgres_pool(
     postgres_pool_idle.set(idle)
     postgres_pool_active.set(active)
     postgres_pool_waiting.set(waiting)
+
+
+# ── Phase 1: Ingest observers ────────────────────────────────────────────────
+
+
+@_safe
+def observe_ingest(
+    *,
+    requirements_count: int = 0,
+    documents_count: int = 0,
+    dedup_kept: int = 0,
+    dedup_removed: int = 0,
+) -> None:
+    """Record ingest-stage metrics."""
+    ingest_requirements_total.inc(requirements_count)
+    ingest_documents_total.inc(documents_count)
+    if dedup_kept:
+        ingest_dedup_total.labels(outcome="kept").inc(dedup_kept)
+    if dedup_removed:
+        ingest_dedup_total.labels(outcome="removed").inc(dedup_removed)
+
+
+# ── Phase 2b: Spec reconciliation observers ──────────────────────────────────
+
+
+@_safe
+def observe_spec_reconciliation(
+    *,
+    phantom_req_ids_removed: int = 0,
+    phantom_dep_ids_removed: int = 0,
+    cycles_broken: int = 0,
+    deps_added: int = 0,
+    req_ids_added: int = 0,
+    uncovered_requirements: int = 0,
+    capability_islands: int = 0,
+) -> None:
+    """Record spec reconciliation stage metrics."""
+    if phantom_req_ids_removed:
+        spec_recon_phantom_refs_removed_total.labels(kind="requirement").inc(phantom_req_ids_removed)
+    if phantom_dep_ids_removed:
+        spec_recon_phantom_refs_removed_total.labels(kind="dependency").inc(phantom_dep_ids_removed)
+    if cycles_broken:
+        spec_recon_cycles_broken_total.inc(cycles_broken)
+    if deps_added:
+        spec_recon_deps_added_total.inc(deps_added)
+    if req_ids_added:
+        spec_recon_req_links_added_total.inc(req_ids_added)
+    spec_recon_uncovered_requirements.set(uncovered_requirements)
+    spec_recon_capability_islands.set(capability_islands)
+
+
+# ── Phase 3: Graph write observers ──────────────────────────────────────────
+
+
+@_safe
+def observe_graph_write(
+    *,
+    requirements_written: int = 0,
+    specs_written: int = 0,
+    implements_edges: int = 0,
+    depends_on_edges: int = 0,
+    duration_seconds: float = 0.0,
+) -> None:
+    """Record knowledge graph write stage metrics."""
+    if requirements_written:
+        graph_nodes_written_total.labels(label="Requirement").inc(requirements_written)
+    if specs_written:
+        graph_nodes_written_total.labels(label="Spec").inc(specs_written)
+    if implements_edges:
+        graph_edges_written_total.labels(type="IMPLEMENTS").inc(implements_edges)
+    if depends_on_edges:
+        graph_edges_written_total.labels(type="DEPENDS_ON").inc(depends_on_edges)
+    if duration_seconds > 0:
+        graph_write_duration_seconds.observe(duration_seconds)
+
+
+# ── Storage / S3 replication observers ───────────────────────────────────────
+
+
+@_safe
+def observe_storage_sync(
+    *,
+    area: str,
+    files_count: int = 0,
+) -> None:
+    """Record durable storage sync metrics."""
+    if files_count:
+        storage_sync_files_total.labels(area=area).inc(files_count)
+
+
+@_safe
+def observe_s3_replication_failure(
+    *,
+    operation: str,
+) -> None:
+    """Record an S3 replication failure."""
+    s3_replication_failures_total.labels(operation=operation).inc()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Refinery v2 (adversarial debate) — Phase 3 observability catalog
+# ═══════════════════════════════════════════════════════════════════════════
+# See plan file's "Data-store layering" section for the full catalog. These
+# metrics are additive — they share only the ``dark_factory_*`` namespace
+# with the existing swarm metrics. Dashboards that use regex matchers like
+# ``dark_factory_.*_total`` need a sanity pass to confirm they're OK
+# aggregating refinery calls alongside swarm calls.
+
+
+# Debate structure & outcomes
+refinery_role_calls_total = Counter(
+    "dark_factory_refinery_role_calls_total",
+    "Refinery role-agent invocations, split by role.",
+    ["role"],
+)
+refinery_rounds_per_requirement = Histogram(
+    "dark_factory_refinery_rounds_per_requirement",
+    "Debate rounds per requirement before termination.",
+    buckets=(1, 2, 3, 4, 5, 6, 8, 10),
+)
+refinery_convergence_outcome_total = Counter(
+    "dark_factory_refinery_convergence_outcome_total",
+    "Debate terminal outcomes.",
+    ["outcome"],  # converged | short_circuited | aborted
+)
+refinery_escalations_total = Counter(
+    "dark_factory_refinery_escalations_total",
+    "Router escalations to stronger models / added rounds.",
+    ["reason"],   # variance | ignored_blockers | critic_judge_mismatch | judge_fail
+)
+refinery_disagreement_score = Histogram(
+    "dark_factory_refinery_disagreement_score",
+    "Per-round disagreement score.",
+    buckets=(0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0),
+)
+
+# Evaluation layer
+refinery_judge_scores = Histogram(
+    "dark_factory_refinery_judge_scores",
+    "Post-penalty judge dimension scores (what the gate uses).",
+    ["dimension"],
+    buckets=_EVAL_SCORE_BUCKETS,
+)
+refinery_judge_scores_raw_llm = Histogram(
+    "dark_factory_refinery_judge_scores_raw_llm",
+    "Pre-penalty LLM dimension scores (compare to post-penalty to see rule impact).",
+    ["dimension"],
+    buckets=_EVAL_SCORE_BUCKETS,
+)
+refinery_rule_violations_total = Counter(
+    "dark_factory_refinery_rule_violations_total",
+    "Rule violations recorded by the parallel rules gate.",
+    ["rule_id", "severity", "dimension"],
+)
+refinery_rule_penalties_applied_total = Counter(
+    "dark_factory_refinery_rule_penalties_applied_total",
+    "Phase-C rule→dimension penalties applied to LLM scores.",
+    ["dimension", "severity"],
+)
+refinery_rules_engine_failed_total = Counter(
+    "dark_factory_refinery_rules_engine_failed_total",
+    "Rules engine crashed with zero rules succeeding.",
+)
+refinery_eval_pipeline_short_circuits_total = Counter(
+    "dark_factory_refinery_eval_pipeline_short_circuits_total",
+    "Phase-B LLM judge call skipped due to catastrophic rule failure.",
+)
+refinery_fallback_judge_used_total = Counter(
+    "dark_factory_refinery_fallback_judge_used_total",
+    "Fallback judge kicked in because DeepEval raised.",
+)
+
+# Research agent
+refinery_research_calls_total = Counter(
+    "dark_factory_refinery_research_calls_total",
+    "Research agent invocations triggered by the Judge's missing_external_info flag.",
+)
+refinery_research_tier_calls_total = Counter(
+    "dark_factory_refinery_research_tier_calls_total",
+    "Research provider calls by tier.",
+    ["tier"],
+)
+refinery_research_internal_sufficient_total = Counter(
+    "dark_factory_refinery_research_internal_sufficient_total",
+    "Librarian short-circuits — T0/T1 was sufficient, external tiers skipped.",
+)
+refinery_research_tier_budget_exhausted_total = Counter(
+    "dark_factory_refinery_research_tier_budget_exhausted_total",
+    "Tier budget hit its cap and further calls raised TierBudgetExhausted.",
+    ["tier"],
+)
+refinery_research_validated_insights_total = Counter(
+    "dark_factory_refinery_research_validated_insights_total",
+    "Validated insights emitted by the Editor.",
+    ["kind"],  # pattern | risk | constraint | tradeoff | decision
+)
+refinery_research_t5_propagation_rejected_total = Counter(
+    "dark_factory_refinery_research_t5_propagation_rejected_total",
+    "Guardrail 1 fires: T5 cluster rejected for lack of corroborating tier.",
+)
+
+# Memory
+refinery_memory_suggested_total = Counter(
+    "dark_factory_refinery_memory_suggested_total",
+    "SuggestedMemory records emitted by roles during a debate.",
+    ["kind", "source_role"],
+)
+refinery_memory_audit_total = Counter(
+    "dark_factory_refinery_memory_audit_total",
+    "Memory lifecycle outcomes.",
+    ["outcome"],  # suggested | saved | dismissed | dedup_blocked
+)
+refinery_memory_write_back_atomic_failures_total = Counter(
+    "dark_factory_refinery_memory_write_back_atomic_failures_total",
+    "Atomic apply-memory write-back failed (Neo4j or Qdrant side).",
+)
+refinery_memory_dedup_blocked_total = Counter(
+    "dark_factory_refinery_memory_dedup_blocked_total",
+    "Dedup blocked a save because an existing memory matched.",
+    ["kind"],
+)
+
+# Cost
+refinery_cost_usd = Histogram(
+    "dark_factory_refinery_cost_usd",
+    "Per-call refinery LLM cost in USD, split by role.",
+    ["role"],
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0),
+)
+refinery_tokens_total = Counter(
+    "dark_factory_refinery_tokens_total",
+    "Refinery LLM token usage.",
+    ["role", "direction"],  # direction=in|out
+)
+
+# Observability integrity
+refinery_dual_write_failures_total = Counter(
+    "dark_factory_refinery_dual_write_failures_total",
+    "Dual-write to llm_calls + refinery_llm_calls failed.",
+    ["table"],
+)
+refinery_postgres_write_latency_seconds = Histogram(
+    "dark_factory_refinery_postgres_write_latency_seconds",
+    "Postgres write latency for refinery forensic tables.",
+    buckets=_LATENCY_BUCKETS_TOOL,
+)
+
+
+# ── Refinery observer helpers ────────────────────────────────────────────────
+
+
+@_safe
+def observe_refinery_role_call(*, role: str) -> None:
+    refinery_role_calls_total.labels(role=_label(role)).inc()
+
+
+@_safe
+def observe_refinery_rounds(*, rounds: int) -> None:
+    if rounds > 0:
+        refinery_rounds_per_requirement.observe(rounds)
+
+
+@_safe
+def observe_refinery_convergence(*, outcome: str) -> None:
+    refinery_convergence_outcome_total.labels(outcome=_label(outcome)).inc()
+
+
+@_safe
+def observe_refinery_escalation(*, reason: str) -> None:
+    refinery_escalations_total.labels(reason=_label(reason)).inc()
+
+
+@_safe
+def observe_refinery_disagreement(*, score: float) -> None:
+    refinery_disagreement_score.observe(max(0.0, score))
+
+
+@_safe
+def observe_refinery_judge_score(*, dimension: str, score: float, raw_llm: bool = False) -> None:
+    target = refinery_judge_scores_raw_llm if raw_llm else refinery_judge_scores
+    target.labels(dimension=_label(dimension)).observe(max(0.0, min(1.0, score)))
+
+
+@_safe
+def observe_refinery_rule_violation(*, rule_id: str, severity: str, dimension: str) -> None:
+    refinery_rule_violations_total.labels(
+        rule_id=_label(rule_id),
+        severity=_label(severity),
+        dimension=_label(dimension),
+    ).inc()
+
+
+@_safe
+def observe_refinery_rule_penalty_applied(*, dimension: str, severity: str) -> None:
+    refinery_rule_penalties_applied_total.labels(
+        dimension=_label(dimension),
+        severity=_label(severity),
+    ).inc()
+
+
+@_safe
+def observe_refinery_rules_engine_failure() -> None:
+    refinery_rules_engine_failed_total.inc()
+
+
+@_safe
+def observe_refinery_eval_short_circuit() -> None:
+    refinery_eval_pipeline_short_circuits_total.inc()
+
+
+@_safe
+def observe_refinery_fallback_judge_used() -> None:
+    refinery_fallback_judge_used_total.inc()
+
+
+@_safe
+def observe_refinery_research_call() -> None:
+    refinery_research_calls_total.inc()
+
+
+@_safe
+def observe_refinery_research_tier(*, tier: int | str) -> None:
+    refinery_research_tier_calls_total.labels(tier=_label(tier)).inc()
+
+
+@_safe
+def observe_refinery_research_internal_sufficient() -> None:
+    refinery_research_internal_sufficient_total.inc()
+
+
+@_safe
+def observe_refinery_research_budget_exhausted(*, tier: int | str) -> None:
+    refinery_research_tier_budget_exhausted_total.labels(tier=_label(tier)).inc()
+
+
+@_safe
+def observe_refinery_validated_insight(*, kind: str) -> None:
+    refinery_research_validated_insights_total.labels(kind=_label(kind)).inc()
+
+
+@_safe
+def observe_refinery_t5_propagation_rejected() -> None:
+    refinery_research_t5_propagation_rejected_total.inc()
+
+
+@_safe
+def observe_refinery_memory_suggested(*, kind: str, source_role: str) -> None:
+    refinery_memory_suggested_total.labels(
+        kind=_label(kind),
+        source_role=_label(source_role),
+    ).inc()
+
+
+@_safe
+def observe_refinery_memory_audit(*, outcome: str) -> None:
+    refinery_memory_audit_total.labels(outcome=_label(outcome)).inc()
+
+
+@_safe
+def observe_refinery_memory_write_back_failure() -> None:
+    refinery_memory_write_back_atomic_failures_total.inc()
+
+
+@_safe
+def observe_refinery_memory_dedup_blocked(*, kind: str) -> None:
+    refinery_memory_dedup_blocked_total.labels(kind=_label(kind)).inc()
+
+
+@_safe
+def observe_refinery_cost(*, role: str, cost_usd: float) -> None:
+    if cost_usd > 0:
+        refinery_cost_usd.labels(role=_label(role)).observe(cost_usd)
+
+
+@_safe
+def observe_refinery_tokens(*, role: str, tokens_in: int = 0, tokens_out: int = 0) -> None:
+    if tokens_in:
+        refinery_tokens_total.labels(role=_label(role), direction="in").inc(tokens_in)
+    if tokens_out:
+        refinery_tokens_total.labels(role=_label(role), direction="out").inc(tokens_out)
+
+
+@_safe
+def observe_refinery_dual_write_failure(*, table: str) -> None:
+    refinery_dual_write_failures_total.labels(table=_label(table)).inc()
+
+
+@_safe
+def observe_refinery_postgres_write(*, duration_seconds: float) -> None:
+    if duration_seconds > 0:
+        refinery_postgres_write_latency_seconds.observe(duration_seconds)

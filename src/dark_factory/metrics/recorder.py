@@ -28,6 +28,7 @@ from typing import Any
 
 import structlog
 
+from dark_factory.log import trace_methods
 from dark_factory.metrics.repository import MetricsRepository
 
 log = structlog.get_logger()
@@ -37,6 +38,7 @@ log = structlog.get_logger()
 _POISON = object()
 
 
+@trace_methods
 class MetricsRecorder:
     """Background writer for :class:`MetricsRepository`."""
 

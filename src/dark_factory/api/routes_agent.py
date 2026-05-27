@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from dark_factory.api.ag_ui_bridge import run_pipeline_stream
+from dark_factory.api.validators import validate_api_key
 
 log = structlog.get_logger()
 
@@ -53,22 +54,7 @@ class RunRequest(BaseModel):
     @field_validator("anthropic_api_key", "openai_api_key")
     @classmethod
     def validate_key(cls, v: str | None) -> str | None:
-        # Empty string → None so the frontend can clear a field without
-        # accidentally clearing the server-side default.
-        if v is None:
-            return None
-        v = v.strip()
-        if not v:
-            return None
-        # Cheap guardrail against accidentally pasting giant blobs —
-        # real keys are ≤ 200 chars for both providers.
-        if len(v) > 512:
-            raise ValueError("API key too long (max 512 chars)")
-        # Reject obvious control characters / whitespace that could
-        # break subsequent env var comparisons.
-        if any(c.isspace() for c in v):
-            raise ValueError("API key must not contain whitespace")
-        return v
+        return validate_api_key(v)
 
 
 @router.post("/agent/run")
@@ -91,6 +77,7 @@ async def agent_run(request: Request, body: RunRequest):
 
     settings = request.app.state.settings
     memory_repo = getattr(request.app.state, "memory_repo", None)
+    vector_repo = getattr(request.app.state, "vector_repo", None)
     thread_id = str(uuid4())
     run_id = str(uuid4())
     accept = request.headers.get("accept")
@@ -111,6 +98,7 @@ async def agent_run(request: Request, body: RunRequest):
             async for chunk in run_pipeline_stream(
                 settings=settings,
                 memory_repo=memory_repo,
+                vector_repo=vector_repo,
                 requirements_path=body.requirements_path,
                 thread_id=thread_id,
                 run_id=run_id,

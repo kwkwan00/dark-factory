@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 
 from dark_factory.graph.client import Neo4jClient
+from dark_factory.log import trace_methods
 from dark_factory.models.domain import Requirement, Spec
 
 
+@trace_methods
 class GraphRepository:
     """CRUD operations on the knowledge graph."""
 
@@ -99,8 +101,8 @@ class GraphRepository:
 
         Used by the preflight skip path: we need the existing Specs to
         continue flowing through ``context.specs`` into the downstream
-        graph / codegen / testgen stages without re-running the
-        refinement loop. Scenarios are stored as a JSON string on the
+        graph stage (and from there into the swarm) without re-running
+        the refinement loop. Scenarios are stored as a JSON string on the
         node (see :meth:`upsert_spec`) and decoded here. Nodes that
         don't exist are silently dropped — the caller is expected to
         intersect with :meth:`existing_spec_ids` first.
@@ -185,6 +187,47 @@ class GraphRepository:
 
             return "\n".join(lines) if lines else None
 
+    def get_requirement(self, req_id: str) -> Requirement | None:
+        """Return a single Requirement by ID, or None if not found."""
+        with self.client.session() as session:
+            result = session.run(
+                "MATCH (r:Requirement {id: $id}) RETURN r",
+                id=req_id,
+            )
+            record = result.single()
+            if record is None:
+                return None
+            props = dict(record["r"])
+            from dark_factory.models.domain import Priority
+            return Requirement(
+                id=props["id"],
+                title=props.get("title") or "",
+                description=props.get("description") or "",
+                source_file=props.get("source_file") or "",
+                priority=Priority(props.get("priority") or "medium"),
+                tags=list(props.get("tags") or []),
+            )
+
+    def get_all_requirements(self) -> list[Requirement]:
+        """Return all Requirement nodes, ordered by priority then ID."""
+        with self.client.session() as session:
+            result = session.run(
+                "MATCH (r:Requirement) RETURN r ORDER BY r.priority, r.id"
+            )
+            from dark_factory.models.domain import Priority
+            reqs: list[Requirement] = []
+            for record in result:
+                props = dict(record["r"])
+                reqs.append(Requirement(
+                    id=props["id"],
+                    title=props.get("title") or "",
+                    description=props.get("description") or "",
+                    source_file=props.get("source_file") or "",
+                    priority=Priority(props.get("priority") or "medium"),
+                    tags=list(props.get("tags") or []),
+                ))
+            return reqs
+
     def get_feature_groups(self) -> tuple[dict[str, list[str]], dict[str, set[str]]]:
         """Return specs grouped by capability and inter-group dependency edges.
 
@@ -193,6 +236,7 @@ class GraphRepository:
             group_deps: ``{capability: {dependent_capability, ...}}``
 
         Specs with empty capability get a singleton group keyed by spec_id.
+        Uses a single Neo4j query to fetch both grouping and dependency data.
         """
         with self.client.session() as session:
             result = session.run(
@@ -206,28 +250,19 @@ class GraphRepository:
             )
 
             groups: dict[str, list[str]] = {}
-            # Map spec_id -> its group key (capability or spec_id)
-            spec_to_group: dict[str, str] = {}
-            raw_dep_caps: dict[str, set[str]] = {}  # group_key -> dep group_keys
+            raw_dep_caps: dict[str, set[str]] = {}
 
             for record in result:
                 spec_id = record["id"]
                 capability = record["capability"] or spec_id
-                spec_to_group[spec_id] = capability
                 groups.setdefault(capability, []).append(spec_id)
 
-            # Second pass: build inter-group dependencies
-            result2 = session.run(
-                """
-                MATCH (s:Spec)-[:DEPENDS_ON]->(dep:Spec)
-                RETURN s.id AS id, s.capability AS cap,
-                       dep.id AS dep_id, dep.capability AS dep_cap
-                """
-            )
-            for record in result2:
-                src_group = record["cap"] or record["id"]
-                dep_group = record["dep_cap"] or record["dep_id"]
-                if src_group != dep_group:
-                    raw_dep_caps.setdefault(src_group, set()).add(dep_group)
+                # Build inter-group dependencies from the same result set
+                dep_ids = record["dep_ids"] or []
+                dep_caps = record["dep_caps"] or []
+                for dep_id, dep_cap in zip(dep_ids, dep_caps):
+                    dep_group = dep_cap or dep_id
+                    if capability != dep_group:
+                        raw_dep_caps.setdefault(capability, set()).add(dep_group)
 
         return groups, raw_dep_caps

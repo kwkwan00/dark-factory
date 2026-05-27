@@ -66,8 +66,6 @@ def _safe_filename_for_prompt(source: Path) -> str:
     already validated by the upload allowlist) so the extension-based
     dispatch hints in the prompt still work.
     """
-    import hashlib
-
     hashed = hashlib.sha256(source.name.encode("utf-8")).hexdigest()[:12]
     ext = source.suffix.lower()
     return f"doc_{hashed}{ext}"

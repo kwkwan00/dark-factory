@@ -12,7 +12,6 @@ SCHEMA_STATEMENTS = [
     "CREATE CONSTRAINT req_id IF NOT EXISTS FOR (r:Requirement) REQUIRE r.id IS UNIQUE",
     "CREATE CONSTRAINT spec_id IF NOT EXISTS FOR (s:Spec) REQUIRE s.id IS UNIQUE",
     "CREATE CONSTRAINT code_id IF NOT EXISTS FOR (c:CodeArtifact) REQUIRE c.id IS UNIQUE",
-    "CREATE CONSTRAINT test_id IF NOT EXISTS FOR (t:TestCase) REQUIRE t.id IS UNIQUE",
     "CREATE INDEX req_title IF NOT EXISTS FOR (r:Requirement) ON (r.title)",
     "CREATE INDEX spec_title IF NOT EXISTS FOR (s:Spec) ON (s.title)",
 ]

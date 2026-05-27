@@ -9,7 +9,7 @@ import pytest
 from pydantic import BaseModel
 
 from dark_factory.llm.base import LLMClient
-from dark_factory.models.domain import PipelineContext, Priority, Requirement, Spec
+from dark_factory.models.domain import Spec
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -39,17 +39,6 @@ class FakeLLMClient(LLMClient):
 
 
 @pytest.fixture
-def sample_requirement() -> Requirement:
-    return Requirement(
-        id="req-001",
-        title="User Authentication",
-        description="The system shall support user authentication via email and password.",
-        source_file="requirements/auth.md",
-        priority=Priority.HIGH,
-    )
-
-
-@pytest.fixture
 def sample_spec() -> Spec:
     return Spec(
         id="spec-req-001",
@@ -61,14 +50,6 @@ def sample_spec() -> Spec:
             "Passwords are hashed with bcrypt",
             "Login returns a valid JWT token",
         ],
-    )
-
-
-@pytest.fixture
-def sample_context(sample_requirement: Requirement) -> PipelineContext:
-    return PipelineContext(
-        input_path="tests/fixtures",
-        requirements=[sample_requirement],
     )
 
 

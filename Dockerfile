@@ -79,15 +79,15 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /usr/local/bin/uv
 # Copy dependency files first for layer caching
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies (without project)
-RUN uv sync --frozen --no-dev --no-install-project
+# Install dependencies (without project), including S3 support
+RUN uv sync --frozen --no-dev --no-install-project --extra s3
 
 # Copy application code
 COPY src/ src/
 COPY config.toml .
 
 # Install the project itself
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --extra s3
 
 # Copy React build output to the static directory served by FastAPI
 COPY --from=frontend-build /app/frontend/dist src/dark_factory/api/static/
@@ -97,4 +97,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-ENTRYPOINT ["uv", "run", "uvicorn", "dark_factory.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["uv", "run", "--no-dev", "uvicorn", "dark_factory.api.app:app", "--host", "0.0.0.0", "--port", "8000"]

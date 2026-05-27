@@ -239,7 +239,7 @@ def _translate_progress(
     elif event == "feature_completed":
         feature = progress.get("feature", unknown)
         status = progress.get("status", unknown)
-        icon = {"success": "✓", "error": "✕", "skipped": "⏭"}.get(status, "•")
+        icon = {"success": "✓", "error": "✕", "skipped": "⏭", "timeout": "⏱"}.get(status, "•")
         artifacts = progress.get("artifacts", 0)
         tests = progress.get("tests", 0)
         summary = f"{icon} Feature `{feature}` {status} — {artifacts} artifact(s), {tests} test(s)"
@@ -356,6 +356,20 @@ def _translate_progress(
             encoder, f"⛔ Pipeline cancelled ({reason})"
         )
 
+    elif event == "pipeline_error":
+        phase = progress.get("phase", "pipeline")
+        error = progress.get("error", "unknown error")
+        yield from _text_events(
+            encoder, f"Pipeline error ({phase}): {error}"
+        )
+
+    elif event == "phase_error":
+        phase = progress.get("phase", "unknown")
+        error = progress.get("error", "unknown error")
+        yield from _text_events(
+            encoder, f"Phase error ({phase}): {error}"
+        )
+
     elif event == "spec_gen_layer_started":
         total = progress.get("total", 0)
         parallel = progress.get("parallel", 1)
@@ -444,6 +458,55 @@ def _translate_progress(
             msg += f", {failed} failed"
         yield from _text_events(encoder, msg)
 
+    else:
+        log.debug("unknown_progress_event", progress_event=event)
+
+
+async def _finalize_run(
+    *,
+    status: str,
+    duration: float,
+    pipeline_run_id: str | None,
+    metrics_recorder: Any,
+    memory_repo: Any,
+    error: str | None = None,
+    pass_rate: float | None = None,
+) -> None:
+    """Shared teardown: Prometheus observe + Postgres metrics record + Neo4j status.
+
+    Called from the success, cancelled, and error exit paths in
+    ``run_pipeline_stream`` so the three-step teardown logic lives in
+    one place.
+    """
+    # 1. Prometheus counter + histogram
+    try:
+        from dark_factory.metrics.prometheus import observe_pipeline_run_end
+
+        observe_pipeline_run_end(status=status, duration_seconds=duration)
+    except Exception:  # pragma: no cover — defensive
+        pass
+
+    # 2. Postgres metrics store
+    if metrics_recorder is not None and pipeline_run_id:
+        try:
+            kwargs: dict[str, Any] = {
+                "run_id": pipeline_run_id,
+                "status": status,
+                "duration_seconds": duration,
+            }
+            if pass_rate is not None:
+                kwargs["pass_rate"] = pass_rate
+            if error is not None:
+                kwargs["error"] = error
+            metrics_recorder.record_pipeline_run_end(**kwargs)
+        except Exception as exc:
+            log.warning("metrics_run_end_record_failed", error=str(exc))
+
+    # 3. Neo4j memory repo — caller is responsible for the specific
+    #    repo method (complete_run / mark_run_cancelled / mark_run_failed)
+    #    because arguments differ. This helper handles only the
+    #    Prometheus + Postgres legs.
+
 
 async def run_pipeline_stream(
     settings: Settings,
@@ -452,6 +515,7 @@ async def run_pipeline_stream(
     run_id: str,
     accept: str | None = None,
     memory_repo: object | None = None,
+    vector_repo: object | None = None,
     anthropic_api_key: str | None = None,
     openai_api_key: str | None = None,
 ) -> AsyncIterator[str]:
@@ -590,6 +654,9 @@ async def run_pipeline_stream(
             },
         )
 
+    # Single import of emit_progress used throughout the generator.
+    from dark_factory.agents.tools import emit_progress as _emit
+
     try:
         from dark_factory.graph.client import Neo4jClient
         from dark_factory.graph.repository import GraphRepository
@@ -621,6 +688,8 @@ async def run_pipeline_stream(
             _tools_mod._progress_broker.clear_history()
 
         # ── Phase 1: Ingest ───────────────────────────────────────────────────
+        from dark_factory.agents.tools import set_current_phase
+        set_current_phase("ingest")
         raise_if_cancelled()
         step_id = str(uuid4())
         yield encoder.encode(
@@ -660,9 +729,21 @@ async def run_pipeline_stream(
             embed_fn=ingest_embed_fn,
             dedup_threshold=settings.pipeline.requirement_dedup_threshold,
         )
-        ctx = await asyncio.to_thread(ingest_stage.run, ctx)
+        ctx = await asyncio.wait_for(
+            asyncio.to_thread(ingest_stage.run, ctx),
+            timeout=settings.pipeline.ingest_timeout_seconds,
+        )
         raise_if_cancelled()
         log.info("ingest_done", requirements=len(ctx.requirements))
+
+        try:
+            _emit(
+                "ingest_completed",
+                run_id=pipeline_run_id,
+                requirements_count=len(ctx.requirements),
+            )
+        except Exception:
+            pass
 
         # Surface dedup results in the Agent Logs stream so the
         # operator can see exactly which requirements were merged. A
@@ -677,9 +758,7 @@ async def run_pipeline_stream(
 
         dedup = ingest_stage.last_dedup_result
         if isinstance(dedup, _DedupeResult) and dedup.dropped_count > 0:
-            from dark_factory.agents.tools import emit_progress as _emit_dedup
-
-            _emit_dedup(
+            _emit(
                 "requirements_deduped",
                 input_count=dedup.dropped_count + len(ctx.requirements),
                 output_count=len(ctx.requirements),
@@ -744,10 +823,16 @@ async def run_pipeline_stream(
                             f"{req.id}.json", req.model_dump_json(indent=2)
                         )
                 await asyncio.to_thread(_sync_requirements)
+                try:
+                    from dark_factory.metrics.helpers import record_storage_sync
+                    record_storage_sync(area="requirements", files_count=len(ctx.requirements))
+                except Exception:
+                    pass
             except Exception as exc:
                 log.warning("storage_requirements_sync_failed", error=str(exc))
 
         # ── Phase 2: Spec Generation ──────────────────────────────────────────
+        set_current_phase("spec_gen")
         step_id = str(uuid4())
         yield encoder.encode(
             StepStartedEvent(
@@ -768,8 +853,12 @@ async def run_pipeline_stream(
             max_specs_per_requirement=settings.pipeline.max_specs_per_requirement,
             graph_repo=repo,
             reuse_existing_specs=settings.pipeline.reuse_existing_specs,
+            vector_repo=vector_repo,
         )
-        ctx = await asyncio.to_thread(spec_stage.run, ctx)
+        ctx = await asyncio.wait_for(
+            asyncio.to_thread(spec_stage.run, ctx),
+            timeout=settings.pipeline.spec_timeout_seconds,
+        )
         raise_if_cancelled()
         log.info("spec_gen_done", specs=len(ctx.specs))
 
@@ -784,7 +873,15 @@ async def run_pipeline_stream(
             except Exception as exc:
                 log.warning("update_run_counts_failed", error=str(exc))
 
-        for ev in _text_events(encoder, f"Generated {len(ctx.specs)} specs"):
+        # Distinguish reused specs from freshly generated ones in the UI
+        reused_count = getattr(spec_stage, '_reused_count', 0)
+        if reused_count and reused_count == len(ctx.specs):
+            spec_msg = f"Reused {len(ctx.specs)} existing specs from knowledge graph"
+        elif reused_count:
+            spec_msg = f"Generated {len(ctx.specs) - reused_count} specs, reused {reused_count} from knowledge graph"
+        else:
+            spec_msg = f"Generated {len(ctx.specs)} specs"
+        for ev in _text_events(encoder, spec_msg):
             yield ev
 
         # Sync generated specs to durable storage
@@ -796,6 +893,11 @@ async def run_pipeline_stream(
                             f"{spec.id}.json", spec.model_dump_json(indent=2)
                         )
                 await asyncio.to_thread(_sync_specs)
+                try:
+                    from dark_factory.metrics.helpers import record_storage_sync
+                    record_storage_sync(area="specs", files_count=len(ctx.specs))
+                except Exception:
+                    pass
             except Exception as exc:
                 log.warning("storage_specs_sync_failed", error=str(exc))
 
@@ -805,7 +907,82 @@ async def run_pipeline_stream(
             )
         )
 
+        # ── Phase 2b: Spec Reconciliation ────────────────────────────────────
+        if settings.pipeline.enable_spec_reconciliation and ctx.specs:
+            set_current_phase("spec_reconciliation")
+            raise_if_cancelled()
+            step_id = str(uuid4())
+            yield encoder.encode(
+                StepStartedEvent(
+                    type=EventType.STEP_STARTED,
+                    step_name="Spec Reconciliation",
+                    step_id=step_id,
+                )
+            )
+            for ev in _text_events(
+                encoder,
+                f"Reconciling {len(ctx.specs)} specs against "
+                f"{len(ctx.requirements)} requirements...",
+            ):
+                yield ev
+
+            from dark_factory.stages.spec_reconciliation import (
+                SpecReconciliationStage,
+            )
+
+            recon_llm = llm_spec  # reuse the spec-gen LLM client
+            spec_recon_stage = SpecReconciliationStage(llm=recon_llm)
+            ctx = await asyncio.wait_for(
+                asyncio.to_thread(spec_recon_stage.run, ctx),
+                timeout=settings.pipeline.spec_recon_timeout_seconds,
+            )
+            raise_if_cancelled()
+            log.info("spec_reconciliation_done")
+
+            # Surface reconciliation findings to the user
+            s = spec_recon_stage.summary
+            parts = []
+            if s.get("cycles_broken"):
+                parts.append(f"{s['cycles_broken']} circular dep(s) broken")
+            if s.get("phantom_req_ids_removed"):
+                parts.append(f"{s['phantom_req_ids_removed']} phantom req ref(s) removed")
+            if s.get("phantom_dep_ids_removed"):
+                parts.append(f"{s['phantom_dep_ids_removed']} phantom dep ref(s) removed")
+            if s.get("deps_added"):
+                parts.append(f"{s['deps_added']} missing dep(s) added")
+            if s.get("req_ids_added"):
+                parts.append(f"{s['req_ids_added']} req link(s) added")
+            if s.get("capabilities_fixed"):
+                parts.append(f"{s['capabilities_fixed']} capability grouping(s) fixed")
+            uncovered = s.get("uncovered_requirements") or []
+            if uncovered:
+                parts.append(f"{len(uncovered)} requirement(s) still uncovered")
+            cap_islands = s.get("capability_islands") or []
+            if cap_islands:
+                parts.append(f"{len(cap_islands)} disconnected capability group(s)")
+            detail = "; ".join(parts) if parts else "no issues found"
+            for ev in _text_events(encoder, f"Spec reconciliation complete: {detail}"):
+                yield ev
+            try:
+                _emit(
+                    "spec_reconciliation_completed",
+                    run_id=pipeline_run_id,
+                    detail=detail,
+                    **{k: (len(v) if isinstance(v, list) else v)
+                       for k, v in s.items() if k != "llm_issues"},
+                )
+            except Exception:
+                pass
+            yield encoder.encode(
+                StepFinishedEvent(
+                    type=EventType.STEP_FINISHED,
+                    step_name="Spec Reconciliation",
+                    step_id=step_id,
+                )
+            )
+
         # ── Phase 3: Knowledge Graph ──────────────────────────────────────────
+        set_current_phase("graph")
         step_id = str(uuid4())
         yield encoder.encode(
             StepStartedEvent(
@@ -815,9 +992,22 @@ async def run_pipeline_stream(
         for ev in _text_events(encoder, "Populating knowledge graph..."):
             yield ev
 
-        ctx = await asyncio.to_thread(GraphStage(repo=repo).run, ctx)
+        ctx = await asyncio.wait_for(
+            asyncio.to_thread(GraphStage(repo=repo).run, ctx),
+            timeout=settings.pipeline.graph_timeout_seconds,
+        )
         raise_if_cancelled()
         log.info("graph_done")
+
+        try:
+            _emit(
+                "graph_write_completed",
+                run_id=pipeline_run_id,
+                requirements=len(ctx.requirements),
+                specs=len(ctx.specs),
+            )
+        except Exception:
+            pass
 
         for ev in _text_events(encoder, "Knowledge graph updated"):
             yield ev
@@ -828,6 +1018,7 @@ async def run_pipeline_stream(
         )
 
         # ── Phase 4: Swarm Orchestrator ───────────────────────────────────────
+        set_current_phase("swarm")
         raise_if_cancelled()
         spec_ids = [s.id for s in ctx.specs]
         step_id = str(uuid4())
@@ -846,11 +1037,33 @@ async def run_pipeline_stream(
         # C1: concurrent runs are rejected at the route level; this bridge
         # only sees events while `app.state.run_lock` is held, so event
         # history from a previous run has already finished.
+        # Total wall-clock budget for the entire swarm phase.
+        #
+        # The old formula scaled with len(spec_ids), which was wrong:
+        # features within a layer run in PARALLEL, so elapsed time is
+        # bounded by the SLOWEST feature in each layer, not the sum.
+        # A single-spec run with one slow feature would time out at
+        # 1200*1+300=1500s even though the feature itself hadn't
+        # reached its 1200s limit yet.
+        #
+        # Correct formula: (initial layer + retries + 1 spare) × feature
+        # budget + generous overhead for deep-agent subprocesses (each
+        # can hold a worker thread for up to DEEP_AGENT_TIMEOUT_SECONDS
+        # _after_ the per-feature wall-clock check fires).
+        _max_layers = settings.pipeline.max_layer_retries + 2  # initial + retries + spare
+        _swarm_wall_timeout = (
+            settings.pipeline.swarm_feature_timeout_seconds * _max_layers
+            + 900  # 15 min overhead for layer transitions and deep-agent drain
+        )
+
         broker = _tools._progress_broker
         if broker is None:
             # Fall back gracefully — still runs the pipeline, just without
             # the nested feature sub-steps.
-            result = await asyncio.to_thread(run_orchestrator, settings, spec_ids=spec_ids)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(run_orchestrator, settings, spec_ids=spec_ids),
+                timeout=_swarm_wall_timeout,
+            )
         else:
             # H2 fix: bounded queue with drop-oldest policy (broker handles
             # overflow internally). Subscribe BEFORE launching the orchestrator
@@ -869,12 +1082,47 @@ async def run_pipeline_stream(
                 asyncio.to_thread(run_orchestrator, settings, spec_ids=spec_ids)
             )
 
+            import time as _bridge_time
+            _swarm_loop_start = _bridge_time.monotonic()
+
             try:
                 while True:
+                    # Wall-clock guard: if the orchestrator task AND event
+                    # drain loop have been running longer than the budget,
+                    # abort — prevents a permanently-stalled queue.get()
+                    # from keeping the SSE connection open forever.
+                    if _bridge_time.monotonic() - _swarm_loop_start > _swarm_wall_timeout:
+                        _elapsed = round(_bridge_time.monotonic() - _swarm_loop_start, 1)
+                        log.error(
+                            "swarm_event_loop_timeout",
+                            elapsed_seconds=_elapsed,
+                        )
+                        try:
+                            _emit(
+                                "phase_error",
+                                run_id=pipeline_run_id,
+                                phase="swarm",
+                                error=f"Swarm wall-clock timeout after {_elapsed}s",
+                            )
+                        except Exception:
+                            pass
+                        # Signal all workers to stop cooperatively so
+                        # in-flight deep-agent subprocesses can wind
+                        # down before we proceed to reconciliation.
+                        from dark_factory.agents.cancellation import request_cancel
+                        request_cancel()
+                        orch_task.cancel()
+                        try:
+                            await orch_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        break
+
                     get_task = asyncio.create_task(progress_queue.get())
                     done, _pending = await asyncio.wait(
                         {orch_task, get_task},
                         return_when=asyncio.FIRST_COMPLETED,
+                        timeout=30,  # re-check wall-clock every 30s at most
                     )
 
                     if get_task in done:
@@ -883,14 +1131,22 @@ async def run_pipeline_stream(
                             encoder, progress, feature_step_ids, last_agent_per_feature
                         ):
                             yield chunk
-                    else:
-                        # orch_task is done — cancel the get and break out
+                    elif orch_task in done:
+                        # Orchestrator finished — cancel the pending queue.get and break
                         get_task.cancel()
                         try:
                             await get_task
                         except (asyncio.CancelledError, Exception):
                             pass
                         break
+                    else:
+                        # asyncio.wait timed out (30s heartbeat) — cancel
+                        # stale get_task and loop back to re-check wall-clock
+                        get_task.cancel()
+                        try:
+                            await get_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
 
                 # H1 fix: flush any `call_soon_threadsafe` callbacks that the
                 # swarm worker threads scheduled just before returning. Without
@@ -909,7 +1165,21 @@ async def run_pipeline_stream(
             finally:
                 broker.unsubscribe(progress_queue)
 
-            result = await orch_task
+            try:
+                result = await orch_task
+            except asyncio.CancelledError:
+                # Wall-clock timeout cancelled the task — treat as an empty result
+                log.error("swarm_orchestrator_cancelled_by_timeout")
+                try:
+                    _emit(
+                        "phase_error",
+                        run_id=pipeline_run_id,
+                        phase="swarm",
+                        error="Swarm orchestrator cancelled by wall-clock timeout",
+                    )
+                except Exception:
+                    pass
+                result = {}
 
         log.info("swarm_done", features=len(result.get("completed_features", [])))
 
@@ -922,6 +1192,18 @@ async def run_pipeline_stream(
         )
         for ev in _text_events(encoder, summary):
             yield ev
+
+        try:
+            _emit(
+                "swarm_completed",
+                run_id=pipeline_run_id,
+                features=len(completed),
+                pass_rate=pass_rate,
+                artifacts=len(result.get("all_artifacts", [])),
+                tests=len(result.get("all_tests", [])),
+            )
+        except Exception:
+            pass
 
         yield encoder.encode(
             StepFinishedEvent(
@@ -937,10 +1219,16 @@ async def run_pipeline_stream(
                     run_storage.sync_output_from_local, swarm_output_dir
                 )
                 log.info("storage_swarm_sync_done", run_id=pipeline_run_id, files=count)
+                try:
+                    from dark_factory.metrics.helpers import record_storage_sync
+                    record_storage_sync(area="output", files_count=count)
+                except Exception:
+                    pass
             except Exception as exc:
                 log.warning("storage_swarm_sync_failed", run_id=pipeline_run_id, error=str(exc))
 
         # ── Phase 5: Reconciliation ──────────────────────────────────────────
+        set_current_phase("reconciliation")
         # Best-effort cross-feature polishing pass — always runs after
         # the feature swarms complete. A single extended Claude Agent
         # SDK invocation in the run's output directory reviews all
@@ -1065,14 +1353,24 @@ async def run_pipeline_stream(
 
                 except Exception as exc:
                     # Reconciliation is best-effort. Log, emit, don't fail.
+                    _recon_err = str(exc) or type(exc).__name__
                     log.warning(
                         "reconciliation_stage_crashed",
                         run_id=pipeline_run_id,
-                        error=str(exc),
+                        error=_recon_err,
                     )
+                    try:
+                        _emit(
+                            "phase_error",
+                            run_id=pipeline_run_id,
+                            phase="reconciliation",
+                            error=f"Reconciliation crashed: {_recon_err}",
+                        )
+                    except Exception:
+                        pass
                     for ev in _text_events(
                         encoder,
-                        f"Reconciliation crashed: {exc}. Continuing with "
+                        f"Reconciliation crashed: {_recon_err}. Continuing with "
                         f"feature output as-is.",
                     ):
                         yield ev
@@ -1096,6 +1394,7 @@ async def run_pipeline_stream(
             )
 
         # ── Phase 6: End-to-End Validation ───────────────────────────────────
+        set_current_phase("e2e_validation")
         # Playwright-powered cross-browser smoke testing of the
         # reconciled code. Runs AFTER reconciliation completes
         # cleanly, only if the feature is enabled. A single
@@ -1139,6 +1438,17 @@ async def run_pipeline_stream(
                 )
             for ev in _text_events(encoder, skip_reason):
                 yield ev
+            # Also publish to the progress broker so the Agent Logs
+            # tab shows the skip event.
+            try:
+                _emit(
+                    "e2e_validation_skipped",
+                    run_id=pipeline_run_id,
+                    reason=skip_reason,
+                    reconciliation_status=recon_status_for_e2e,
+                )
+            except Exception:
+                pass
         if e2e_should_run:
             from dark_factory.stages.e2e_validation import E2EValidationStage
 
@@ -1159,7 +1469,6 @@ async def run_pipeline_stream(
 
             try:
                 e2e_stage = E2EValidationStage(
-                    max_turns=settings.pipeline.max_e2e_turns,
                     timeout_seconds=settings.pipeline.e2e_timeout_seconds,
                     browsers=list(settings.pipeline.e2e_browsers),
                 )
@@ -1224,14 +1533,24 @@ async def run_pipeline_stream(
                         pass
             except Exception as exc:
                 # E2E is best-effort. Log, emit, don't fail.
+                _e2e_err = str(exc) or type(exc).__name__
                 log.warning(
                     "e2e_stage_crashed",
                     run_id=pipeline_run_id,
-                    error=str(exc),
+                    error=_e2e_err,
                 )
+                try:
+                    _emit(
+                        "phase_error",
+                        run_id=pipeline_run_id,
+                        phase="e2e_validation",
+                        error=f"E2E validation crashed: {_e2e_err}",
+                    )
+                except Exception:
+                    pass
                 for ev in _text_events(
                     encoder,
-                    f"E2E validation crashed: {exc}. Continuing with "
+                    f"E2E validation crashed: {_e2e_err}. Continuing with "
                     f"reconciled output as-is.",
                 ):
                     yield ev
@@ -1270,23 +1589,14 @@ async def run_pipeline_stream(
         status = "success" if succeeded == total and total > 0 else "partial"
         duration = time.time() - pipeline_start_time
 
-        try:
-            from dark_factory.metrics.prometheus import observe_pipeline_run_end
-
-            observe_pipeline_run_end(status=status, duration_seconds=duration)
-        except Exception:  # pragma: no cover — defensive
-            pass
-
-        if metrics_recorder is not None and pipeline_run_id:
-            try:
-                metrics_recorder.record_pipeline_run_end(
-                    run_id=pipeline_run_id,
-                    status=status,
-                    pass_rate=float(pass_rate) if isinstance(pass_rate, (int, float)) else None,
-                    duration_seconds=duration,
-                )
-            except Exception as exc:
-                log.warning("metrics_run_end_record_failed", error=str(exc))
+        await _finalize_run(
+            status=status,
+            duration=duration,
+            pipeline_run_id=pipeline_run_id,
+            metrics_recorder=metrics_recorder,
+            memory_repo=memory_repo,
+            pass_rate=float(pass_rate) if isinstance(pass_rate, (int, float)) else None,
+        )
 
         # Neo4j run history: flip the Run node from "running" to its
         # terminal status. Without this the ``/api/history`` endpoint
@@ -1313,6 +1623,18 @@ async def run_pipeline_stream(
             except Exception as exc:
                 log.warning("complete_run_failed", error=str(exc))
 
+        try:
+            _emit(
+                "pipeline_completed",
+                run_id=pipeline_run_id,
+                status=status,
+                pass_rate=float(pass_rate) if isinstance(pass_rate, (int, float)) else 0.0,
+                duration_seconds=round(duration, 1),
+                features=len(completed),
+            )
+        except Exception:
+            pass
+
         yield encoder.encode(
             RunFinishedEvent(
                 type=EventType.RUN_FINISHED,
@@ -1329,9 +1651,7 @@ async def run_pipeline_stream(
 
         # Progress event so the Agent Logs tab shows the cancel
         try:
-            from dark_factory.agents.tools import emit_progress as _emit_cancel
-
-            _emit_cancel(
+            _emit(
                 "pipeline_cancelled",
                 run_id=pipeline_run_id or None,
                 reason="user_requested",
@@ -1339,37 +1659,26 @@ async def run_pipeline_stream(
         except Exception:  # pragma: no cover — defensive
             pass
 
-        # Run history: mark as cancelled rather than failed
+        # Run history: mark as cancelled (distinct from error)
         if pipeline_run_id and memory_repo is not None:
             try:
                 await asyncio.to_thread(
-                    lambda: memory_repo.mark_run_failed(
+                    lambda: memory_repo.mark_run_cancelled(
                         run_id=pipeline_run_id,
-                        error="Cancelled by user",
+                        duration_seconds=duration,
                     )
                 )
             except Exception as inner:
-                log.warning("mark_run_failed_failed", error=str(inner))
+                log.warning("mark_run_cancelled_failed", error=str(inner))
 
-        # Prometheus: pipeline_runs_total{status="cancelled"}
-        try:
-            from dark_factory.metrics.prometheus import observe_pipeline_run_end
-
-            observe_pipeline_run_end(status="cancelled", duration_seconds=duration)
-        except Exception:  # pragma: no cover — defensive
-            pass
-
-        # Postgres metrics store: dedicated "cancelled" status
-        if metrics_recorder is not None and pipeline_run_id:
-            try:
-                metrics_recorder.record_pipeline_run_end(
-                    run_id=pipeline_run_id,
-                    status="cancelled",
-                    duration_seconds=duration,
-                    error="Cancelled by user",
-                )
-            except Exception as inner:
-                log.warning("metrics_run_end_record_failed", error=str(inner))
+        await _finalize_run(
+            status="cancelled",
+            duration=duration,
+            pipeline_run_id=pipeline_run_id,
+            metrics_recorder=metrics_recorder,
+            memory_repo=memory_repo,
+            error="Cancelled by user",
+        )
 
         # Tell the SSE client the run ended cleanly-cancelled
         for ev in _text_events(encoder, "⛔ Pipeline cancelled by user"):
@@ -1382,37 +1691,52 @@ async def run_pipeline_stream(
         )
 
     except Exception as exc:
-        log.error("pipeline_stream_error", error=str(exc))
+        # Build a meaningful error message — asyncio.TimeoutError has
+        # an empty str(), so we synthesise one from the current phase.
+        from dark_factory.agents.tools import get_current_phase
+
+        phase = get_current_phase() or "pipeline"
+        duration = time.time() - pipeline_start_time
+        if isinstance(exc, asyncio.TimeoutError):
+            error_msg = (
+                f"Phase '{phase}' timed out after {duration:.0f}s"
+            )
+        else:
+            error_msg = str(exc) or f"Unknown error in phase '{phase}'"
+
+        log.error("pipeline_stream_error", error=error_msg, phase=phase)
+
+        # Emit to the progress broker so the Agent Logs tab shows the error
+        try:
+            _emit(
+                "pipeline_error",
+                run_id=pipeline_run_id or None,
+                phase=phase,
+                error=error_msg,
+            )
+        except Exception:  # pragma: no cover — defensive
+            pass
+
         # Mark the Run History entry as failed so it doesn't stay 'running' forever
         if pipeline_run_id and memory_repo is not None:
             try:
                 await asyncio.to_thread(
                     lambda: memory_repo.mark_run_failed(
-                        run_id=pipeline_run_id, error=str(exc)
+                        run_id=pipeline_run_id, error=error_msg
                     )
                 )
             except Exception as inner:
                 log.warning("mark_run_failed_failed", error=str(inner))
         # Metrics: record the failed run lifecycle end in Postgres + Prometheus
-        duration = time.time() - pipeline_start_time
 
-        try:
-            from dark_factory.metrics.prometheus import observe_pipeline_run_end
-
-            observe_pipeline_run_end(status="error", duration_seconds=duration)
-        except Exception:  # pragma: no cover — defensive
-            pass
-
-        if metrics_recorder is not None and pipeline_run_id:
-            try:
-                metrics_recorder.record_pipeline_run_end(
-                    run_id=pipeline_run_id,
-                    status="error",
-                    duration_seconds=duration,
-                    error=str(exc),
-                )
-            except Exception as inner:
-                log.warning("metrics_run_end_record_failed", error=str(inner))
+        await _finalize_run(
+            status="error",
+            duration=duration,
+            pipeline_run_id=pipeline_run_id,
+            metrics_recorder=metrics_recorder,
+            memory_repo=memory_repo,
+            error=error_msg,
+        )
         try:
             import traceback as _tb
 
@@ -1421,22 +1745,39 @@ async def run_pipeline_stream(
             _rec_inc(
                 category="pipeline",
                 severity="critical",
-                message=str(exc)[:500],
+                message=error_msg[:500],
                 stack=_tb.format_exc()[:4000],
-                phase="pipeline",
+                phase=phase,
                 run_id=pipeline_run_id or None,
             )
         except Exception as inner:  # pragma: no cover — defensive
             log.warning("incident_record_failed", error=str(inner))
+        for ev in _text_events(encoder, f"Pipeline error ({phase}): {error_msg}"):
+            yield ev
         yield encoder.encode(
-            RunErrorEvent(type=EventType.RUN_ERROR, message=str(exc))
+            RunErrorEvent(type=EventType.RUN_ERROR, message=error_msg)
         )
     finally:
         # Each cleanup step is isolated so a failure in one (e.g. Neo4j
         # close raises a connection error, env restore hits an OSError)
-        # cannot prevent the others from running. The cancel flag reset
-        # is done FIRST — it's the cheapest and most critical step, and
-        # its failure would poison the next run.
+        # cannot prevent the others from running.
+
+        # Final S3 sync: upload the entire local run directory so that
+        # any files written to disk but not yet replicated (e.g. a
+        # mid-swarm crash before sync_output_from_local ran) still
+        # reach durable storage.  Uses the run_storage from the outer
+        # scope — if it's None (storage init failed), this is a no-op.
+        try:
+            if run_storage is not None and pipeline_run_id:
+                run_dir = Path(settings.pipeline.output_dir) / pipeline_run_id
+                if run_dir.is_dir():
+                    run_storage.sync_output_from_local(run_dir)
+                    log.info("final_s3_sync_done", run_id=pipeline_run_id)
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning("final_s3_sync_failed", error=str(exc))
+
+        # The cancel flag reset is done early — it's the cheapest and
+        # most critical step, and its failure would poison the next run.
         try:
             if is_cancelled():
                 log.info("pipeline_cancel_cleared_on_exit")
@@ -1453,11 +1794,13 @@ async def run_pipeline_stream(
         try:
             from dark_factory.agents.tools import (
                 set_current_feature,
+                set_current_phase,
                 set_current_run_id,
             )
 
             set_current_run_id("")
             set_current_feature("")
+            set_current_phase("")
         except Exception as exc:  # pragma: no cover — defensive
             log.warning("clear_agent_globals_failed_on_exit", error=str(exc))
 

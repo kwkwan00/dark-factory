@@ -7,10 +7,12 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from dark_factory.config import PostgresConfig
+from dark_factory.log import trace_methods
 
 log = structlog.get_logger()
 
 
+@trace_methods
 class PostgresClient:
     """Connection pool facade for Postgres metric writes and reads.
 

@@ -1,0 +1,276 @@
+# Deep Agents
+# Sub-agents spawned by swarm agents for specialized analysis.
+
+deep_codegen:
+  user: |
+    Generate production-quality code based on this specification:
+
+    {spec_context}
+
+    Instructions: {instructions}
+
+    <<quality_bar>>
+
+    Additionally:
+    - Write all files to the current working directory using Read/Write/Edit tools.
+    - Read any existing files first to understand the project structure and conventions before writing.
+    - Match the language, framework, and style of any existing code in the directory.
+    - Output budget: at most 8 files and 400 lines per file.
+deep_dependency_analysis:
+  user: |
+    Analyze the dependency tree for feature '{feature_name}'.
+    Spec IDs: {spec_ids_json}
+
+    {context_block}
+
+    You are READ-ONLY. Do not Write or Edit any file — your output is the JSON report below.
+
+    Trace all transitive DEPENDS_ON relationships. Return a single JSON object with this exact shape (no prose outside the JSON):
+
+    ```json
+    {{
+      "graph": [
+        {{"spec_id": "spec-1", "depends_on": ["spec-2", "spec-3"]}}
+      ],
+      "cycles": [
+        {{"path": ["spec-1", "spec-2", "spec-1"], "rationale": "..."}}
+      ],
+      "missing": [
+        {{"spec_id": "spec-1", "referenced_id_or_behaviour": "...", "rationale": "..."}}
+      ],
+      "execution_order": ["spec-2", "spec-3", "spec-1"],
+      "risk_areas": [
+        {{"spec_id": "spec-1", "severity": "HIGH", "kind": "high_fan_in|deep_chain", "rationale": "..."}}
+      ]
+    }}
+    ```
+
+    <<severity_bands>>
+    Scope: dependency analysis only — see `deep_risk_assessment` for end-to-end risk scoring (do not duplicate its judgements here).
+deep_risk_assessment:
+  user: |
+    Assess risks for feature '{feature_name}'.
+
+    Spec context:
+    {spec_context}
+
+    {context_block}
+
+    You are READ-ONLY. Do not Write or Edit any file — your output is the JSON report below.
+
+    Score each dimension, then return a single JSON object with this exact shape (no prose outside the JSON):
+
+    ```json
+    {{
+      "dimensions": {{
+        "complexity":      {{"severity": "LOW|MEDIUM|HIGH|CRITICAL", "rationale": "..."}},
+        "historical":      {{"severity": "LOW|MEDIUM|HIGH|CRITICAL", "rationale": "..."}},
+        "security":        {{"severity": "LOW|MEDIUM|HIGH|CRITICAL", "rationale": "..."}},
+        "integration":     {{"severity": "LOW|MEDIUM|HIGH|CRITICAL", "rationale": "..."}},
+        "ambiguity":       {{"severity": "LOW|MEDIUM|HIGH|CRITICAL", "rationale": "..."}}
+      }},
+      "overall_severity": "LOW|MEDIUM|HIGH|CRITICAL",
+      "mitigations": [
+        {{"applies_to": "complexity|historical|security|integration|ambiguity",
+          "action": "specific actionable suggestion the Planner can execute",
+          "expected_effect": "..."}}
+      ]
+    }}
+    ```
+
+    <<severity_bands>>
+    Scope: end-to-end risk only — leave dependency-graph judgements (fan-in, cycles, missing edges) to `deep_dependency_analysis`. Every MEDIUM/HIGH/CRITICAL dimension MUST appear at least once in `mitigations`.
+deep_security_review:
+  user: |
+    Perform a thorough security review of this code:
+
+    ```
+    {code_content}
+    ```
+
+    Spec context:
+    {spec_context}
+
+    {context_block}
+
+    You are READ-ONLY. Do not Write or Edit the code — your output is the JSON report below.
+
+    Check for: SQL injection (string concatenation in queries), command injection (unsanitized input in shell calls), XSS (unescaped user content in HTML/templates), authentication/authorization gaps, sensitive data exposure (secrets in code, PII in logs, missing encryption), input validation gaps (unbounded inputs, missing type checks), insecure dependencies / deprecated APIs, path traversal (user-controlled file paths without validation).
+
+    Return a single JSON object with this exact shape (no prose outside the JSON):
+
+    ```json
+    {{
+      "findings": [
+        {{
+          "severity":     "CRITICAL|HIGH|MEDIUM|LOW",
+          "category":     "sql_injection|command_injection|xss|authn_authz|data_exposure|input_validation|dependency|path_traversal",
+          "file":         "relative/path.py",
+          "line":         42,
+          "description":  "what is wrong (one sentence)",
+          "fix":          "concrete remediation step"
+        }}
+      ],
+      "summary": "X CRITICAL, Y HIGH, Z MEDIUM, W LOW — or 'No security issues found' when empty"
+    }}
+    ```
+
+    <<severity_bands>>
+    If no findings, return ``"findings": []`` and set ``summary`` to "No security issues found". Do not invent findings to fill the array.
+deep_performance_review:
+  user: |
+    Analyze this code for performance issues:
+
+    ```
+    {code_content}
+    ```
+
+    Spec context:
+    {spec_context}
+
+    {context_block}
+
+    You are READ-ONLY. Do not Write or Edit the code — your output is the JSON report below.
+
+    Check for: algorithmic complexity (O(n^2) or worse where O(n) or O(n log n) is achievable), N+1 query patterns (loop of individual queries instead of batch), resource leaks (unclosed connections, file handles, cursors), unbounded memory growth (appending to lists without limits, caching without eviction), blocking I/O in async code paths, missing pagination on list endpoints, redundant computation (repeated expensive calls that could be cached).
+
+    Return a single JSON object with this exact shape (no prose outside the JSON):
+
+    ```json
+    {{
+      "findings": [
+        {{
+          "severity":     "CRITICAL|HIGH|MEDIUM|LOW",
+          "category":     "complexity|n_plus_one|resource_leak|memory_growth|blocking_io|pagination|redundant_compute",
+          "file":         "relative/path.py",
+          "line":         42,
+          "description":  "what is wrong (one sentence)",
+          "fix":          "concrete optimization step"
+        }}
+      ],
+      "summary": "X CRITICAL, Y HIGH, Z MEDIUM, W LOW — or 'No performance issues found' when empty"
+    }}
+    ```
+
+    <<severity_bands>>
+    Reserve CRITICAL for performance issues that would cause the system to fall over at expected production load (data-loss-on-overload, runaway memory, query storms that exhaust the connection pool). If no findings, return ``"findings": []`` with summary "No performance issues found".
+deep_spec_compliance:
+  user: |
+    Verify this code against each acceptance criterion.
+
+    Code:
+    ```
+    {code_content}
+    ```
+
+    Acceptance criteria (JSON array):
+    {acceptance_criteria_json}
+
+    {context_block}
+
+    You are READ-ONLY. Do not Write or Edit the code — your output is the JSON report below.
+
+    Return a single JSON object with this exact shape (no prose outside the JSON):
+
+    ```json
+    {{
+      "criteria": [
+        {{
+          "criterion":      "quoted verbatim",
+          "verdict":        "PASS|FAIL",
+          "implementation": "file:line or 'NOT IMPLEMENTED'",
+          "severity":       "CRITICAL|HIGH|MEDIUM|LOW|null",
+          "reason":         "FAIL → what is missing/incorrect AND the fix; PASS → null"
+        }}
+      ],
+      "summary": "X of Y criteria passing"
+    }}
+    ```
+
+    <<severity_bands>>
+    A FAIL on a primary-flow criterion is CRITICAL; a FAIL on an edge-case criterion is HIGH or MEDIUM. PASS rows MUST set ``severity`` and ``reason`` to ``null``.
+deep_unit_test_gen:
+  user: |
+    Generate comprehensive unit tests for this code:
+
+    ```
+    {code_content}
+    ```
+
+    Spec context:
+    {spec_context}
+
+    {context_block}
+
+    **Scope (owned by this agent):** function- and method-level isolation.
+    Test each public function/method independently with all external
+    dependencies mocked. Happy path + error/exception paths + simple
+    boundary conditions on the function's OWN parameters.
+
+    **Out of scope (delegated):**
+    - Cross-module interactions and end-to-end HTTP flows → `deep_integration_test_gen`.
+    - Adversarial inputs, regression tests for past mistakes, concurrency, type confusion → `deep_edge_case_test_gen`.
+
+    Requirements:
+    - Mock all external dependencies (network, database, filesystem, third-party APIs).
+    - Use descriptive test names: `test_<function>_<scenario>_<expected_outcome>`.
+    - Detect the language from the source code and use the standard test framework (Python → pytest, TypeScript → jest/vitest, Go → testing).
+    - Write the test file to disk using the Write tool. Name it `test_<source_filename>` (Python) or `<source_filename>.test.ts` (TypeScript).
+deep_integration_test_gen:
+  user: |
+    Generate integration tests for this code:
+
+    ```
+    {code_content}
+    ```
+
+    Spec context:
+    {spec_context}
+
+    {context_block}
+
+    **Scope (owned by this agent):** cross-module wiring + end-to-end flows.
+    Test how the code in this spec interacts with code from dependency
+    specs. Test API endpoints end-to-end if the code defines HTTP routes
+    (request → response, including error status codes). Map each
+    WHEN/THEN scenario from the spec to at least one test.
+
+    **Out of scope (delegated):**
+    - Single-function correctness with all deps mocked → `deep_unit_test_gen`.
+    - Adversarial / boundary / regression-against-past-mistakes → `deep_edge_case_test_gen`.
+
+    Requirements:
+    - Use real objects where practical; only mock at the system boundary (external services, databases).
+    - Write the test file to disk using the Write tool. Name it `integration_test_<feature>.py` or similar.
+deep_edge_case_test_gen:
+  user: |
+    Generate edge case and adversarial tests for this code:
+
+    ```
+    {code_content}
+    ```
+
+    Spec context:
+    {spec_context}
+
+    Past mistakes to guard against:
+    {past_mistakes_json}
+
+    {context_block}
+
+    **Scope (owned by this agent):** adversarial inputs, regression
+    coverage for past mistakes, concurrency, and type confusion. The
+    questions are "what happens when this gets called WRONG" and
+    "how do we catch the bug we caught last time."
+
+    **Out of scope (delegated):**
+    - Happy-path single-function correctness → `deep_unit_test_gen`.
+    - Cross-module flows / end-to-end HTTP → `deep_integration_test_gen`.
+
+    Requirements:
+    - Each past mistake MUST inform at least one regression test. Name these tests `test_regression_<mistake_description>`.
+    - Test boundary conditions: empty strings, empty lists, None/null, zero, negative numbers, max-length strings, Unicode, special characters.
+    - Test error handling: what happens when dependencies raise exceptions, return unexpected types, or time out?
+    - Test concurrency if applicable: parallel calls to the same function, race conditions on shared state.
+    - Test type confusion: passing a string where an int is expected, a list where a dict is expected.
+    - Write the test file to disk using the Write tool.

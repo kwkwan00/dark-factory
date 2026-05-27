@@ -1,10 +1,9 @@
 import { Component, type ReactNode, useState } from "react";
-import AboutTab from "./components/AboutTab";
 import AgentLogsTab from "./components/AgentLogsTab";
 import AgentMemoryTab from "./components/AgentMemoryTab";
-import GapFinderTab from "./components/GapFinderTab";
 import ManufactureTab from "./components/ManufactureTab";
 import MetricsTab from "./components/MetricsTab";
+import RefineryTab from "./components/RefineryTab";
 import SettingsTab from "./components/SettingsTab";
 import { ManufactureProvider } from "./contexts/ManufactureContext";
 
@@ -47,21 +46,19 @@ class ErrorBoundary extends Component<EBProps, EBState> {
 
 type Tab =
   | "manufacture"
+  | "refinery"
   | "agent-logs"
-  | "gap-finder"
   | "agent-memory"
   | "metrics"
-  | "settings"
-  | "about";
+  | "settings";
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: "manufacture", label: "Manufacture" },
+  { id: "refinery", label: "Refine" },
   { id: "agent-logs", label: "Agent Logs" },
-  { id: "gap-finder", label: "Gap Finder" },
   { id: "agent-memory", label: "Agent Memory" },
   { id: "metrics", label: "Metrics" },
   { id: "settings", label: "Settings" },
-  { id: "about", label: "About" },
 ];
 
 export default function App() {
@@ -89,12 +86,13 @@ export default function App() {
       <main className="tab-content">
         <ErrorBoundary>
           {activeTab === "manufacture" && <ManufactureTab />}
+          <div style={{ display: activeTab === "refinery" ? undefined : "none" }}>
+            <RefineryTab />
+          </div>
           {activeTab === "agent-logs" && <AgentLogsTab />}
-          {activeTab === "gap-finder" && <GapFinderTab />}
           {activeTab === "agent-memory" && <AgentMemoryTab />}
           {activeTab === "metrics" && <MetricsTab />}
           {activeTab === "settings" && <SettingsTab />}
-          {activeTab === "about" && <AboutTab />}
         </ErrorBoundary>
       </main>
     </ManufactureProvider>

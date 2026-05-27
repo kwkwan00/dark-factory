@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from qdrant_client.models import Filter, FieldCondition, MatchValue, PointStruct
 
+from dark_factory.log import trace_methods
 from dark_factory.vector.client import QdrantClientWrapper
 from dark_factory.vector.embeddings import EmbeddingService
 
@@ -23,6 +25,7 @@ log = structlog.get_logger()
 _QDRANT_ID_NAMESPACE = uuid.UUID("9c8d7e6f-5a4b-3c2d-1e0f-aabbccddeeff")
 
 
+@trace_methods
 class VectorRepository:
     """Semantic search over memories, specs, and code artifacts."""
 
@@ -43,25 +46,30 @@ class VectorRepository:
         source_spec_id: str = "",
         agent: str = "",
         relevance_score: float = 0.5,
+        run_id: str = "",
     ) -> None:
         text = f"{description}\n{secondary_text}"
         vector = self._embeddings.embed(text)
+        payload: dict[str, Any] = {
+            "id": node_id,
+            "memory_type": memory_type,
+            "description": description,
+            "secondary_text": secondary_text,
+            "source_feature": source_feature,
+            "source_spec_id": source_spec_id,
+            "agent": agent,
+            "relevance_score": relevance_score,
+            "run_id": run_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "times_recalled": 0,
+        }
         self._client.client.upsert(
             collection_name=self._client.collection_name("memories"),
             points=[
                 PointStruct(
                     id=self._to_point_id(node_id),
                     vector=vector,
-                    payload={
-                        "id": node_id,
-                        "memory_type": memory_type,
-                        "description": description,
-                        "secondary_text": secondary_text,
-                        "source_feature": source_feature,
-                        "source_spec_id": source_spec_id,
-                        "agent": agent,
-                        "relevance_score": relevance_score,
-                    },
+                    payload=payload,
                 )
             ],
         )
@@ -91,26 +99,90 @@ class VectorRepository:
         ).points
         return [{"id": p.payload.get("id", ""), "score": p.score, **p.payload} for p in results]
 
+    # ── Refinery v2: role-filtered hybrid retrieval ──────────────────
+    #
+    # search_memories_hybrid carries a RoleFilterPolicy — required, no
+    # no-filter overload — so a policy is always translated into a
+    # server-side Qdrant Filter before the query runs. This is the
+    # Parnas-discipline load-bearing method: an out-of-slice row cannot
+    # be returned even if the calling role's prompt asks for one.
+    #
+    # Phase 6 ships dense-only server-side filtering. The Phase-11
+    # sparse/BM25 migration adds a ``bm25`` named vector to the
+    # ``memories`` collection; at that point this method switches to
+    # ``prefetch`` + ``FusionQuery(RRF)`` without the caller noticing.
+
+    def search_memories_hybrid(
+        self,
+        *,
+        query_text: str,
+        policy: "Any",  # RoleFilterPolicy — avoid circular import
+        limit: int | None = None,
+    ) -> list[dict]:
+        """Dense + (future) BM25 search with role-filter enforcement.
+
+        Mandatory ``policy`` argument — there is no no-filter overload.
+        Callers pass ``role_slices.ROLE_FILTERS[role]`` or an override;
+        the filter is built in one place (``context.translators``) and
+        passed as ``query_filter`` so Qdrant enforces the slice.
+        """
+
+        from dark_factory.api.refinery.context.translators import (
+            policy_to_qdrant_memory_filter,
+        )
+
+        qdrant_filter = policy_to_qdrant_memory_filter(policy)
+        effective_limit = limit or getattr(policy, "row_cap", 12) or 12
+        vector = self._embeddings.embed(query_text)
+
+        results = self._client.client.query_points(
+            collection_name=self._client.collection_name("memories"),
+            query=vector,
+            query_filter=qdrant_filter,  # NEVER None-unless-policy-is-empty
+            limit=effective_limit,
+            score_threshold=0.3,
+        ).points
+        return [
+            {"id": p.payload.get("id", ""), "score": p.score, **p.payload}
+            for p in results
+        ]
+
     # ── Spec operations ──────────────────────────────────────────────
 
-    def upsert_spec(self, *, spec: Spec) -> None:
+    def upsert_spec(
+        self,
+        *,
+        spec: Spec,
+        eval_score: float | None = None,
+        attempts: int | None = None,
+    ) -> None:
         criteria = "\n".join(spec.acceptance_criteria)
-        text = f"{spec.title}\n{spec.description}\n{criteria}"
+        scenarios_text = "\n".join(
+            f"WHEN {s.when} THEN {s.then}" for s in spec.scenarios
+        )
+        text = f"{spec.title}\n{spec.description}\n{criteria}\n{scenarios_text}"
         vector = self._embeddings.embed(text)
+        payload: dict[str, Any] = {
+            "id": spec.id,
+            "title": spec.title,
+            "description": spec.description,
+            "capability": spec.capability,
+            "acceptance_criteria": spec.acceptance_criteria,
+            "requirement_ids": spec.requirement_ids,
+            "dependencies": spec.dependencies,
+            "scenarios": [s.model_dump() for s in spec.scenarios],
+        }
+        if eval_score is not None:
+            payload["eval_score"] = eval_score
+        if attempts is not None:
+            payload["attempts"] = attempts
         self._client.client.upsert(
             collection_name=self._client.collection_name("specs"),
             points=[
                 PointStruct(
                     id=self._to_point_id(spec.id),
                     vector=vector,
-                    payload={
-                        "id": spec.id,
-                        "title": spec.title,
-                        "description": spec.description,
-                        "capability": spec.capability,
-                        "acceptance_criteria": criteria,
-                        "requirement_ids": spec.requirement_ids,
-                    },
+                    payload=payload,
                 )
             ],
         )
@@ -193,22 +265,32 @@ class VectorRepository:
         vector: list[float],
         turns_used: int = 0,
         duration_seconds: float = 0.0,
+        spec_ids: list[str] | None = None,
+        final_eval_scores: dict[str, float] | None = None,
+        recalled_memory_ids: list[str] | None = None,
     ) -> None:
+        payload: dict[str, Any] = {
+            "id": episode_id,
+            "run_id": run_id,
+            "feature": feature,
+            "outcome": outcome,
+            "summary": summary,
+            "turns_used": turns_used,
+            "duration_seconds": duration_seconds,
+        }
+        if spec_ids:
+            payload["spec_ids"] = spec_ids
+        if final_eval_scores:
+            payload["final_eval_scores"] = final_eval_scores
+        if recalled_memory_ids:
+            payload["recalled_memory_ids"] = recalled_memory_ids
         self._client.client.upsert(
             collection_name=self._client.collection_name("episodes"),
             points=[
                 PointStruct(
                     id=self._to_point_id(episode_id),
                     vector=vector,
-                    payload={
-                        "id": episode_id,
-                        "run_id": run_id,
-                        "feature": feature,
-                        "outcome": outcome,
-                        "summary": summary,
-                        "turns_used": turns_used,
-                        "duration_seconds": duration_seconds,
-                    },
+                    payload=payload,
                 )
             ],
         )

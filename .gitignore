@@ -62,6 +62,11 @@ logs/
 *.swo
 *~
 
+# ── Claude Code per-developer overrides ───────────────────────────────────
+# Local permission grants / hooks — checked-in `.claude/settings.json`
+# is shared; this file is the per-developer override.
+.claude/settings.local.json
+
 # ── OS junk ───────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import RefreshIcon from "./RefreshIcon";
 import {
   api,
   type AdminClearAllResponse,
@@ -1084,13 +1085,15 @@ function SettingsForm({ current, onSaved }: SettingsFormProps) {
     draft.requirement_dedup_threshold !==
       current.requirement_dedup_threshold ||
     draft.enable_e2e_validation !== current.enable_e2e_validation ||
-    draft.max_e2e_turns !== current.max_e2e_turns ||
     draft.e2e_timeout_seconds !== current.e2e_timeout_seconds ||
     draft.e2e_browsers.join(",") !== current.e2e_browsers.join(",") ||
     draft.enable_episodic_memory !== current.enable_episodic_memory ||
     draft.memory_dedup_threshold !== current.memory_dedup_threshold ||
     draft.llm_model !== current.llm_model ||
-    draft.eval_model !== current.eval_model;
+    draft.planning_model !== current.planning_model ||
+    draft.eval_model !== current.eval_model ||
+    draft.refinery_model !== current.refinery_model ||
+    draft.refinery_reasoning_effort !== current.refinery_reasoning_effort;
 
   const handleSave = async () => {
     setSaving(true);
@@ -1110,13 +1113,15 @@ function SettingsForm({ current, onSaved }: SettingsFormProps) {
         reconciliation_timeout_seconds: draft.reconciliation_timeout_seconds,
         requirement_dedup_threshold: draft.requirement_dedup_threshold,
         enable_e2e_validation: draft.enable_e2e_validation,
-        max_e2e_turns: draft.max_e2e_turns,
         e2e_timeout_seconds: draft.e2e_timeout_seconds,
         e2e_browsers: draft.e2e_browsers,
         enable_episodic_memory: draft.enable_episodic_memory,
         memory_dedup_threshold: draft.memory_dedup_threshold,
         llm_model: draft.llm_model,
+        planning_model: draft.planning_model,
         eval_model: draft.eval_model,
+        refinery_model: draft.refinery_model,
+        refinery_reasoning_effort: draft.refinery_reasoning_effort,
       };
       const next = await api.updateSettings(body);
       onSaved(next);
@@ -1179,8 +1184,8 @@ function SettingsForm({ current, onSaved }: SettingsFormProps) {
 
       <SectionLabel label="Models" />
       <ModelSelectRow
-        label="Main LLM (spec gen + codegen swarm)"
-        description="Anthropic model used by the architect/critic/swarm agents"
+        label="Coding & Testing model"
+        description="Anthropic model used for code generation and test writing"
         value={draft.llm_model}
         options={anthropicModels.models}
         onChange={(v) => setDraft({ ...draft, llm_model: v })}
@@ -1196,7 +1201,24 @@ function SettingsForm({ current, onSaved }: SettingsFormProps) {
         }
       />
       <ModelSelectRow
-        label="Eval model (DeepEval judge)"
+        label="Planning & Architecture model"
+        description="Anthropic model used for spec generation, planner agent, and reviewer agent"
+        value={draft.planning_model}
+        options={anthropicModels.models}
+        onChange={(v) => setDraft({ ...draft, planning_model: v })}
+        source={
+          anthropicModels.status === "loading"
+            ? "loading"
+            : anthropicModels.status === "error"
+              ? "error"
+              : anthropicModels.source
+        }
+        error={
+          anthropicModels.status === "error" ? anthropicModels.error : null
+        }
+      />
+      <ModelSelectRow
+        label="Evaluation model (LLM-as-a-Judge)"
         description="OpenAI model used to score specs, tests, and generated code"
         value={draft.eval_model}
         options={openaiModels.models}
@@ -1210,6 +1232,41 @@ function SettingsForm({ current, onSaved }: SettingsFormProps) {
         }
         error={openaiModels.status === "error" ? openaiModels.error : null}
       />
+
+      <ModelSelectRow
+        label="Refinery model"
+        description="OpenAI model used for the Requirements Refinery deep agent"
+        value={draft.refinery_model}
+        options={openaiModels.models}
+        onChange={(v) => setDraft({ ...draft, refinery_model: v })}
+        source={
+          openaiModels.status === "loading"
+            ? "loading"
+            : openaiModels.status === "error"
+              ? "error"
+              : openaiModels.source
+        }
+        error={openaiModels.status === "error" ? openaiModels.error : null}
+      />
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0" }}>
+        <div>
+          <div style={{ fontSize: 13, color: "#e6edf3" }}>Refinery reasoning effort</div>
+          <div style={{ fontSize: 11, color: "#8b949e" }}>Reasoning depth for the refinery model (low, medium, high, xhigh)</div>
+        </div>
+        <select
+          value={draft.refinery_reasoning_effort}
+          onChange={(e) => setDraft({ ...draft, refinery_reasoning_effort: e.target.value })}
+          style={{
+            background: "#0d1117", border: "1px solid #30363d", borderRadius: 6,
+            color: "#e6edf3", padding: "6px 10px", fontSize: 12,
+          }}
+        >
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+          <option value="xhigh">xhigh</option>
+        </select>
+      </div>
 
       <SectionLabel label="API keys (optional)" />
       <p style={{ color: "#8b949e", fontSize: 11, margin: "0 0 10px" }}>
@@ -1521,14 +1578,6 @@ function SettingsForm({ current, onSaved }: SettingsFormProps) {
         }}
       >
         <NumberRow
-          label="Max E2E turns"
-          value={draft.max_e2e_turns}
-          min={1}
-          max={500}
-          onChange={(v) => setDraft({ ...draft, max_e2e_turns: v })}
-          description="SDK max_turns for the E2E deep-agent pass"
-        />
-        <NumberRow
           label="E2E timeout (s)"
           value={draft.e2e_timeout_seconds}
           min={60}
@@ -1675,8 +1724,8 @@ export default function SettingsTab() {
           <div className="card-title" style={{ margin: 0 }}>
             Service Health
           </div>
-          <button className="btn btn-secondary" onClick={() => void refreshHealth()}>
-            Refresh
+          <button className="btn btn-secondary" onClick={() => void refreshHealth()} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <RefreshIcon /> Refresh
           </button>
         </div>
 
@@ -1731,8 +1780,8 @@ export default function SettingsTab() {
             File Watcher
           </div>
           <div style={{ display: "flex", gap: 8 }}>
-            <button className="btn btn-secondary" onClick={() => void refreshStatus()}>
-              Refresh
+            <button className="btn btn-secondary" onClick={() => void refreshStatus()} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              <RefreshIcon /> Refresh
             </button>
             {watching ? (
               <button className="btn btn-danger" onClick={() => void stop()}>

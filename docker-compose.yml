@@ -114,6 +114,14 @@ services:
       PROMETHEUS_ENABLED: "true"
       PROMETHEUS_URL: http://prometheus:9090
       DEEP_AGENT_DEBUG_STDERR: "1"
+      # Storage: local is the primary backend. When S3_BUCKET is set,
+      # ReplicatedStorage auto-writes to both local and S3.
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
     depends_on:
       neo4j:
         condition: service_healthy

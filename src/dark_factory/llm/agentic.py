@@ -15,7 +15,8 @@ from typing import Callable
 import anthropic
 import structlog
 
-from dark_factory.llm.anthropic import _record_llm_call
+from dark_factory.llm.anthropic import _backoff_sleep, _is_transient, _record_llm_call
+from dark_factory.llm.base import DEFAULT_MODEL
 from dark_factory.llm.tool_handlers import execute_tool, get_tool_schemas
 
 # Optional progress callback type: (turn, max_turns, tool_names, text_preview) -> None
@@ -23,7 +24,7 @@ OnTurnCallback = Callable[[int, int, list[str], str], None]
 
 log = structlog.get_logger()
 
-_DEFAULT_MODEL = "claude-sonnet-4-6"
+_DEFAULT_MODEL = DEFAULT_MODEL
 
 
 def run_agentic_loop(
@@ -101,7 +102,7 @@ def run_agentic_loop(
             return (_join_text(accumulated_text) + note).strip()
 
         # ---- API call with single retry on transient errors ---------------
-        response = _call_with_retry(
+        response, call_started_at = _call_with_retry(
             client=client,
             model=model,
             messages=messages,
@@ -138,10 +139,7 @@ def run_agentic_loop(
         _record_llm_call(
             client="agentic",
             model=model,
-            started_at=time.time() - (
-                (getattr(response, "_request_duration", None) or 0)
-                or 0
-            ),
+            started_at=call_started_at,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_input_tokens=cache_read,
@@ -267,7 +265,7 @@ def _call_with_retry(
     system: str | None,
     timeout_seconds: float,
     turn: int,
-) -> anthropic.types.Message:
+) -> tuple[anthropic.types.Message, float]:
     """Call messages.create with a single retry on transient errors."""
 
     kwargs: dict = {
@@ -284,26 +282,14 @@ def _call_with_retry(
     for attempt in range(2):
         started_at = time.time()
         try:
-            return client.messages.create(**kwargs)
+            return client.messages.create(**kwargs), started_at
         except Exception as exc:
             last_error = exc
             http_status = getattr(exc, "status_code", None)
             rate_limited = isinstance(exc, anthropic.RateLimitError) or (
                 http_status == 429
             )
-
-            is_transient = (
-                rate_limited
-                or isinstance(
-                    exc,
-                    (
-                        anthropic.APIConnectionError,
-                        anthropic.APITimeoutError,
-                        anthropic.InternalServerError,
-                    ),
-                )
-                or (isinstance(http_status, int) and http_status >= 500)
-            )
+            transient = _is_transient(exc)
 
             _record_llm_call(
                 client="agentic",
@@ -320,12 +306,14 @@ def _call_with_retry(
                 "agentic_api_error",
                 turn=turn,
                 attempt=attempt + 1,
-                transient=is_transient,
+                transient=transient,
                 error=str(exc)[:500],
             )
 
-            if not is_transient:
+            if not transient:
                 raise
+            if attempt < 1:
+                _backoff_sleep(attempt, exc)
 
     assert last_error is not None
     raise last_error

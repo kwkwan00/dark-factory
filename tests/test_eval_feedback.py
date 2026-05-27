@@ -16,7 +16,7 @@ def test_evaluation_config_defaults() -> None:
     assert config.adaptive is True
     assert config.decay_factor == 0.95
     assert config.boost_delta == 0.1
-    assert config.demote_delta == 0.05
+    assert config.demote_delta == 0.1
     assert config.trend_window == 5
     assert config.threshold_min == 0.3
     assert config.threshold_max == 0.9
@@ -226,3 +226,123 @@ def test_reviewer_has_eval_history_tools() -> None:
         names = [getattr(t, "name", str(t)) for t in tools]
         assert "query_eval_history" in names
         assert "query_run_history" in names
+
+
+# ── Memory fix tests ─────────────────────────────────────────────────
+
+
+def test_demote_cypher_does_not_increment_times_applied() -> None:
+    """_DEMOTE_CYPHER should NOT increment times_applied or times_seen."""
+    from dark_factory.memory.repository import MemoryRepository
+
+    for label, cypher in MemoryRepository._DEMOTE_CYPHER.items():
+        assert "times_applied" not in cypher, f"{label} demote increments times_applied"
+        assert "times_seen" not in cypher, f"{label} demote increments times_seen"
+
+
+def test_detect_label_handles_episode_prefix() -> None:
+    """_detect_label should return 'Episode' for ep- prefixed IDs."""
+    from unittest.mock import MagicMock
+    from dark_factory.memory.repository import MemoryRepository
+
+    repo = MemoryRepository(client=MagicMock())
+    assert repo._detect_label("ep-abc123") == "Episode"
+    assert repo._detect_label("pattern-abc") == "Pattern"
+    assert repo._detect_label("unknown-abc") is None
+
+
+def test_apply_eval_feedback_skips_episode_and_pattern_ids() -> None:
+    """Episodes lack relevance_score; Patterns are excluded because
+    the causal link between recalling a pattern and an eval outcome
+    is too noisy. Both should be skipped without error."""
+    from unittest.mock import MagicMock
+    from dark_factory.memory.repository import MemoryRepository
+
+    repo = MemoryRepository(client=MagicMock())
+    repo.boost_relevance = MagicMock()
+    repo.demote_relevance = MagicMock()
+
+    repo.apply_eval_feedback(
+        recalled_memory_ids=["pattern-1", "ep-abc", "mistake-2", "solution-3"],
+        pass_rate=1.0,
+    )
+    # mistake-2 and solution-3 should be boosted; pattern-1 and ep-abc skipped
+    boost_calls = repo.boost_relevance.call_args_list
+    boosted_ids = {c.args[0] for c in boost_calls}
+    assert "mistake-2" in boosted_ids
+    assert "solution-3" in boosted_ids
+    assert "pattern-1" not in boosted_ids
+    assert "ep-abc" not in boosted_ids
+
+
+def test_boost_syncs_qdrant_relevance() -> None:
+    """boost_relevance should update the Qdrant payload's relevance_score."""
+    from unittest.mock import MagicMock
+    from dark_factory.memory.repository import MemoryRepository
+
+    mock_client = MagicMock()
+    mock_session = MagicMock()
+    mock_client.session.return_value.__enter__ = MagicMock(return_value=mock_session)
+    mock_client.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    # _read_relevance returns the boosted value
+    mock_session.run.return_value.single.return_value = {"score": 0.6}
+
+    mock_vector = MagicMock()
+    repo = MemoryRepository(client=mock_client, vector_repo=mock_vector)
+
+    repo.boost_relevance("pattern-1", "Pattern", delta=0.1)
+    mock_vector.update_relevance_score.assert_called_once_with(
+        node_id="pattern-1", new_score=0.6,
+    )
+
+
+def test_cross_feature_dedup_enabled_for_patterns() -> None:
+    """record_pattern should pass match_cross_feature=True to dedup."""
+    from unittest.mock import MagicMock
+    from dark_factory.memory.repository import MemoryRepository
+
+    mock_client = MagicMock()
+    mock_session = MagicMock()
+    mock_client.session.return_value.__enter__ = MagicMock(return_value=mock_session)
+    mock_client.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    repo = MemoryRepository(client=mock_client)
+    repo.dedup_helper = MagicMock()
+    repo.dedup_helper.find_existing_match.return_value = None
+
+    repo.record_pattern(
+        description="Use parameterized queries",
+        context="Prevents SQL injection",
+        source_feature="auth",
+        agent="coder",
+    )
+    repo.dedup_helper.find_existing_match.assert_called_once()
+    call_kwargs = repo.dedup_helper.find_existing_match.call_args.kwargs
+    assert call_kwargs["match_cross_feature"] is True
+
+
+def test_cross_feature_dedup_disabled_for_mistakes() -> None:
+    """record_mistake should keep match_cross_feature=False (default)."""
+    from unittest.mock import MagicMock
+    from dark_factory.memory.repository import MemoryRepository
+
+    mock_client = MagicMock()
+    mock_session = MagicMock()
+    mock_client.session.return_value.__enter__ = MagicMock(return_value=mock_session)
+    mock_client.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    repo = MemoryRepository(client=mock_client)
+    repo.dedup_helper = MagicMock()
+    repo.dedup_helper.find_existing_match.return_value = None
+
+    repo.record_mistake(
+        description="Missing null check",
+        error_type="null_pointer",
+        trigger_context="user input",
+        source_feature="auth",
+        agent="reviewer",
+    )
+    repo.dedup_helper.find_existing_match.assert_called_once()
+    call_kwargs = repo.dedup_helper.find_existing_match.call_args.kwargs
+    assert call_kwargs.get("match_cross_feature", False) is False

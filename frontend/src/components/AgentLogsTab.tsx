@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type ProgressEvent } from "../api/client";
-import { EVENT_BADGES, formatTime, formatEventDetails } from "../lib/agentLogFormat";
+import { formatTime, formatEventDetails, resolveBadge } from "../lib/agentLogFormat";
 
 // Ring buffer size — keep the most recent N events in memory
 const MAX_EVENTS = 2000;
@@ -223,10 +223,7 @@ export default function AgentLogsTab() {
             </div>
           ) : (
             filtered.map((entry) => {
-              const badge = EVENT_BADGES[entry.event] ?? {
-                label: entry.event.toUpperCase(),
-                color: "#8b949e",
-              };
+              const badge = resolveBadge(entry);
               return (
                 <div key={entry._id} className="log-entry">
                   <span className="log-time">{formatTime(entry.timestamp)}</span>

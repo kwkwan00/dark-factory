@@ -56,16 +56,6 @@ class CodeArtifact(BaseModel):
     content: str
 
 
-class TestCase(BaseModel):
-    """A generated test for a code artifact."""
-
-    id: str
-    artifact_id: str
-    test_type: str = "unit"  # unit, integration, eval
-    file_path: str
-    content: str
-
-
 class PipelineContext(BaseModel):
     """Accumulator passed between pipeline stages."""
 
@@ -73,4 +63,3 @@ class PipelineContext(BaseModel):
     requirements: list[Requirement] = Field(default_factory=list)
     specs: list[Spec] = Field(default_factory=list)
     artifacts: list[CodeArtifact] = Field(default_factory=list)
-    tests: list[TestCase] = Field(default_factory=list)

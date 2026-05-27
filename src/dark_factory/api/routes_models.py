@@ -44,6 +44,8 @@ import structlog
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from dark_factory.api.validators import validate_api_key
+
 log = structlog.get_logger()
 
 router = APIRouter()
@@ -108,16 +110,7 @@ class ModelListRequest(BaseModel):
     @field_validator("api_key")
     @classmethod
     def _validate_key(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        v = v.strip()
-        if not v:
-            return None
-        if len(v) > 512:
-            raise ValueError("API key too long (max 512 chars)")
-        if any(c.isspace() for c in v):
-            raise ValueError("API key must not contain whitespace")
-        return v
+        return validate_api_key(v)
 
 
 # ── OpenAI chat-model filter ───────────────────────────────────────────────
@@ -165,19 +158,6 @@ def _is_chat_capable_openai_model(model_id: str) -> bool:
         or mid.startswith("o3")
         or mid.startswith("o4")
         or mid.startswith("o5")
-    )
-
-
-# ── Sort helpers ───────────────────────────────────────────────────────────
-
-
-def _sort_models_newest_first(
-    models: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Sort models by created_at desc with None pushed to the end."""
-    return sorted(
-        models,
-        key=lambda m: (m.get("created_at") is None, -(m.get("created_at") or 0)),
     )
 
 

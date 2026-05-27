@@ -9,240 +9,412 @@ import pytest
 from dark_factory.api.app import app
 
 
-# ── Graph Gap Finder ───────────────────────────────────────────────────────────
+# ── Run-scoped Gap Finder ──────────────────────────────────────────────────────
 
 
-def _install_neo4j_side_effects(mock_session, unplanned, specs, req_count):
-    """Configure a mock Neo4j session for the gaps endpoint.
-
-    The endpoint makes four session.run() calls in order:
-      1. unplanned requirements
-      2. all specs with requirement_ids
-      3. requirement count (on a second session; we lump it in for
-         simplicity — see below)
+def test_run_gaps_derives_from_traceability(api_client):
+    """GET /api/graph/gaps/{run_id} derives gap analysis from the
+    traceability matrix. Exercises:
+      - spec-1 has no artifacts → specs_without_artifacts
+      - spec-2 has files but eval failed → specs_failing_evals
+      - req-1 has overall_status "no_specs" → unimplemented_requirements
     """
-    count_result = MagicMock()
-    count_result.single.return_value = {"cnt": req_count}
-    mock_session.run.side_effect = [unplanned, specs, count_result]
+    trace_response = {
+        "run_id": "run-test-1",
+        "rows": [
+            {
+                "requirement": {"id": "req-1", "title": "Login", "priority": "high"},
+                "specs": [],
+                "overall_status": "no_specs",
+            },
+            {
+                "requirement": {"id": "req-2", "title": "Dashboard", "priority": "medium"},
+                "specs": [
+                    {
+                        "id": "spec-1",
+                        "title": "Dashboard spec",
+                        "capability": "dashboard",
+                        "files": [],
+                        "test_files": [],
+                        "eval_scores": {},
+                        "all_passed": None,
+                    },
+                    {
+                        "id": "spec-2",
+                        "title": "Charts spec",
+                        "capability": "dashboard",
+                        "files": [{"path": "charts.py"}],
+                        "test_files": [],
+                        "eval_scores": {"correctness": 0.3},
+                        "all_passed": False,
+                    },
+                ],
+                "overall_status": "fail",
+            },
+        ],
+    }
 
-
-def test_graph_gaps_postgres_disabled_returns_unplanned_only(api_client):
-    """When Postgres isn't configured the endpoint still returns the
-    Neo4j-derived unplanned requirement list and sets
-    ``enabled_postgres=false`` so the UI can render a partial view."""
-    app.state.metrics_client = None
-
+    # Mock get_traceability to return our test data, and Neo4j for
+    # the structural gap queries (broken deps, cap islands, episodes).
     mock_session = MagicMock()
     app.state.neo4j_client.session.return_value.__enter__.return_value = mock_session
     app.state.neo4j_client.session.return_value.__exit__.return_value = False
+    # Neo4j queries: broken_deps, cap_groups, cap_adjacency, episodes
+    mock_session.run.return_value = []
 
-    _install_neo4j_side_effects(
-        mock_session,
-        unplanned=[
-            {
-                "id": "req-1",
-                "title": "Login",
-                "priority": "high",
-                "source_file": "reqs/auth.md",
-            }
-        ],
-        specs=[],
-        req_count=1,
-    )
-
-    resp = api_client.get("/api/graph/gaps")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["enabled_postgres"] is False
-    assert data["stale_days"] == 7
-    assert len(data["unplanned_requirements"]) == 1
-    assert data["unplanned_requirements"][0]["id"] == "req-1"
-    # Postgres-backed lists are empty when the store is off.
-    assert data["specs_without_artifacts"] == []
-    assert data["specs_failing_evals"] == []
-    assert data["stale_requirements"] == []
-    assert data["totals"]["requirements"] == 1
-
-
-def test_graph_gaps_happy_path_with_postgres(api_client):
-    """Full end-to-end with mocked Neo4j + Postgres. Exercises all four
-    gap categories at once:
-      - req-1 is unplanned (no IMPLEMENTS)
-      - spec-1 has no artifacts (not in artifact_writes)
-      - spec-2 failed its latest eval
-      - req-3 is stale (last eval > stale_days ago)
-    """
-    from datetime import datetime, timedelta, timezone
-
-    # Neo4j side: one unplanned req, three specs with IMPLEMENTS links
-    mock_session = MagicMock()
-    app.state.neo4j_client.session.return_value.__enter__.return_value = mock_session
-    app.state.neo4j_client.session.return_value.__exit__.return_value = False
-
-    _install_neo4j_side_effects(
-        mock_session,
-        unplanned=[
-            {
-                "id": "req-1",
-                "title": "Login",
-                "priority": "high",
-                "source_file": "reqs/auth.md",
-            }
-        ],
-        specs=[
-            {
-                "id": "spec-1",
-                "title": "Login spec",
-                "capability": "auth",
-                "requirement_ids": ["req-2"],
-            },
-            {
-                "id": "spec-2",
-                "title": "Logout spec",
-                "capability": "auth",
-                "requirement_ids": ["req-2"],
-            },
-            {
-                "id": "spec-3",
-                "title": "Stale spec",
-                "capability": "legacy",
-                "requirement_ids": ["req-3"],
-            },
-        ],
-        req_count=3,
-    )
-
-    # Postgres side: stub out metrics_client.connection() chain.
-    # artifact_writes → only spec-2 and spec-3 have artifacts.
-    # eval_metrics   → spec-2 failed its latest eval; spec-3's latest
-    #                  eval is 30 days old.
-    now = datetime.now(tz=timezone.utc)
-    old = now - timedelta(days=30)
-
-    class _FakeCursor:
-        def __init__(self):
-            self._result: list[dict] = []
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def execute(self, sql, params=None):
-            if "artifact_writes" in sql:
-                self._result = [
-                    {"spec_id": "spec-2"},
-                    {"spec_id": "spec-3"},
-                ]
-            elif "eval_metrics" in sql:
-                self._result = [
-                    {
-                        "spec_id": "spec-2",
-                        "metric_name": "correctness",
-                        "score": 0.2,
-                        "passed": False,
-                        "timestamp": now,
-                    },
-                    {
-                        "spec_id": "spec-3",
-                        "metric_name": "correctness",
-                        "score": 0.95,
-                        "passed": True,
-                        "timestamp": old,
-                    },
-                ]
-            else:
-                self._result = []
-
-        def fetchall(self):
-            return self._result
-
-    class _FakeConn:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def cursor(self):
-            return _FakeCursor()
-
-    fake_client = MagicMock()
-    fake_client.connection.return_value.__enter__.return_value = _FakeConn()
-    fake_client.connection.return_value.__exit__.return_value = False
-    original = app.state.metrics_client
-    app.state.metrics_client = fake_client
-    try:
-        resp = api_client.get("/api/graph/gaps?stale_days=7")
-    finally:
-        app.state.metrics_client = original
+    with patch(
+        "dark_factory.api.routes_dashboard.get_traceability",
+        return_value=trace_response,
+    ):
+        resp = api_client.get("/api/graph/gaps/run-test-1")
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["enabled_postgres"] is True
+    assert data["run_id"] == "run-test-1"
 
-    # 1. Unplanned: just req-1
-    unplanned_ids = [r["id"] for r in data["unplanned_requirements"]]
-    assert unplanned_ids == ["req-1"]
+    # spec-1 has no files → specs_without_artifacts
+    no_artifacts_ids = [s["id"] for s in data["specs_without_artifacts"]]
+    assert "spec-1" in no_artifacts_ids
 
-    # 2. Specs without artifacts: spec-1 only
-    ids_without_artifacts = [s["id"] for s in data["specs_without_artifacts"]]
-    assert ids_without_artifacts == ["spec-1"]
-
-    # 3. Failing evals: spec-2 only
+    # spec-2 has all_passed=False → specs_failing_evals
     failing_ids = [s["id"] for s in data["specs_failing_evals"]]
     assert failing_ids == ["spec-2"]
-    # Passed through from Postgres
-    assert data["specs_failing_evals"][0]["score"] == 0.2
-    assert data["specs_failing_evals"][0]["metric_name"] == "correctness"
+    assert data["specs_failing_evals"][0]["eval_scores"]["correctness"] == 0.3
 
-    # 4. Stale requirements: req-3 (its spec-3 was evaluated 30d ago),
-    # NOT req-2 (its spec-2 was evaluated just now). req-1 has no specs
-    # at all so it doesn't appear in the req_to_specs map and therefore
-    # is not reported as stale (it's already in unplanned — avoids
-    # double-counting).
-    stale_ids = [r["id"] for r in data["stale_requirements"]]
-    assert stale_ids == ["req-3"]
+    # req-1 has overall_status "no_specs" → unimplemented
+    unimpl_ids = [r["id"] for r in data["unimplemented_requirements"]]
+    assert unimpl_ids == ["req-1"]
+
+    # Totals
+    assert data["totals"]["requirements"] == 2
+    assert data["totals"]["specs"] == 2
 
 
-def test_graph_gaps_postgres_error_degrades_gracefully(api_client):
-    """If the Postgres query raises, we still return the Neo4j-derived
-    lists and mark ``enabled_postgres=false`` with a ``postgres_error``
-    field — the UI can show a banner and render what it has."""
+def test_run_gaps_clean_run_returns_no_gaps(api_client):
+    """A run where every spec has files and passing evals returns
+    empty gap lists."""
+    trace_response = {
+        "run_id": "run-clean",
+        "rows": [
+            {
+                "requirement": {"id": "req-1", "title": "Login", "priority": "high"},
+                "specs": [
+                    {
+                        "id": "spec-1",
+                        "title": "Login spec",
+                        "capability": "auth",
+                        "files": [{"path": "auth.py"}],
+                        "test_files": [{"path": "test_auth.py"}],
+                        "eval_scores": {"correctness": 0.95},
+                        "all_passed": True,
+                    },
+                ],
+                "overall_status": "pass",
+            },
+        ],
+    }
+
     mock_session = MagicMock()
     app.state.neo4j_client.session.return_value.__enter__.return_value = mock_session
     app.state.neo4j_client.session.return_value.__exit__.return_value = False
+    mock_session.run.return_value = []
 
-    _install_neo4j_side_effects(
-        mock_session,
-        unplanned=[],
-        specs=[
-            {
-                "id": "spec-1",
-                "title": "X",
-                "capability": None,
-                "requirement_ids": [],
-            }
-        ],
-        req_count=0,
-    )
-
-    fake_client = MagicMock()
-    fake_client.connection.side_effect = RuntimeError("connection refused")
-    original = app.state.metrics_client
-    app.state.metrics_client = fake_client
-    try:
-        resp = api_client.get("/api/graph/gaps")
-    finally:
-        app.state.metrics_client = original
+    with patch(
+        "dark_factory.api.routes_dashboard.get_traceability",
+        return_value=trace_response,
+    ):
+        resp = api_client.get("/api/graph/gaps/run-clean")
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data["enabled_postgres"] is False
-    assert "connection refused" in data["postgres_error"]
-    # Neo4j-only payload is still present
-    assert data["unplanned_requirements"] == []
+    assert data["specs_without_artifacts"] == []
+    assert data["specs_failing_evals"] == []
+    assert data["unimplemented_requirements"] == []
+    assert data["broken_dependencies"] == []
+    assert data["capability_islands"] == []
+    assert data["missing_episodes"] == []
+
+
+def test_run_gaps_invalid_run_id_rejected(api_client):
+    """Run IDs with special characters are rejected by regex."""
+    resp = api_client.get("/api/graph/gaps/run;drop")
+    assert resp.status_code == 422
+
+
+# ── Requirements Refinery ──────────────────────────────────────────────────────
+
+
+def test_patch_requirement_updates_fields(api_client):
+    """PATCH /api/graph/requirements/{id} merges fields and keeps the ID."""
+    from dark_factory.models.domain import Priority, Requirement
+
+    existing = Requirement(
+        id="req-abc",
+        title="Old Title",
+        description="Old desc",
+        source_file="reqs.md",
+        priority=Priority.MEDIUM,
+        tags=["auth"],
+    )
+    mock_repo = MagicMock()
+    mock_repo.get_requirement.return_value = existing
+    mock_repo.upsert_requirement.return_value = None
+
+    with patch(
+        "dark_factory.graph.repository.GraphRepository",
+        return_value=mock_repo,
+    ):
+        resp = api_client.patch(
+            "/api/graph/requirements/req-abc",
+            json={"title": "New Title", "priority": "high"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["id"] == "req-abc"
+    assert data["title"] == "New Title"
+    assert data["priority"] == "high"
+    # Description and source_file preserved from existing
+    assert data["description"] == "Old desc"
+    assert data["source_file"] == "reqs.md"
+
+
+def test_patch_requirement_not_found(api_client):
+    """PATCH returns 404 for a nonexistent requirement."""
+    mock_repo = MagicMock()
+    mock_repo.get_requirement.return_value = None
+
+    with patch(
+        "dark_factory.graph.repository.GraphRepository",
+        return_value=mock_repo,
+    ):
+        resp = api_client.patch(
+            "/api/graph/requirements/req-nope",
+            json={"title": "Nope"},
+        )
+
+    assert resp.status_code == 404
+
+
+def test_export_requirements_json(api_client):
+    """GET /api/graph/requirements/export returns a JSON array."""
+    from dark_factory.models.domain import Priority, Requirement
+
+    mock_repo = MagicMock()
+    mock_repo.get_all_requirements.return_value = [
+        Requirement(
+            id="req-1",
+            title="Login",
+            description="User can log in",
+            source_file="reqs.md",
+            priority=Priority.HIGH,
+            tags=["auth"],
+        ),
+    ]
+
+    with patch(
+        "dark_factory.graph.repository.GraphRepository",
+        return_value=mock_repo,
+    ):
+        resp = api_client.get("/api/graph/requirements/export")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]["id"] == "req-1"
+    assert data[0]["title"] == "Login"
+
+
+def test_export_refinery_zip(api_client):
+    """POST /api/refinery/export returns a ZIP with report + requirement files."""
+    import io
+    import zipfile
+
+    payload = {
+        "summary": "Refined 2 requirements",
+        "pass_summaries": ["Pass 1 done"],
+        "refined_requirements": [
+            {
+                "id": "req-1",
+                "original_title": "Login",
+                "original_description": "User login",
+                "title": "User Authentication",
+                "description": "Detailed login with MFA",
+                "priority": "high",
+                "tags": ["auth"],
+                "relationships": [
+                    {"target_id": "req-2", "type": "depends_on", "rationale": "needs session"},
+                ],
+                "suggested_specs": [
+                    {
+                        "title": "Login Flow",
+                        "capability": "auth",
+                        "description": "Main login",
+                        "acceptance_criteria": ["user can log in"],
+                    },
+                ],
+                "changes": ["Expanded description"],
+                "pass_context": "Pass 4",
+            },
+            {
+                "id": "req-2",
+                "original_title": "Session",
+                "original_description": "Session mgmt",
+                "title": "Session Management",
+                "description": "Handle user sessions",
+                "priority": "medium",
+                "tags": ["auth"],
+                "relationships": [],
+                "suggested_specs": [],
+                "changes": [],
+                "pass_context": "",
+            },
+        ],
+        "suggested_memories": [],
+        "new_relationships_count": 1,
+        "requirements_modified_count": 2,
+        "requirements_unchanged_count": 0,
+        "source_run_id": "run-test",
+        "methodology": "5-pass analysis",
+        "evidence_summary": "eval failures drove changes",
+        "risk_areas": ["session handling"],
+    }
+
+    resp = api_client.post("/api/refinery/export", json=payload)
+    assert resp.status_code == 200
+    assert "application/zip" in resp.headers.get("content-type", "")
+
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    names = zf.namelist()
+
+    # Report file exists
+    assert "refinery-run-test/REPORT.md" in names
+    report_md = zf.read("refinery-run-test/REPORT.md").decode()
+    assert "# Requirements Refinery Report" in report_md
+    assert "Refined 2 requirements" in report_md
+    assert "5-pass analysis" in report_md
+    assert "session handling" in report_md
+
+    # Individual requirement files (2 requirements = 2 files)
+    assert "refinery-run-test/requirements/req-1.md" in names
+    assert "refinery-run-test/requirements/req-2.md" in names
+
+    req1_md = zf.read("refinery-run-test/requirements/req-1.md").decode()
+    assert "# User Authentication" in req1_md
+    assert "depends_on" in req1_md
+    assert "Login Flow" in req1_md
+
+    req2_md = zf.read("refinery-run-test/requirements/req-2.md").decode()
+    assert "# Session Management" in req2_md
+
+
+# ── Refinery Persistence ───────────────────────────────────────────────────────
+
+
+def test_refinery_history_lists_results(api_client, tmp_path):
+    """GET /api/refinery/history returns saved results."""
+    from dark_factory.storage.backend import get_storage
+
+    storage = get_storage()
+    # Write a fake result
+    metadata = {
+        "id": "refinery-20260418-120000-abcd",
+        "timestamp": "2026-04-18T12:00:00Z",
+        "source_run_id": "run-test",
+        "source_mode": "run",
+        "requirements_count": 5,
+        "requirements_modified": 3,
+        "requirements_unchanged": 2,
+        "relationships_count": 2,
+        "suggested_memories_count": 1,
+        "duration_seconds": 100.0,
+    }
+    import json as _json
+
+    storage.write_text(
+        "refinery/refinery-20260418-120000-abcd/metadata.json",
+        _json.dumps(metadata),
+    )
+
+    resp = api_client.get("/api/refinery/history")
+    assert resp.status_code == 200
+    results = resp.json()["results"]
+    assert any(r["id"] == "refinery-20260418-120000-abcd" for r in results)
+
+    # Cleanup
+    storage.delete_prefix("refinery/refinery-20260418-120000-abcd/")
+
+
+def test_refinery_load_saved_result(api_client):
+    """GET /api/refinery/{result_id} loads a saved response."""
+    from dark_factory.storage.backend import get_storage
+
+    import json as _json
+
+    storage = get_storage()
+    response_data = {
+        "summary": "Test refinement",
+        "refined_requirements": [],
+        "suggested_memories": [],
+    }
+    storage.write_text(
+        "refinery/refinery-20260418-130000-ef01/response.json",
+        _json.dumps(response_data),
+    )
+
+    resp = api_client.get("/api/refinery/refinery-20260418-130000-ef01")
+    assert resp.status_code == 200
+    assert resp.json()["summary"] == "Test refinement"
+
+    # Cleanup
+    storage.delete_prefix("refinery/refinery-20260418-130000-ef01/")
+
+
+def test_refinery_load_nonexistent_returns_404(api_client):
+    resp = api_client.get("/api/refinery/refinery-nonexistent-0000")
+    assert resp.status_code == 404
+
+
+def test_refinery_delete_result(api_client):
+    """DELETE /api/refinery/{result_id} removes from storage."""
+    from dark_factory.storage.backend import get_storage
+
+    import json as _json
+
+    storage = get_storage()
+    storage.write_text(
+        "refinery/refinery-20260418-140000-9999/metadata.json",
+        _json.dumps({"id": "refinery-20260418-140000-9999"}),
+    )
+
+    resp = api_client.delete("/api/refinery/refinery-20260418-140000-9999")
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == "refinery-20260418-140000-9999"
+
+    # Verify it's gone
+    assert storage.list_keys("refinery/refinery-20260418-140000-9999/") == []
+
+
+# ── Memory Dedup Check ────────────────────────────────────────────────────────
+
+
+def test_memory_check_duplicate_returns_valid_shape(api_client):
+    """POST /api/memory/check-duplicate returns the expected response shape."""
+    resp = api_client.post(
+        "/api/memory/check-duplicate",
+        json={
+            "type": "strategy",
+            "description": "xyzzy_unique_test_string_42_" + str(id(api_client)),
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    # Should have all expected keys regardless of match/no-match
+    assert "is_duplicate" in data
+    assert "existing_id" in data
+    assert "existing_description" in data
+    assert "similarity" in data
 
 
 # ── Run History ───────────────────────────────────────────────────────────────

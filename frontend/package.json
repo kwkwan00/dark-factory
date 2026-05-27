@@ -11,7 +11,9 @@
     "copy-dist": "node -e \"const fs=require('fs');fs.cpSync('dist','../src/dark_factory/api/static',{recursive:true})\""
   },
   "dependencies": {
+    "@react-pdf/renderer": "^4.5.1",
     "@xyflow/react": "^12.10.2",
+    "html-to-image": "^1.11.13",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "recharts": "^2.12.7"

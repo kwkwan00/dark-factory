@@ -10,55 +10,6 @@ import structlog
 
 log = structlog.get_logger()
 
-
-def _record_claude_code_call(
-    *,
-    model: str,
-    started_at: float,
-    prompt_chars: int | None = None,
-    system_prompt_chars: int | None = None,
-    completion_chars: int | None = None,
-    error: str | None = None,
-) -> None:
-    """Best-effort write to BOTH Prometheus and the Postgres recorder.
-
-    The Claude Agent SDK doesn't surface token usage cleanly from the Python
-    query() helper, so this records latency/chars/error only. Cost can't be
-    computed without token counts — the cost_usd column will be NULL for
-    claude_code calls until the SDK adds structured usage to its messages.
-    """
-    latency_seconds = time.time() - started_at
-
-    try:
-        from dark_factory.metrics.prometheus import observe_llm_call
-
-        observe_llm_call(
-            client="claude_code",
-            model=model,
-            latency_seconds=latency_seconds,
-            error=error,
-        )
-    except Exception:  # pragma: no cover
-        pass
-
-    try:
-        from dark_factory.agents import tools as _tools_mod
-
-        recorder = _tools_mod._metrics_recorder
-        if recorder is None:
-            return
-        recorder.record_llm_call(
-            client="claude_code",
-            model=model,
-            prompt_chars=prompt_chars,
-            system_prompt_chars=system_prompt_chars,
-            completion_chars=completion_chars,
-            latency_seconds=latency_seconds,
-            error=error,
-        )
-    except Exception:  # pragma: no cover
-        pass
-
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -69,11 +20,14 @@ from claude_agent_sdk import (
 from pydantic import BaseModel
 
 from dark_factory.agents.background_loop import BackgroundLoop
+from dark_factory.llm.anthropic import _record_llm_call
 from dark_factory.llm.base import LLMClient
+from dark_factory.log import trace_methods
 
 T = TypeVar("T", bound=BaseModel)
 
 
+@trace_methods
 class ClaudeAgentClient(LLMClient):
     """LLM client that delegates to the Claude Agent SDK."""
 
@@ -118,7 +72,8 @@ class ClaudeAgentClient(LLMClient):
                 timeout=effective_timeout,
             )
         except Exception as exc:
-            _record_claude_code_call(
+            _record_llm_call(
+                client="claude_code",
                 model=self.model or "claude-code-default",
                 started_at=started_at,
                 prompt_chars=len(prompt),
@@ -126,7 +81,8 @@ class ClaudeAgentClient(LLMClient):
                 error=str(exc),
             )
             raise
-        _record_claude_code_call(
+        _record_llm_call(
+            client="claude_code",
             model=self.model or "claude-code-default",
             started_at=started_at,
             prompt_chars=len(prompt),

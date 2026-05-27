@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import tomllib
@@ -20,6 +21,12 @@ class Neo4jConfig(BaseModel):
     user: str = Field(default="neo4j")
     # L14 fix: SecretStr so password isn't accidentally logged via model_dump
     password: SecretStr = Field(default=SecretStr(""))
+    # Connection-level timeouts (seconds). connection_timeout is the TCP
+    # handshake / TLS deadline; connection_acquisition_timeout is how long
+    # to wait for a slot in the driver's connection pool.
+    connection_timeout: int = Field(default=30, ge=5, le=120)
+    connection_acquisition_timeout: int = Field(default=60, ge=10, le=300)
+    max_connection_pool_size: int = Field(default=50, ge=5, le=200)
 
 
 class LLMConfig(BaseModel):
@@ -42,9 +49,9 @@ class ModelRoutingConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
 
     # Swarm agents
-    planner: str | None = None
+    planner: str | None = "claude-opus-4-6"
     coder: str | None = None
-    reviewer: str | None = None
+    reviewer: str | None = "claude-opus-4-6"
     tester: str | None = None
 
     # Deep agents (direct API calls)
@@ -52,7 +59,7 @@ class ModelRoutingConfig(BaseModel):
     deep_codegen: str | None = None    # Category B: file-creating tools
 
     # Pipeline stages (non-swarm)
-    spec: str | None = None
+    spec: str | None = "claude-opus-4-6"
     ingest: str | None = None
 
     def resolve(self, role: str, fallback: str) -> str:
@@ -83,6 +90,10 @@ class PipelineConfig(BaseModel):
     # architect/critic loop independently. Produces more granular specs
     # that downstream swarm workers can implement in isolation.
     enable_spec_decomposition: bool = True
+    # Post-generation reconciliation: validate requirement coverage,
+    # fix cross-spec dependencies, detect cycles, and strip phantom
+    # references before committing to the knowledge graph.
+    enable_spec_reconciliation: bool = True
     max_specs_per_requirement: int = Field(default=12, ge=1, le=32)
     # Preflight skip: when True, the spec stage queries Neo4j for any
     # target spec ids that already exist and short-circuits the swarm
@@ -92,7 +103,7 @@ class PipelineConfig(BaseModel):
     # from Neo4j and passed through to downstream stages unchanged.
     # Turn off via the Settings tab or ``REUSE_EXISTING_SPECS=0`` for a
     # forced full regeneration.
-    reuse_existing_specs: bool = True
+    reuse_existing_specs: bool = False
 
     # Reconciliation phase: always runs AFTER every feature swarm
     # completes (assuming the swarms actually produced output — the
@@ -146,7 +157,6 @@ class PipelineConfig(BaseModel):
     # Docker image bundles chromium + firefox + webkit binaries so
     # the default browser matrix ships fully functional.
     enable_e2e_validation: bool = True
-    max_e2e_turns: int = Field(default=40, ge=1, le=500)
     e2e_timeout_seconds: int = Field(default=1200, ge=60, le=7200)
     e2e_browsers: list[str] = Field(
         default_factory=lambda: ["chromium", "firefox", "webkit"]
@@ -173,6 +183,143 @@ class PipelineConfig(BaseModel):
     # new node on every record_* call, matching pre-Tier-A behaviour).
     memory_dedup_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
 
+    # Requirements Refinery: model, reasoning effort, turn budget, and
+    # timeout for the deep agent that performs multi-pass analysis.
+    refinery_model: str = "gpt-5.4"
+    refinery_reasoning_effort: str = "xhigh"
+    refinery_max_turns: int = Field(default=40, ge=5, le=100)
+    refinery_timeout_seconds: int = Field(default=900, ge=60, le=3600)
+
+    # ────────────────────────────────────────────────────────────
+    # Adversarial Refinery — Parnas modules + LangGraph debate.
+    # The per-requirement debate at ``refinery/debate/graph.py`` is
+    # the only refinery path; the legacy single-agent flow has been
+    # removed.
+    # ────────────────────────────────────────────────────────────
+
+    # Debate structure
+    refinery_debate_max_rounds: int = Field(default=3, ge=1, le=8)
+    refinery_debate_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    refinery_research_cap: int = Field(default=1, ge=0, le=3)
+    refinery_escalation_cap: int = Field(default=1, ge=0, le=3)
+    refinery_model_strong: str | None = None  # escalation-tier model; falls back to base_model
+
+    # Role overrides
+    refinery_roles_enabled: list[str] = Field(
+        default_factory=lambda: [
+            "product", "engineering", "security",
+            "operations", "cost", "judge",
+        ]
+    )
+    refinery_role_models: dict[str, str] = Field(default_factory=dict)
+    refinery_role_reasoning_effort: dict[str, str] = Field(default_factory=dict)
+    refinery_role_filter_overrides: dict[str, dict] = Field(default_factory=dict)
+
+    # Context / retrieval
+    refinery_context_vector_limit: int = Field(default=12, ge=1, le=50)
+    refinery_context_bm25_limit: int = Field(default=10, ge=1, le=50)
+    refinery_context_graph_weight: float = Field(default=1.5, ge=0.5, le=5.0)
+    refinery_context_cache_size: int = Field(default=256, ge=16, le=4096)
+
+    # Judge — semantic (DeepEval)
+    refinery_judge_thresholds: dict[str, float] = Field(
+        default_factory=lambda: {
+            "clarity": 0.7, "testability": 0.7, "feasibility": 0.7,
+            "completeness": 0.7, "risk_coverage": 0.7,
+            "reversibility": 0.7,
+        }
+    )
+    refinery_judge_overall_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+    refinery_judge_aggregation: str = "min"  # "min" | "mean" | "weighted"
+    refinery_judge_timeout_seconds: int = Field(default=120, ge=10, le=600)
+    refinery_judge_fallback_enabled: bool = True
+
+    # Multi-pass set-level Judge — caps how many critique-and-ratify
+    # rounds the cross-set review runs. Default 1 = single-shot
+    # (equivalent to the original cross-set review behaviour); ramping
+    # up is opt-in once operators have confidence in the loop.
+    refinery_set_review_max_rounds: int = Field(default=1, ge=1, le=5)
+
+    # Judge — rules gate (fused with LLM into one combined pipeline)
+    refinery_rules_enabled: bool = True
+    refinery_rules_disabled: list[str] = Field(default_factory=list)
+    refinery_rules_extra_modules: list[str] = Field(default_factory=list)
+    refinery_rules_inject_as_critique: bool = True
+    refinery_rules_dimension_overrides: dict[str, str] = Field(default_factory=dict)
+    refinery_rules_short_circuit_llm: bool = False
+    refinery_rules_short_circuit_threshold: int = Field(default=3, ge=1, le=20)
+    refinery_rules_penalty_blocker_cap: float = Field(default=0.5, ge=0.0, le=1.0)
+    refinery_rules_penalty_warning_delta: float = Field(default=0.1, ge=0.0, le=1.0)
+
+    # Research agent (layered sourcing)
+    refinery_research_enabled_tiers: list[int] = Field(
+        default_factory=lambda: [0, 1, 2, 3, 4, 5]
+    )
+    refinery_research_tier_budgets: dict[int, int] = Field(
+        default_factory=lambda: {0: 8, 1: 6, 2: 4, 3: 4, 4: 2, 5: 6}
+    )
+    refinery_research_internal_sufficient_threshold: float = Field(
+        default=0.75, ge=0.0, le=1.0
+    )
+    refinery_research_editor_min_confidence: float = Field(
+        default=0.55, ge=0.0, le=1.0
+    )
+    refinery_research_tier_trust_weights: dict[int, float] = Field(
+        default_factory=lambda: {0: 1.0, 1: 0.95, 2: 0.90, 3: 0.80, 4: 0.60, 5: 0.30}
+    )
+    refinery_research_official_url_allowlist: list[str] = Field(
+        default_factory=lambda: [
+            "docs.aws.amazon.com", "learn.microsoft.com",
+            "cloud.google.com", "docs.anthropic.com",
+            "platform.openai.com", "fastapi.tiangolo.com",
+            "qdrant.tech", "neo4j.com",
+        ]
+    )
+    refinery_research_max_sources_per_call: int = Field(default=20, ge=1, le=100)
+
+    # Institutional memory
+    refinery_memory_kinds_enabled: list[str] = Field(
+        default_factory=lambda: [
+            "decision", "incident", "pattern", "constraint", "conflict",
+        ]
+    )
+    refinery_conflict_emit_threshold: float = Field(default=0.4, ge=0.0, le=5.0)
+    refinery_decision_emit_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
+    refinery_pattern_emit_generality: float = Field(default=0.6, ge=0.0, le=1.0)
+    refinery_memory_dedup_by_kind: bool = True
+    refinery_auto_save_on_apply: bool = True
+
+    # Observability
+    refinery_disagreement_escalate_threshold: float = Field(
+        default=0.5, ge=0.0, le=5.0
+    )
+    refinery_langsmith_enabled: bool | None = None  # env-driven when None
+    refinery_postgres_forensics_enabled: bool = True
+    refinery_prometheus_metrics_enabled: bool = True
+
+    # Swarm memory recall scoping — Phase 9 sneaky-touchpoint mitigation.
+    # Today the swarm's ``MemoryRepository.search_memories`` returns all
+    # memory kinds; once the refinery starts writing Decision/Constraint/
+    # Conflict kinds to the same Qdrant collection, swarm agents would
+    # see them unless explicitly scoped. Default preserves today's
+    # behaviour by scoping to the 4 legacy kinds. Flip to include the
+    # new kinds once validated.
+    swarm_memory_kinds_enabled: list[str] = Field(
+        default_factory=lambda: ["pattern", "mistake", "solution", "strategy"]
+    )
+
+    # Wall-clock timeouts (seconds) for each pipeline stage. These are
+    # enforced via asyncio.wait_for() in ag_ui_bridge and via elapsed-time
+    # checks in the LangGraph stream loop so a hung LLM call or blocked
+    # DB write cannot stall the pipeline indefinitely.
+    ingest_timeout_seconds: int = Field(default=300, ge=30, le=3600)
+    spec_timeout_seconds: int = Field(default=3600, ge=60, le=7200)
+    spec_recon_timeout_seconds: int = Field(default=1200, ge=30, le=1800)
+    graph_timeout_seconds: int = Field(default=120, ge=10, le=600)
+    # Per-feature swarm wall-clock timeout. Checked on every LangGraph
+    # chunk so it fires even if the LLM is mid-call.
+    swarm_feature_timeout_seconds: int = Field(default=3600, ge=60, le=7200)
+
     # Max output tokens for every LLM call the swarm makes. LangChain's
     # default ChatAnthropic max_tokens is 1024 — far too small to hold
     # a ``write_file`` tool call for a real dashboard or multi-hundred-
@@ -191,6 +338,11 @@ class PipelineConfig(BaseModel):
 class LoggingConfig(BaseModel):
     level: str = "INFO"
     format: str = "console"
+    # When true, classes decorated with ``@trace_methods`` emit
+    # ``call_entry`` / ``call_exit`` DEBUG events for every public
+    # method (with arg *shape*, never values). Off by default;
+    # ``DARK_FACTORY_LOG_TRACE=1`` is the env-var shorthand.
+    trace_calls: bool = False
 
 
 class OpenSpecConfig(BaseModel):
@@ -233,8 +385,12 @@ class EvaluationConfig(BaseModel):
     base_threshold: float = 0.5
     adaptive: bool = True
     decay_factor: float = 0.95
+    # Days since last boost/demote before decay applies. Memories that
+    # received feedback within this window keep their score — only
+    # stale memories decay.
+    decay_grace_days: int = 7
     boost_delta: float = 0.1
-    demote_delta: float = 0.05
+    demote_delta: float = 0.1
     trend_window: int = 5
     threshold_min: float = 0.3
     threshold_max: float = 0.9
@@ -323,6 +479,15 @@ def _env_float(name: str) -> float | None:
         return None
 
 
+def _env_bool(name: str) -> bool | None:
+    """Parse a boolean env var, returning None if unset."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+@functools.lru_cache(maxsize=1)
 def load_settings(config_path: Path | None = None) -> Settings:
     """Load settings from config.toml, then overlay environment variables."""
     data: dict = {}
@@ -355,20 +520,16 @@ def load_settings(config_path: Path | None = None) -> Settings:
         settings.qdrant.api_key = SecretStr(qdrant_api_key)
 
     # Postgres metrics store — disabled unless explicitly enabled
-    if (pg_enabled := os.getenv("POSTGRES_ENABLED")) is not None:
-        settings.postgres.enabled = pg_enabled.strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+    if (pg_enabled := _env_bool("POSTGRES_ENABLED")) is not None:
+        settings.postgres.enabled = pg_enabled
     if pg_url := os.getenv("POSTGRES_URL"):
         settings.postgres.url = pg_url
     if pg_password := os.getenv("POSTGRES_PASSWORD"):
         settings.postgres.password = SecretStr(pg_password)
 
     # Prometheus admin endpoint — only used by the clear-all flow
-    if (prom_enabled := os.getenv("PROMETHEUS_ENABLED")) is not None:
-        settings.prometheus.enabled = prom_enabled.strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+    if (prom_enabled := _env_bool("PROMETHEUS_ENABLED")) is not None:
+        settings.prometheus.enabled = prom_enabled
     if prom_url := os.getenv("PROMETHEUS_URL"):
         settings.prometheus.url = prom_url
 
@@ -389,16 +550,14 @@ def load_settings(config_path: Path | None = None) -> Settings:
         settings.pipeline.spec_eval_threshold = val
     if output_dir := os.getenv("OUTPUT_DIR"):
         settings.pipeline.output_dir = output_dir
-    if (decomp_raw := os.getenv("ENABLE_SPEC_DECOMPOSITION")) is not None:
-        settings.pipeline.enable_spec_decomposition = decomp_raw.strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+    if (decomp_val := _env_bool("ENABLE_SPEC_DECOMPOSITION")) is not None:
+        settings.pipeline.enable_spec_decomposition = decomp_val
+    if (recon_val := _env_bool("ENABLE_SPEC_RECONCILIATION")) is not None:
+        settings.pipeline.enable_spec_reconciliation = recon_val
     if (val := _env_int("MAX_SPECS_PER_REQUIREMENT")) is not None:
         settings.pipeline.max_specs_per_requirement = val
-    if (reuse_raw := os.getenv("REUSE_EXISTING_SPECS")) is not None:
-        settings.pipeline.reuse_existing_specs = reuse_raw.strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+    if (reuse_val := _env_bool("REUSE_EXISTING_SPECS")) is not None:
+        settings.pipeline.reuse_existing_specs = reuse_val
 
     # Reconciliation phase overrides
     if (val := _env_int("MAX_RECONCILIATION_TURNS")) is not None:
@@ -415,10 +574,8 @@ def load_settings(config_path: Path | None = None) -> Settings:
         settings.pipeline.requirement_dedup_threshold = val
 
     # Episodic memory toggle
-    if (episodic_raw := os.getenv("ENABLE_EPISODIC_MEMORY")) is not None:
-        settings.pipeline.enable_episodic_memory = episodic_raw.strip().lower() in (
-            "1", "true", "yes", "on",
-        )
+    if (episodic_val := _env_bool("ENABLE_EPISODIC_MEMORY")) is not None:
+        settings.pipeline.enable_episodic_memory = episodic_val
 
     # Memory write-time dedup threshold
     if (val := _env_float("MEMORY_DEDUP_THRESHOLD")) is not None:
@@ -429,12 +586,8 @@ def load_settings(config_path: Path | None = None) -> Settings:
         settings.pipeline.max_llm_tokens = val
 
     # E2E validation (Phase 6) overrides
-    if (e2e_enabled := os.getenv("ENABLE_E2E_VALIDATION")) is not None:
-        settings.pipeline.enable_e2e_validation = e2e_enabled.strip().lower() in (
-            "1", "true", "yes", "on",
-        )
-    if (val := _env_int("MAX_E2E_TURNS")) is not None:
-        settings.pipeline.max_e2e_turns = val
+    if (e2e_val := _env_bool("ENABLE_E2E_VALIDATION")) is not None:
+        settings.pipeline.enable_e2e_validation = e2e_val
     if (val := _env_int("E2E_TIMEOUT_SECONDS")) is not None:
         settings.pipeline.e2e_timeout_seconds = val
     if e2e_browsers_raw := os.getenv("E2E_BROWSERS"):
@@ -504,3 +657,9 @@ def load_settings(config_path: Path | None = None) -> Settings:
     )
 
     return settings
+
+
+def reload_settings(config_path: Path | None = None) -> Settings:
+    """Clear the settings cache and reload from disk + env vars."""
+    load_settings.cache_clear()
+    return load_settings(config_path)

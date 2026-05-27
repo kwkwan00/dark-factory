@@ -96,7 +96,11 @@ async def lifespan(app: FastAPI):
     from dark_factory.log import setup_logging
 
     settings = load_settings()
-    setup_logging(level=settings.logging.level, fmt=settings.logging.format)
+    setup_logging(
+        level=settings.logging.level,
+        fmt=settings.logging.format,
+        trace_calls=settings.logging.trace_calls,
+    )
     app.state.settings = settings
 
     # Storage backend (local or S3) — used by routes_runs file explorer
@@ -161,6 +165,9 @@ async def lifespan(app: FastAPI):
             database=settings.memory.database,
             user=settings.neo4j.user,
             password=settings.neo4j.password,
+            connection_timeout=settings.neo4j.connection_timeout,
+            connection_acquisition_timeout=settings.neo4j.connection_acquisition_timeout,
+            max_connection_pool_size=settings.neo4j.max_connection_pool_size,
         )
         memory_client = Neo4jClient(mem_config)
         init_memory_schema(memory_client)

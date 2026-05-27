@@ -162,12 +162,14 @@ def _stream_with_mocks(minimal_settings, **kwargs):
         patch("dark_factory.graph.repository.GraphRepository"),
         patch("dark_factory.stages.ingest.IngestStage") as ingest_cls,
         patch("dark_factory.stages.spec.SpecStage") as spec_cls,
+        patch("dark_factory.stages.spec_reconciliation.SpecReconciliationStage") as spec_recon_cls,
         patch("dark_factory.stages.graph.GraphStage") as graph_cls,
         patch("dark_factory.agents.orchestrator.run_orchestrator", return_value=result),
         patch("dark_factory.ui.helpers.build_llm"),
     ):
         ingest_cls.return_value.run.return_value = ctx
         spec_cls.return_value.run.return_value = ctx
+        spec_recon_cls.return_value.run.return_value = ctx
         graph_cls.return_value.run.return_value = ctx
 
         return collect_stream(
@@ -227,8 +229,8 @@ def test_stream_step_names_match_phases(minimal_settings):
         for c in chunks
         if event_type(c) == "STEP_STARTED"
     ]
-    # Core 4 phases always present; Reconciliation also runs now that run_id is always set
-    assert step_names[:4] == ["Ingest", "Spec Generation", "Knowledge Graph", "Swarm Orchestrator"]
+    # Core phases always present; Spec Reconciliation runs between Spec Generation and Knowledge Graph
+    assert step_names[:5] == ["Ingest", "Spec Generation", "Spec Reconciliation", "Knowledge Graph", "Swarm Orchestrator"]
 
 
 def test_stream_run_id_in_started_and_finished(minimal_settings):
@@ -545,6 +547,56 @@ def test_stream_reconciliation_crash_does_not_fail_run(minimal_settings):
     # Run still finished cleanly — no RUN_ERROR
     assert types[-1] == "RUN_FINISHED"
     assert "RUN_ERROR" not in types
+
+
+def test_stream_reconciliation_crash_emits_phase_error(minimal_settings):
+    """A reconciliation crash must emit a phase_error progress event
+    so the Agent Logs tab shows what happened."""
+    ctx = _mock_context()
+    result = _mock_result()
+    emitted: list[dict] = []
+
+    def _capture_emit(event, **data):
+        emitted.append({"event": event, **data})
+
+    def _crashing_run(self, **kwargs):
+        raise RuntimeError("neo4j gone")
+
+    fake_memory_repo = MagicMock()
+    fake_memory_repo.create_run.return_value = "run-recon-err"
+
+    with (
+        patch("dark_factory.graph.client.Neo4jClient"),
+        patch("dark_factory.graph.repository.GraphRepository"),
+        patch("dark_factory.stages.ingest.IngestStage") as ingest_cls,
+        patch("dark_factory.stages.spec.SpecStage") as spec_cls,
+        patch("dark_factory.stages.graph.GraphStage") as graph_cls,
+        patch(
+            "dark_factory.agents.orchestrator.run_orchestrator",
+            return_value=result,
+        ),
+        patch(
+            "dark_factory.stages.reconciliation.ReconciliationStage.run",
+            new=_crashing_run,
+        ),
+        patch("dark_factory.ui.helpers.build_llm"),
+        patch("dark_factory.agents.tools.emit_progress", side_effect=_capture_emit),
+    ):
+        ingest_cls.return_value.run.return_value = ctx
+        spec_cls.return_value.run.return_value = ctx
+        graph_cls.return_value.run.return_value = ctx
+
+        collect_stream(
+            run_pipeline_stream(
+                minimal_settings, "./test", "t-1", "r-1",
+                memory_repo=fake_memory_repo,
+            )
+        )
+
+    phase_errors = [e for e in emitted if e["event"] == "phase_error"]
+    assert len(phase_errors) == 1
+    assert phase_errors[0]["phase"] == "reconciliation"
+    assert "neo4j gone" in phase_errors[0]["error"]
 
 
 # ── Phase 6: E2E Validation ───────────────────────────────────────────────────
@@ -875,6 +927,72 @@ def test_stream_e2e_crash_does_not_fail_run(minimal_settings):
     assert "RUN_ERROR" not in types
 
 
+def test_stream_e2e_crash_emits_phase_error(minimal_settings):
+    """An E2E crash must emit a phase_error progress event."""
+    ctx = _mock_context()
+    result = _mock_result()
+    emitted: list[dict] = []
+
+    def _capture_emit(event, **data):
+        emitted.append({"event": event, **data})
+
+    def _fake_recon(self, **kwargs):
+        from dark_factory.stages.reconciliation import ReconciliationResult
+
+        return ReconciliationResult(
+            status="clean",
+            summary="ok",
+            agent_output="",
+            report_path=None,
+            duration_seconds=1.0,
+        )
+
+    def _crashing_e2e(self, **kwargs):
+        raise RuntimeError("browser missing")
+
+    fake_memory_repo = MagicMock()
+    fake_memory_repo.create_run.return_value = "run-e2e-err"
+
+    minimal_settings.pipeline.enable_e2e_validation = True
+
+    with (
+        patch("dark_factory.graph.client.Neo4jClient"),
+        patch("dark_factory.graph.repository.GraphRepository"),
+        patch("dark_factory.stages.ingest.IngestStage") as ingest_cls,
+        patch("dark_factory.stages.spec.SpecStage") as spec_cls,
+        patch("dark_factory.stages.graph.GraphStage") as graph_cls,
+        patch(
+            "dark_factory.agents.orchestrator.run_orchestrator",
+            return_value=result,
+        ),
+        patch(
+            "dark_factory.stages.reconciliation.ReconciliationStage.run",
+            new=_fake_recon,
+        ),
+        patch(
+            "dark_factory.stages.e2e_validation.E2EValidationStage.run",
+            new=_crashing_e2e,
+        ),
+        patch("dark_factory.ui.helpers.build_llm"),
+        patch("dark_factory.agents.tools.emit_progress", side_effect=_capture_emit),
+    ):
+        ingest_cls.return_value.run.return_value = ctx
+        spec_cls.return_value.run.return_value = ctx
+        graph_cls.return_value.run.return_value = ctx
+
+        collect_stream(
+            run_pipeline_stream(
+                minimal_settings, "./test", "t-1", "r-1",
+                memory_repo=fake_memory_repo,
+            )
+        )
+
+    phase_errors = [e for e in emitted if e["event"] == "phase_error"]
+    assert len(phase_errors) == 1
+    assert phase_errors[0]["phase"] == "e2e_validation"
+    assert "browser missing" in phase_errors[0]["error"]
+
+
 # ── Error handling ────────────────────────────────────────────────────────────
 
 
@@ -899,6 +1017,57 @@ def test_stream_emits_run_error_on_exception(minimal_settings):
     error_chunk = next(c for c in chunks if event_type(c) == "RUN_ERROR")
     payload = parse_event(error_chunk)
     assert "ingest failed" in payload.get("message", "")
+
+
+def test_stream_timeout_error_has_meaningful_message(minimal_settings):
+    """asyncio.TimeoutError has an empty str() — the bridge must synthesise
+    a useful error message that includes the current phase."""
+    with (
+        patch("dark_factory.graph.client.Neo4jClient"),
+        patch("dark_factory.graph.repository.GraphRepository"),
+        patch("dark_factory.stages.ingest.IngestStage") as ingest_cls,
+        patch("dark_factory.ui.helpers.build_llm"),
+    ):
+        ingest_cls.return_value.run.side_effect = asyncio.TimeoutError()
+
+        chunks = collect_stream(
+            run_pipeline_stream(minimal_settings, "./req.md", "t-1", "r-1")
+        )
+
+    error_chunk = next(c for c in chunks if event_type(c) == "RUN_ERROR")
+    payload = parse_event(error_chunk)
+    msg = payload.get("message", "")
+    # Must NOT be empty (the bug we're fixing)
+    assert msg != ""
+    assert "timed out" in msg.lower()
+    assert "ingest" in msg.lower()
+
+
+def test_stream_error_emits_progress_event(minimal_settings):
+    """The error handler must publish a 'pipeline_error' event to the
+    progress broker so the Agent Logs tab can show the failure."""
+    emitted: list[dict] = []
+
+    def _capture_emit(event, **data):
+        emitted.append({"event": event, **data})
+
+    with (
+        patch("dark_factory.graph.client.Neo4jClient"),
+        patch("dark_factory.graph.repository.GraphRepository"),
+        patch("dark_factory.stages.ingest.IngestStage") as ingest_cls,
+        patch("dark_factory.ui.helpers.build_llm"),
+        patch("dark_factory.agents.tools.emit_progress", side_effect=_capture_emit),
+    ):
+        ingest_cls.return_value.run.side_effect = RuntimeError("db down")
+
+        collect_stream(
+            run_pipeline_stream(minimal_settings, "./req.md", "t-1", "r-1")
+        )
+
+    error_events = [e for e in emitted if e["event"] == "pipeline_error"]
+    assert len(error_events) == 1
+    assert "db down" in error_events[0]["error"]
+    assert error_events[0]["phase"] == "ingest"
 
 
 # ── Agent endpoint (HTTP) ─────────────────────────────────────────────────────

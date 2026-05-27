@@ -6,10 +6,12 @@ import structlog
 from neo4j import GraphDatabase, Session
 
 from dark_factory.config import Neo4jConfig
+from dark_factory.log import trace_methods
 
 log = structlog.get_logger()
 
 
+@trace_methods
 class Neo4jClient:
     """Manages the Neo4j driver lifecycle."""
 
@@ -20,6 +22,10 @@ class Neo4jClient:
         self._driver = GraphDatabase.driver(
             config.uri,
             auth=(config.user, password),
+            connection_timeout=config.connection_timeout,
+            connection_acquisition_timeout=config.connection_acquisition_timeout,
+            max_connection_pool_size=config.max_connection_pool_size,
+            max_connection_lifetime=3600,  # recycle connections after 1 hour
         )
         log.info("neo4j_client_created", uri=config.uri, database=config.database)
 

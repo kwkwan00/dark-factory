@@ -33,7 +33,12 @@ function useFetch<T>(
     abortRef.current = ctrl;
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
 
-    setState({ status: "loading" });
+    // Only show the "loading" state on the very first load.
+    // Subsequent refreshes (polling) keep the previous data visible
+    // to avoid flashing "Loading..." and resetting child component state.
+    setState((prev) =>
+      prev.status === "idle" ? { status: "loading" } : prev,
+    );
     try {
       const data = await fetcherRef.current();
       if (mountedRef.current && !ctrl.signal.aborted) {
@@ -42,10 +47,12 @@ function useFetch<T>(
     } catch (e) {
       if (ctrl.signal.aborted) return; // timed out or superseded — ignore
       if (mountedRef.current) {
-        setState({
-          status: "error",
-          error: e instanceof Error ? e.message : String(e),
-        });
+        // On refresh errors, keep the previous data if we had some
+        setState((prev) =>
+          prev.status === "done"
+            ? prev  // keep stale data visible rather than flashing error
+            : { status: "error", error: e instanceof Error ? e.message : String(e) },
+        );
       }
     } finally {
       clearTimeout(timer);
@@ -54,14 +61,6 @@ function useFetch<T>(
   }, deps);
 
   return { state, load };
-}
-
-export function useGraphGaps(staleDays = 7) {
-  const { state, load } = useFetch(() => api.graphGaps(staleDays), [staleDays]);
-  useEffect(() => {
-    void load();
-  }, [load]);
-  return { state, refresh: load };
 }
 
 export function useHistory(limit = 20) {

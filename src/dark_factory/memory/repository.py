@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -10,6 +11,7 @@ from uuid import uuid4
 import structlog
 
 from dark_factory.graph.client import Neo4jClient
+from dark_factory.log import trace_methods
 
 if TYPE_CHECKING:
     from dark_factory.vector.repository import VectorRepository
@@ -22,14 +24,36 @@ log = structlog.get_logger()
 # boost/demote cypher dispatch). The two namespaces are different
 # by convention — ``memory_type`` is lowercase and plural-friendly,
 # ``label`` is the Neo4j PascalCase node label.
-_MEMORY_TYPE_TO_LABEL: dict[str, str] = {
+MEMORY_KIND_TO_LABEL: dict[str, str] = {
+    # Swarm-produced kinds.
     "pattern": "Pattern",
     "mistake": "Mistake",
     "solution": "Solution",
     "strategy": "Strategy",
+    # Refinery institutional-memory kinds. Live alongside the swarm
+    # kinds in the same collection; role-filter policies scope each
+    # role's recall so refinery kinds don't leak to swarm callers by
+    # default (see swarm_memory_kinds_enabled config).
+    "decision": "Decision",
+    "constraint": "Constraint",
+    "conflict": "Conflict",
+    "incident": "Mistake",  # alias — refinery "incident" re-uses :Mistake label
+    "hypothesis": "Hypothesis",
+    "anti_pattern": "AntiPattern",
 }
 
+# Backward-compat alias for module-internal callers; new code should
+# import MEMORY_KIND_TO_LABEL from this module directly.
+_MEMORY_TYPE_TO_LABEL = MEMORY_KIND_TO_LABEL
 
+
+_RELEVANCE_LOCK_COUNT = 64
+"""Hash-bucket count for the per-node relevance write lock pool. 64 is
+enough that contention is rare with ~5 concurrent debates × 4 critic
+roles, while keeping the per-process lock count bounded at startup."""
+
+
+@trace_methods
 class MemoryRepository:
     """Read/write procedural memories (patterns, mistakes, solutions, strategies)."""
 
@@ -52,11 +76,31 @@ class MemoryRepository:
             vector_repo=vector_repo,
             threshold=dedup_threshold,
         )
+        # Track which memories were already dedup-boosted in this run
+        # so the same memory isn't boosted N times when N features
+        # independently rediscover it.
+        self._dedup_boosted_this_run: set[str] = set()
+
+        # Per-node serialisation for boost/demote. Neo4j's
+        # ``execute_write`` already serialises within Neo4j, but the
+        # post-commit Qdrant payload sync runs OUTSIDE that lock — so
+        # concurrent boost+demote on the same node could land Qdrant
+        # writes out of order, leaving Neo4j and Qdrant at different
+        # scores. Bucketing node ids into a small fixed lock pool
+        # keeps that critical section serialised across both stores
+        # without unbounded lock-dict growth.
+        self._relevance_lock_pool: list[threading.Lock] = [
+            threading.Lock() for _ in range(_RELEVANCE_LOCK_COUNT)
+        ]
 
     def set_dedup_threshold(self, threshold: float) -> None:
         """Live-update the dedup threshold. Called by the Settings
         PATCH handler so operators can tune dedup without a restart."""
         self.dedup_helper.threshold = max(0.0, min(1.0, threshold))
+
+    def reset_run_state(self) -> None:
+        """Clear per-run tracking. Call at the start of each pipeline run."""
+        self._dedup_boosted_this_run.clear()
 
     def _try_dedup_and_boost(
         self,
@@ -65,6 +109,7 @@ class MemoryRepository:
         query_text: str,
         source_feature: str,
         boost_delta: float = 0.05,
+        match_cross_feature: bool = False,
     ) -> str | None:
         """Run the dedup check for a candidate memory.
 
@@ -82,6 +127,7 @@ class MemoryRepository:
             memory_type=memory_type,
             query_text=query_text,
             source_feature=source_feature,
+            match_cross_feature=match_cross_feature,
         )
         if match is None:
             return None
@@ -90,13 +136,12 @@ class MemoryRepository:
         if not matched_id:
             return None
 
-        # Boost the existing memory's relevance + bump its
-        # times_applied counter so frequently-rediscovered memories
-        # earn their weight faster. Tolerate boost failures — a
-        # transient Neo4j hiccup shouldn't cause us to create a
-        # duplicate instead.
+        # Boost once per run per memory. Without this cap, N features
+        # rediscovering the same pattern would boost it N times (+N*delta)
+        # in a single run with no eval evidence.
         label = _MEMORY_TYPE_TO_LABEL.get(memory_type)
-        if label is not None:
+        if label is not None and matched_id not in self._dedup_boosted_this_run:
+            self._dedup_boosted_this_run.add(matched_id)
             try:
                 self.boost_relevance(matched_id, label, delta=boost_delta)
             except Exception as exc:  # pragma: no cover — defensive
@@ -121,9 +166,28 @@ class MemoryRepository:
 
         return matched_id
 
+    def _emit_create_metrics(
+        self, memory_type: str, node_id: str, source_feature: str, run_id: str,
+    ) -> None:
+        """Emit metrics for a newly created memory node. Never raises."""
+        _metric_memory_op(
+            operation="create",
+            memory_type=memory_type,
+            memory_id=node_id,
+            source_feature=source_feature,
+            run_id=run_id or None,
+        )
+        try:
+            from dark_factory.metrics.prometheus import observe_memory_write
+
+            observe_memory_write(memory_type=memory_type, outcome="created")
+        except Exception:  # pragma: no cover — defensive
+            pass
+
     def _vector_upsert(self, node_id: str, memory_type: str, description: str,
-                        secondary_text: str, source_feature: str, source_spec_id: str,
-                        agent: str) -> None:
+                        secondary_text: str, source_feature: str,
+                        source_spec_id: str = "",
+                        agent: str = "", run_id: str = "") -> None:
         """Best-effort upsert to Qdrant alongside Neo4j."""
         if self.vector_repo is None:
             return
@@ -132,7 +196,7 @@ class MemoryRepository:
                 node_id=node_id, memory_type=memory_type,
                 description=description, secondary_text=secondary_text,
                 source_feature=source_feature, source_spec_id=source_spec_id,
-                agent=agent, relevance_score=0.5,
+                agent=agent, relevance_score=0.5, run_id=run_id,
             )
         except Exception as exc:
             log.warning("vector_upsert_failed", node_id=node_id, error=str(exc))
@@ -157,6 +221,7 @@ class MemoryRepository:
             memory_type="pattern",
             query_text=f"{description}\n{context}",
             source_feature=source_feature,
+            match_cross_feature=True,
         )
         if existing is not None:
             return existing
@@ -179,20 +244,8 @@ class MemoryRepository:
                 agent=agent, run_id=run_id, now=now,
             )
         self._vector_upsert(node_id, "pattern", description, context,
-                            source_feature, source_spec_id, agent)
-        _metric_memory_op(
-            operation="create",
-            memory_type="pattern",
-            memory_id=node_id,
-            source_feature=source_feature,
-            run_id=run_id or None,
-        )
-        try:
-            from dark_factory.metrics.prometheus import observe_memory_write
-
-            observe_memory_write(memory_type="pattern", outcome="created")
-        except Exception:  # pragma: no cover — defensive
-            pass
+                            source_feature, source_spec_id, agent, run_id)
+        self._emit_create_metrics("pattern", node_id, source_feature, run_id)
         return node_id
 
     def record_mistake(
@@ -247,20 +300,8 @@ class MemoryRepository:
                 agent=agent, run_id=run_id, now=now,
             )
         self._vector_upsert(node_id, "mistake", description, trigger_context,
-                            source_feature, source_spec_id, agent)
-        _metric_memory_op(
-            operation="create",
-            memory_type="mistake",
-            memory_id=node_id,
-            source_feature=source_feature,
-            run_id=run_id or None,
-        )
-        try:
-            from dark_factory.metrics.prometheus import observe_memory_write
-
-            observe_memory_write(memory_type="mistake", outcome="created")
-        except Exception:  # pragma: no cover — defensive
-            pass
+                            source_feature, source_spec_id, agent, run_id)
+        self._emit_create_metrics("mistake", node_id, source_feature, run_id)
         return node_id
 
     def record_solution(
@@ -326,20 +367,8 @@ class MemoryRepository:
                     mistake_id=mistake_id, solution_id=node_id,
                 )
         self._vector_upsert(node_id, "solution", description, code_snippet,
-                            source_feature, source_spec_id, agent)
-        _metric_memory_op(
-            operation="create",
-            memory_type="solution",
-            memory_id=node_id,
-            source_feature=source_feature,
-            run_id=run_id or None,
-        )
-        try:
-            from dark_factory.metrics.prometheus import observe_memory_write
-
-            observe_memory_write(memory_type="solution", outcome="created")
-        except Exception:  # pragma: no cover — defensive
-            pass
+                            source_feature, source_spec_id, agent, run_id)
+        self._emit_create_metrics("solution", node_id, source_feature, run_id)
         return node_id
 
     def record_strategy(
@@ -355,6 +384,7 @@ class MemoryRepository:
             memory_type="strategy",
             query_text=f"{description}\n{applicability}",
             source_feature=source_feature,
+            match_cross_feature=True,
         )
         if existing is not None:
             return existing
@@ -376,21 +406,381 @@ class MemoryRepository:
                 source_feature=source_feature, agent=agent, run_id=run_id, now=now,
             )
         self._vector_upsert(node_id, "strategy", description, applicability,
-                            source_feature, "", agent)
-        _metric_memory_op(
-            operation="create",
-            memory_type="strategy",
-            memory_id=node_id,
-            source_feature=source_feature,
-            run_id=run_id or None,
-        )
-        try:
-            from dark_factory.metrics.prometheus import observe_memory_write
-
-            observe_memory_write(memory_type="strategy", outcome="created")
-        except Exception:  # pragma: no cover — defensive
-            pass
+                            source_feature, "", agent, run_id)
+        self._emit_create_metrics("strategy", node_id, source_feature, run_id)
         return node_id
+
+    # ═══════════════════════════════════════════════════════════════
+    # Institutional-memory types (refinery-produced)
+    # ═══════════════════════════════════════════════════════════════
+
+    def record_refinery_memories_atomic(
+        self,
+        specs: list[dict[str, Any]],
+    ) -> list[str]:
+        """Write multiple refinery memories inside ONE Neo4j transaction.
+
+        Used by ``PATCH /api/graph/requirements/{req_id}`` to honour the
+        atomic-write-back contract: the requirement upsert and all
+        selected suggested-memory writes commit or roll back together.
+
+        Each spec is a dict with keys matching the ``_record_refinery_memory``
+        kwargs (``memory_type``, ``summary``, ``body``, ``kind_props``,
+        ``source_role``, ``source_requirement_id``, ``rationale``,
+        ``provenance_refinery_run_id``, ``run_id``).
+
+        Behaviour:
+        - Dedup runs outside the Neo4j transaction (reads the existing
+          vector-search index); any hits get boosted and return the
+          existing id.
+        - For the NEW nodes, a single ``session.execute_write`` opens
+          one transaction and commits all CREATEs. Any node's Cypher
+          error rolls back the whole batch; no partial state.
+        - Qdrant upserts happen AFTER the Neo4j commit. If Qdrant fails,
+          we issue a compensating DETACH DELETE for the just-created
+          Neo4j nodes so the two stores don't diverge. The
+          compensating delete is best-effort and logged.
+
+        Returns the list of memory ids in the same order as ``specs``
+        — mixing existing (deduped) and newly created ids.
+        """
+
+        from dark_factory.metrics.prometheus import (
+            observe_refinery_memory_write_back_failure,
+        )
+
+        # Phase 1: dedup + id assignment outside the transaction.
+        resolved: list[tuple[str, dict[str, Any] | None]] = []
+        for spec in specs:
+            memory_type = spec["memory_type"]
+            label = _MEMORY_TYPE_TO_LABEL.get(memory_type)
+            if label is None:
+                raise ValueError(f"unknown refinery memory_type: {memory_type!r}")
+            feature = spec.get("source_requirement_id") or "refinery"
+            existing = self._try_dedup_and_boost(
+                memory_type=memory_type,
+                query_text=f"{spec['summary']}\n{spec.get('body', '')}",
+                source_feature=feature,
+                match_cross_feature=True,
+            )
+            if existing is not None:
+                resolved.append((existing, None))
+                continue
+            node_id = f"{memory_type}-{uuid4().hex[:8]}"
+            now = datetime.now(tz=timezone.utc).isoformat()
+            props = {
+                "id": node_id,
+                "summary": spec["summary"],
+                "body": spec.get("body", ""),
+                "source_requirement_id": spec.get("source_requirement_id", ""),
+                "source_role": spec.get("source_role", ""),
+                "rationale": spec.get("rationale", ""),
+                "provenance_refinery_run_id": spec.get(
+                    "provenance_refinery_run_id", "",
+                ),
+                "run_id": spec.get("run_id", ""),
+                "relevance_score": 0.5,
+                "times_recalled": 0,
+                "created_at": now,
+                "updated_at": now,
+                **spec.get("kind_props", {}),
+            }
+            resolved.append((node_id, {
+                "label": label, "props": props, "memory_type": memory_type,
+                "feature": feature,
+                "source_role": spec.get("source_role", ""),
+                "run_id": spec.get("run_id", ""),
+                "summary": spec["summary"],
+                "body": spec.get("body", ""),
+            }))
+
+        new_writes = [(nid, payload) for nid, payload in resolved if payload]
+        if not new_writes:
+            return [nid for nid, _ in resolved]
+
+        # Phase 2: write all new nodes in one Neo4j transaction.
+        def _tx(tx):
+            for _nid, payload in new_writes:
+                tx.run(
+                    f"CREATE (n:{payload['label']} $props)",
+                    props=payload["props"],
+                )
+
+        with self.client.session() as session:
+            session.execute_write(_tx)
+
+        # Phase 3: Qdrant upserts outside the Neo4j transaction. On
+        # failure, compensate by deleting the just-created Neo4j nodes.
+        try:
+            for _nid, payload in new_writes:
+                self._vector_upsert(
+                    payload["props"]["id"],
+                    payload["memory_type"],
+                    payload["summary"], payload["body"],
+                    payload["feature"], "",
+                    payload["source_role"] or "judge",
+                    payload["run_id"],
+                )
+                self._emit_create_metrics(
+                    payload["memory_type"],
+                    payload["props"]["id"],
+                    payload["feature"],
+                    payload["run_id"],
+                )
+        except Exception as exc:
+            log.warning(
+                "refinery_memory_atomic_qdrant_failed_rolling_back_neo4j",
+                error=str(exc),
+            )
+            observe_refinery_memory_write_back_failure()
+            # Compensating delete — best effort; log and continue either way.
+            try:
+                with self.client.session() as session:
+                    session.execute_write(
+                        lambda tx: tx.run(
+                            "UNWIND $ids AS mid "
+                            "MATCH (n) WHERE n.id = mid "
+                            "DETACH DELETE n",
+                            ids=[nid for nid, _ in new_writes],
+                        )
+                    )
+            except Exception as cleanup_exc:  # pragma: no cover — defensive
+                log.error(
+                    "refinery_memory_atomic_cleanup_failed",
+                    error=str(cleanup_exc),
+                )
+            raise
+
+        return [nid for nid, _ in resolved]
+
+    def _record_refinery_memory(
+        self,
+        *,
+        memory_type: str,
+        summary: str,
+        body: str,
+        source_role: str,
+        kind_props: dict[str, Any],
+        source_requirement_id: str = "",
+        rationale: str = "",
+        provenance_refinery_run_id: str = "",
+        run_id: str = "",
+    ) -> str:
+        """Shared write path for refinery memories.
+
+        Label resolved from ``_MEMORY_TYPE_TO_LABEL``. Dedup via
+        ``_try_dedup_and_boost`` — a semantic duplicate within the same
+        source feature is boosted rather than re-created. Returns the
+        node id (either new or an existing one after boost).
+        """
+
+        label = _MEMORY_TYPE_TO_LABEL.get(memory_type)
+        if label is None:
+            raise ValueError(f"unknown refinery memory_type: {memory_type!r}")
+
+        feature = source_requirement_id or "refinery"
+        existing = self._try_dedup_and_boost(
+            memory_type=memory_type,
+            query_text=f"{summary}\n{body}",
+            source_feature=feature,
+            match_cross_feature=True,
+        )
+        if existing is not None:
+            return existing
+
+        node_id = f"{memory_type}-{uuid4().hex[:8]}"
+        now = datetime.now(tz=timezone.utc).isoformat()
+        props: dict[str, Any] = {
+            "id": node_id,
+            "summary": summary,
+            "body": body,
+            "source_requirement_id": source_requirement_id,
+            "source_role": source_role,
+            "rationale": rationale,
+            "provenance_refinery_run_id": provenance_refinery_run_id,
+            "run_id": run_id,
+            "relevance_score": 0.5,
+            "times_recalled": 0,
+            "created_at": now,
+            "updated_at": now,
+            **kind_props,
+        }
+        # Label interpolation is safe because it's resolved from the
+        # trusted static ``_MEMORY_TYPE_TO_LABEL`` dict — never user input.
+        with self.client.session() as session:
+            session.run(f"CREATE (n:{label} $props)", props=props)
+        self._vector_upsert(
+            node_id, memory_type, summary, body,
+            feature, "", source_role, run_id,
+        )
+        self._emit_create_metrics(memory_type, node_id, feature, run_id)
+        return node_id
+
+    def record_decision(
+        self,
+        *,
+        summary: str,
+        body: str,
+        context: str = "",
+        source_requirement_id: str = "",
+        source_role: str = "",
+        decision_alternatives: list[str] | None = None,
+        rationale: str = "",
+        provenance_refinery_run_id: str = "",
+        run_id: str = "",
+    ) -> str:
+        """Record a Decision memory — why a particular choice was made
+        over alternatives. Emitted when a synthesis Rebuttal accepts or
+        rejects a critique with a rationale that generalises beyond the
+        current requirement."""
+
+        return self._record_refinery_memory(
+            memory_type="decision",
+            summary=summary, body=body,
+            source_role=source_role,
+            kind_props={
+                "context": context,
+                "decision_alternatives": list(decision_alternatives or []),
+            },
+            source_requirement_id=source_requirement_id,
+            rationale=rationale,
+            provenance_refinery_run_id=provenance_refinery_run_id,
+            run_id=run_id,
+        )
+
+    def record_constraint(
+        self,
+        *,
+        summary: str,
+        body: str,
+        constraint_domain: str = "system",
+        applicability: str = "",
+        source_requirement_id: str = "",
+        source_role: str = "",
+        rationale: str = "",
+        provenance_refinery_run_id: str = "",
+        run_id: str = "",
+    ) -> str:
+        """Record a Constraint memory — a system or business limitation
+        that future requirements must respect. Emitted when a critic
+        cites a concrete limit (stack pin, API rate, compliance rule)
+        in a BLOCKER critique."""
+
+        return self._record_refinery_memory(
+            memory_type="constraint",
+            summary=summary, body=body,
+            source_role=source_role,
+            kind_props={
+                "constraint_domain": constraint_domain,
+                "applicability": applicability,
+            },
+            source_requirement_id=source_requirement_id,
+            rationale=rationale,
+            provenance_refinery_run_id=provenance_refinery_run_id,
+            run_id=run_id,
+        )
+
+    def record_anti_pattern(
+        self,
+        *,
+        summary: str,
+        body: str,
+        alternative: str = "",
+        harm: str = "",
+        applicability: str = "",
+        source_requirement_id: str = "",
+        source_role: str = "",
+        rationale: str = "",
+        provenance_refinery_run_id: str = "",
+        run_id: str = "",
+    ) -> str:
+        """Record an Anti-pattern memory — recurring negative guidance
+        ("don't structure auth this way") paired with the recommended
+        alternative. Distinct from Mistake (point-event failure) and
+        Pattern (positive recurrent guidance). Emitted when a critic
+        flags a draft as repeating a known harmful approach AND names a
+        better alternative."""
+
+        return self._record_refinery_memory(
+            memory_type="anti_pattern",
+            summary=summary, body=body,
+            source_role=source_role,
+            kind_props={
+                "alternative": alternative,
+                "harm": harm,
+                "applicability": applicability,
+            },
+            source_requirement_id=source_requirement_id,
+            rationale=rationale,
+            provenance_refinery_run_id=provenance_refinery_run_id,
+            run_id=run_id,
+        )
+
+    def record_hypothesis(
+        self,
+        *,
+        summary: str,
+        body: str,
+        verification_query: str,
+        status: str = "open",
+        source_requirement_id: str = "",
+        source_role: str = "",
+        rationale: str = "",
+        provenance_refinery_run_id: str = "",
+        run_id: str = "",
+    ) -> str:
+        """Record a Hypothesis memory — an untested guess the panel
+        flagged for verification. Carries the verification query the
+        next debate's Research agent should target as a Librarian
+        prompt; status moves open → verified | refuted as future
+        debates resolve it."""
+
+        return self._record_refinery_memory(
+            memory_type="hypothesis",
+            summary=summary, body=body,
+            source_role=source_role,
+            kind_props={
+                "verification_query": verification_query,
+                "status": status,
+            },
+            source_requirement_id=source_requirement_id,
+            rationale=rationale,
+            provenance_refinery_run_id=provenance_refinery_run_id,
+            run_id=run_id,
+        )
+
+    def record_conflict(
+        self,
+        *,
+        summary: str,
+        body: str,
+        conflict_parties: list[str] | None = None,
+        conflict_resolution: str | None = None,
+        cause: str = "disagreement",
+        source_requirement_id: str = "",
+        rationale: str = "",
+        provenance_refinery_run_id: str = "",
+        run_id: str = "",
+    ) -> str:
+        """Record a Conflict memory — a recurring disagreement worth
+        preserving so future debates start with the tradeoff context
+        already loaded. Emitted when a finalize round has high
+        disagreement OR the reconcile node fires on short-circuit."""
+
+        return self._record_refinery_memory(
+            memory_type="conflict",
+            summary=summary, body=body,
+            source_role="judge",
+            kind_props={
+                "conflict_parties": list(conflict_parties or []),
+                "conflict_resolution": conflict_resolution or "",
+                "cause": cause,
+            },
+            source_requirement_id=source_requirement_id,
+            rationale=rationale,
+            provenance_refinery_run_id=provenance_refinery_run_id,
+            run_id=run_id,
+        )
 
     # M4 fix: derive _VALID_LABELS from the single source of truth
     # at class body evaluation time so the two stay in sync. The
@@ -405,83 +795,85 @@ class MemoryRepository:
     # of user-facing values into query text. Even though label is validated
     # against _VALID_LABELS, a future refactor bypassing that check would
     # reintroduce injection risk. Dict-dispatch removes the footgun entirely.
+    # Boost and demote Cypher now also set last_feedback_at so that
+    # decay_all_relevance can skip recently-active memories.
     _BOOST_CYPHER: dict[str, str] = {
-        "Pattern": """
-            MATCH (n:Pattern {id: $id})
+        label: f"""
+            MATCH (n:{label} {{id: $id}})
             SET n.relevance_score = CASE
                 WHEN n.relevance_score + $delta > 1.0 THEN 1.0
                 ELSE n.relevance_score + $delta
             END,
-            n.times_applied = n.times_applied + 1,
+            n.{counter} = coalesce(n.{counter}, 0) + 1,
+            n.last_feedback_at = $now,
             n.updated_at = $now
-        """,
-        "Mistake": """
-            MATCH (n:Mistake {id: $id})
-            SET n.relevance_score = CASE
-                WHEN n.relevance_score + $delta > 1.0 THEN 1.0
-                ELSE n.relevance_score + $delta
-            END,
-            n.times_seen = n.times_seen + 1,
-            n.updated_at = $now
-        """,
-        "Solution": """
-            MATCH (n:Solution {id: $id})
-            SET n.relevance_score = CASE
-                WHEN n.relevance_score + $delta > 1.0 THEN 1.0
-                ELSE n.relevance_score + $delta
-            END,
-            n.times_applied = n.times_applied + 1,
-            n.updated_at = $now
-        """,
-        "Strategy": """
-            MATCH (n:Strategy {id: $id})
-            SET n.relevance_score = CASE
-                WHEN n.relevance_score + $delta > 1.0 THEN 1.0
-                ELSE n.relevance_score + $delta
-            END,
-            n.times_applied = n.times_applied + 1,
-            n.updated_at = $now
-        """,
+        """
+        for label, counter in [
+            ("Pattern", "times_applied"),
+            ("Mistake", "times_seen"),
+            ("Solution", "times_applied"),
+            ("Strategy", "times_applied"),
+            # Phase-9 refinery kinds — counter rides on times_recalled,
+            # which is the only universal counter on these nodes.
+            ("Decision", "times_recalled"),
+            ("Constraint", "times_recalled"),
+            ("Conflict", "times_recalled"),
+            ("Hypothesis", "times_recalled"),
+            ("AntiPattern", "times_recalled"),
+        ]
     }
 
     _DEMOTE_CYPHER: dict[str, str] = {
-        "Pattern": """
-            MATCH (n:Pattern {id: $id})
+        label: f"""
+            MATCH (n:{label} {{id: $id}})
             SET n.relevance_score = CASE
                 WHEN n.relevance_score - $delta < 0.0 THEN 0.0
                 ELSE n.relevance_score - $delta
             END,
-            n.times_applied = n.times_applied + 1,
+            n.last_feedback_at = $now,
             n.updated_at = $now
-        """,
-        "Mistake": """
-            MATCH (n:Mistake {id: $id})
-            SET n.relevance_score = CASE
-                WHEN n.relevance_score - $delta < 0.0 THEN 0.0
-                ELSE n.relevance_score - $delta
-            END,
-            n.times_seen = n.times_seen + 1,
-            n.updated_at = $now
-        """,
-        "Solution": """
-            MATCH (n:Solution {id: $id})
-            SET n.relevance_score = CASE
-                WHEN n.relevance_score - $delta < 0.0 THEN 0.0
-                ELSE n.relevance_score - $delta
-            END,
-            n.times_applied = n.times_applied + 1,
-            n.updated_at = $now
-        """,
-        "Strategy": """
-            MATCH (n:Strategy {id: $id})
-            SET n.relevance_score = CASE
-                WHEN n.relevance_score - $delta < 0.0 THEN 0.0
-                ELSE n.relevance_score - $delta
-            END,
-            n.times_applied = n.times_applied + 1,
-            n.updated_at = $now
-        """,
+        """
+        for label in (
+            "Pattern", "Mistake", "Solution", "Strategy",
+            "Decision", "Constraint", "Conflict", "Hypothesis",
+            "AntiPattern",
+        )
     }
+
+    def _sync_qdrant_relevance(self, node_id: str, new_score: float) -> None:
+        """Best-effort sync of relevance_score to the Qdrant payload."""
+        if self.vector_repo is None:
+            return
+        try:
+            self.vector_repo.update_relevance_score(
+                node_id=node_id, new_score=new_score,
+            )
+        except Exception as exc:
+            log.debug("qdrant_relevance_sync_failed", node_id=node_id, error=str(exc))
+
+    _READ_RELEVANCE_CYPHER: dict[str, str] = {
+        label: f"MATCH (n:{label} {{id: $id}}) RETURN n.relevance_score AS score"
+        for label in (
+            "Pattern", "Mistake", "Solution", "Strategy",
+            "Decision", "Constraint", "Conflict", "Hypothesis",
+            "AntiPattern",
+        )
+    }
+
+    def _read_relevance(self, node_id: str, label: str) -> float | None:
+        """Read the current relevance_score from Neo4j (post-write)."""
+        cypher = self._READ_RELEVANCE_CYPHER.get(label)
+        if cypher is None:
+            return None
+        try:
+            with self.client.session() as session:
+                result = session.run(cypher, id=node_id)
+                record = result.single()
+                if record and record["score"] is not None:
+                    return float(record["score"])
+        except Exception:
+            pass
+        return None
 
     def boost_relevance(self, node_id: str, label: str, delta: float = 0.1) -> None:
         """Increment relevance_score and usage counter for a memory node.
@@ -498,51 +890,63 @@ class MemoryRepository:
         if cypher is None:
             log.warning("boost_invalid_label", label=label, node_id=node_id)
             return
-        now = datetime.now(tz=timezone.utc).isoformat()
-
-        def _tx(tx) -> None:
-            tx.run(cypher, id=node_id, delta=delta, now=now)
-
-        with self.client.session() as session:
-            # Some tests pass MagicMock sessions that don't implement
-            # ``execute_write`` — fall back to ``run`` so existing unit
-            # tests keep passing without mocking the tx helper.
-            exec_write = getattr(session, "execute_write", None)
-            if exec_write is not None:
-                exec_write(_tx)
-            else:
-                session.run(cypher, id=node_id, delta=delta, now=now)
-        _metric_memory_op(
-            operation="boost",
-            memory_type=label.lower(),
-            memory_id=node_id,
-            delta=delta,
+        self._mutate_relevance(
+            node_id=node_id, label=label, delta=delta,
+            cypher=cypher, op="boost",
         )
 
     def demote_relevance(self, node_id: str, label: str, delta: float = 0.05) -> None:
         """Decrease relevance_score, floored at 0.0.
 
-        H3 fix: same write-transaction wrapping as ``boost_relevance``
-        so concurrent feedback signals on the same memory node are
-        serialised by Neo4j's per-node write lock.
+        Concurrent feedback signals on the same memory node serialise
+        through ``_mutate_relevance``'s per-node Python lock, which
+        wraps both the Neo4j commit and the Qdrant payload sync — so
+        the two stores can't drift under boost+demote contention.
         """
         cypher = self._DEMOTE_CYPHER.get(label)
         if cypher is None:
             log.warning("demote_invalid_label", label=label, node_id=node_id)
             return
+        self._mutate_relevance(
+            node_id=node_id, label=label, delta=delta,
+            cypher=cypher, op="demote",
+        )
+
+    def _mutate_relevance(
+        self,
+        *,
+        node_id: str,
+        label: str,
+        delta: float,
+        cypher: str,
+        op: str,
+    ) -> None:
+        """Run a relevance-mutation Cypher + Qdrant payload sync under
+        a per-node lock. Bucketed via hash so concurrent writes on
+        different nodes don't block each other.
+        """
+
         now = datetime.now(tz=timezone.utc).isoformat()
 
         def _tx(tx) -> None:
             tx.run(cypher, id=node_id, delta=delta, now=now)
 
-        with self.client.session() as session:
-            exec_write = getattr(session, "execute_write", None)
-            if exec_write is not None:
-                exec_write(_tx)
-            else:
-                session.run(cypher, id=node_id, delta=delta, now=now)
+        bucket = self._relevance_lock_pool[
+            hash(node_id) % len(self._relevance_lock_pool)
+        ]
+        with bucket:
+            with self.client.session() as session:
+                exec_write = getattr(session, "execute_write", None)
+                if exec_write is not None:
+                    exec_write(_tx)
+                else:
+                    session.run(cypher, id=node_id, delta=delta, now=now)
+            new_score = self._read_relevance(node_id, label)
+            if new_score is not None:
+                self._sync_qdrant_relevance(node_id, new_score)
+
         _metric_memory_op(
-            operation="demote",
+            operation=op,
             memory_type=label.lower(),
             memory_id=node_id,
             delta=delta,
@@ -685,6 +1089,105 @@ class MemoryRepository:
             )
         log.warning("run_marked_failed", run_id=run_id, error=error[:200], at=now_iso)
 
+    def mark_run_cancelled(self, *, run_id: str, duration_seconds: float = 0.0) -> None:
+        """Mark a Run node as cancelled by the user."""
+        with self.client.session() as session:
+            session.run(
+                """
+                MATCH (r:Run {id: $id})
+                SET r.status = 'cancelled',
+                    r.duration_seconds = $duration
+                """,
+                id=run_id,
+                duration=duration_seconds,
+            )
+        log.info("run_marked_cancelled", run_id=run_id)
+
+    def delete_run(self, *, run_id: str) -> dict[str, int]:
+        """Delete a Run and all linked data from Neo4j.
+
+        Removes the Run node, its Episodes (+ APPLIED edges),
+        EvalResults, and any memories scoped to this run. Returns
+        a dict of counts per node type deleted.
+        """
+        counts: dict[str, int] = {}
+
+        def _delete_all(tx) -> dict[str, int]:
+            # Episodes linked to this run (+ their APPLIED edges)
+            r = tx.run(
+                "MATCH (ep:Episode {run_id: $id}) DETACH DELETE ep RETURN count(ep) AS c",
+                id=run_id,
+            ).single()
+            ep_count = r["c"] if r else 0
+
+            # EvalResults linked to this run
+            r = tx.run(
+                "MATCH (e:EvalResult {run_id: $id}) DETACH DELETE e RETURN count(e) AS c",
+                id=run_id,
+            ).single()
+            eval_count = r["c"] if r else 0
+
+            # Memories scoped to this run
+            r = tx.run(
+                """
+                MATCH (n) WHERE n.run_id = $id
+                  AND (n:Pattern OR n:Mistake OR n:Solution OR n:Strategy)
+                DETACH DELETE n RETURN count(n) AS c
+                """,
+                id=run_id,
+            ).single()
+            mem_count = r["c"] if r else 0
+
+            # The Run node itself
+            r = tx.run(
+                "MATCH (r:Run {id: $id}) DETACH DELETE r RETURN count(r) AS c",
+                id=run_id,
+            ).single()
+            run_count = r["c"] if r else 0
+
+            return {
+                "episodes": ep_count,
+                "eval_results": eval_count,
+                "memories": mem_count,
+                "runs": run_count,
+            }
+
+        with self.client.session() as session:
+            exec_write = getattr(session, "execute_write", None)
+            if exec_write is not None:
+                counts = exec_write(_delete_all)
+            else:
+                # Fallback for older Neo4j driver versions
+                counts = _delete_all(session)
+
+        # Remove episode vectors from Qdrant
+        if self.vector_repo is not None:
+            try:
+                from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+                self.vector_repo._client.client.delete(
+                    collection_name=self.vector_repo._client.collection_name("episodes"),
+                    points_selector=Filter(
+                        must=[FieldCondition(key="run_id", match=MatchValue(value=run_id))]
+                    ),
+                )
+            except Exception as exc:
+                log.warning("delete_run_qdrant_episodes_failed", error=str(exc))
+
+            # Remove memory vectors scoped to this run
+            try:
+                self.vector_repo._client.client.delete(
+                    collection_name=self.vector_repo._client.collection_name("memories"),
+                    points_selector=Filter(
+                        must=[FieldCondition(key="run_id", match=MatchValue(value=run_id))]
+                    ),
+                )
+            except Exception as exc:
+                log.warning("delete_run_qdrant_memories_failed", error=str(exc))
+
+        log.info("run_deleted", run_id=run_id, counts=counts)
+        return counts
+
     # ── Episodic memory ──────────────────────────────────────────────
     #
     # Episodes are per-feature autobiographical records written at the
@@ -728,6 +1231,7 @@ class MemoryRepository:
                     ep.key_events_json = $key_events_json,
                     ep.tool_calls_json = $tool_calls_json,
                     ep.eval_scores_json = $eval_scores_json,
+                    ep.recalled_memory_ids = $recalled_memory_ids,
                     ep.started_at = $started_at,
                     ep.ended_at = $ended_at
                 WITH ep
@@ -748,15 +1252,43 @@ class MemoryRepository:
                 key_events_json=key_events_json,
                 tool_calls_json=tool_calls_json,
                 eval_scores_json=eval_scores_json,
+                recalled_memory_ids=list(episode.recalled_memory_ids),
                 started_at=episode.started_at.isoformat(),
                 ended_at=episode.ended_at.isoformat(),
             )
+
+            # Create APPLIED edges from the episode to each recalled
+            # memory node (Pattern, Mistake, Solution, Strategy, or
+            # prior Episode).  These edges enable graph traversal like
+            # "which episodes used this pattern?" and "which patterns
+            # came from runs that succeeded?".
+            recalled = list(episode.recalled_memory_ids)
+            if recalled:
+                session.run(
+                    """
+                    MATCH (ep:Episode {id: $ep_id})
+                    UNWIND $mem_ids AS mem_id
+                    CALL {
+                        WITH ep, mem_id
+                        OPTIONAL MATCH (m) WHERE m.id = mem_id
+                            AND (m:Pattern OR m:Mistake OR m:Solution
+                                 OR m:Strategy OR m:Episode)
+                        FOREACH (_ IN CASE WHEN m IS NOT NULL THEN [1] ELSE [] END |
+                            MERGE (ep)-[:APPLIED]->(m)
+                        )
+                    }
+                    """,
+                    ep_id=episode.id,
+                    mem_ids=recalled,
+                )
+
         log.info(
             "episode_written",
             episode_id=episode.id,
             feature=episode.feature,
             run_id=episode.run_id,
             outcome=episode.outcome,
+            recalled_memories=len(episode.recalled_memory_ids),
         )
 
     def get_episodes_for_run(
@@ -1200,7 +1732,23 @@ class MemoryRepository:
                 now=now,
             )
             record = result.single()
-            return int(record["cnt"]) if record else 0
+            count = int(record["cnt"]) if record else 0
+
+        # Sync last_recalled_at to Qdrant so filtered searches can
+        # distinguish recently-active memories from dormant ones.
+        # Batched: single set_payload call with all point IDs.
+        if self.vector_repo is not None and ids:
+            try:
+                point_ids = [self.vector_repo._to_point_id(mid) for mid in ids]
+                self.vector_repo._client.client.set_payload(
+                    collection_name=self.vector_repo._client.collection_name("memories"),
+                    payload={"last_recalled_at": now},
+                    points=point_ids,
+                )
+            except Exception:
+                pass  # best-effort
+
+        return count
 
     def get_recall_effectiveness(self, *, days: int = 7) -> dict:
         """Return aggregate recall feedback stats over the last N days.
@@ -1244,56 +1792,151 @@ class MemoryRepository:
                 "boost_rate": 0.0,
             }
 
-    def decay_all_relevance(self, factor: float = 0.95) -> int:
-        """Multiply all memory node relevance_scores by factor. Returns count updated."""
+    def decay_all_relevance(
+        self, factor: float = 0.95, grace_days: int = 7,
+    ) -> int:
+        """Multiply stale memory relevance_scores by *factor*.
+
+        Memories that received boost/demote feedback within
+        *grace_days* are skipped — only memories that have gone stale
+        (no recent eval signal) decay.  Returns count updated.
+        """
         now = datetime.now(tz=timezone.utc).isoformat()
+        cutoff = (
+            datetime.now(tz=timezone.utc)
+            - __import__("datetime").timedelta(days=grace_days)
+        ).isoformat()
         with self.client.session() as session:
             result = session.run(
                 """
                 MATCH (n)
-                WHERE n:Pattern OR n:Mistake OR n:Solution OR n:Strategy
+                WHERE (n:Pattern OR n:Mistake OR n:Solution OR n:Strategy)
+                  AND (n.last_feedback_at IS NULL OR n.last_feedback_at < $cutoff)
                 SET n.relevance_score = n.relevance_score * $factor,
                     n.updated_at = $now
-                RETURN count(n) AS cnt
+                RETURN n.id AS id, n.relevance_score AS score
                 """,
-                factor=factor, now=now,
+                factor=factor, now=now, cutoff=cutoff,
             )
-            record = result.single()
-            count = record["cnt"] if record else 0
-        # NOTE: ``delta`` is overloaded here — for decay operations it carries
-        # the *multiplier* (e.g. 0.95), not an additive score change.
-        # ``count`` is the number of affected nodes. Consumers of the
-        # ``memory_operations`` table should interpret ``delta`` based on
-        # the ``operation`` column.
+            rows = [(r["id"], r["score"]) for r in result if r["id"]]
+        count = len(rows)
+
+        # Bulk-sync decayed scores to Qdrant so vector search ranking
+        # stays consistent with Neo4j.
+        # TODO(perf): This is N+1 — each update_relevance_score makes a
+        # separate Qdrant set_payload RPC. A bulk_update_relevance helper
+        # on VectorRepository that batches all (point_id, score) pairs into
+        # a single Qdrant batch_update call would reduce round-trips from
+        # O(N) to O(1). Acceptable for now since decay runs infrequently
+        # (typically once per pipeline run).
+        if self.vector_repo is not None and rows:
+            for node_id, score in rows:
+                try:
+                    self.vector_repo.update_relevance_score(
+                        node_id=node_id, new_score=float(score),
+                    )
+                except Exception:
+                    pass  # best-effort — one failure shouldn't stop the batch
+
         _metric_memory_op(operation="decay", count=count, delta=factor)
         return count
+
+    def prune_low_relevance(self, threshold: float = 0.05) -> int:
+        """Delete memory nodes with relevance_score below *threshold*.
+
+        Also removes the corresponding Qdrant points. Returns the
+        number of nodes deleted. Call after ``decay_all_relevance`` to
+        garbage-collect memories that have decayed below usefulness.
+        """
+        with self.client.session() as session:
+            result = session.run(
+                """
+                MATCH (n)
+                WHERE (n:Pattern OR n:Mistake OR n:Solution OR n:Strategy)
+                  AND n.relevance_score < $threshold
+                WITH n, n.id AS nid
+                DETACH DELETE n
+                RETURN nid
+                """,
+                threshold=threshold,
+            )
+            deleted_ids = [r["nid"] for r in result if r["nid"]]
+
+        # Remove from Qdrant — batched into a single delete call.
+        if self.vector_repo is not None and deleted_ids:
+            try:
+                from qdrant_client.models import PointIdsList
+
+                point_ids = [self.vector_repo._to_point_id(nid) for nid in deleted_ids]
+                self.vector_repo._client.client.delete(
+                    collection_name=self.vector_repo._client.collection_name("memories"),
+                    points_selector=PointIdsList(points=point_ids),
+                )
+            except Exception:
+                pass  # best-effort
+
+        count = len(deleted_ids)
+        if count:
+            log.info("memory_pruned", count=count, threshold=threshold)
+            _metric_memory_op(operation="prune", count=count, delta=threshold)
+        return count
+
+    # Labels that support relevance scoring (have _BOOST/_DEMOTE Cypher).
+    # Episodes are detected by _detect_label but don't have relevance_score
+    # on the Neo4j node — they're immutable records whose usefulness is
+    # tracked via APPLIED edges instead.
+    _SCORABLE_LABELS = frozenset({"Pattern", "Mistake", "Solution", "Strategy"})
+
+    # Labels where eval feedback has a clear causal signal.
+    # Pattern is excluded: a recalled pattern may be irrelevant to the
+    # eval outcome, so boosting/demoting it adds noise. Patterns earn
+    # relevance through dedup boosts (rediscovery) and lose it through
+    # decay — both signals that don't require eval causation.
+    _EVAL_FEEDBACK_LABELS = frozenset({"Mistake", "Solution", "Strategy"})
 
     def apply_eval_feedback(
         self,
         *,
         recalled_memory_ids: list[str],
-        all_passed: bool,
+        pass_rate: float,
         boost_delta: float = 0.1,
-        demote_delta: float = 0.05,
+        demote_delta: float = 0.1,
     ) -> None:
-        """After an eval, boost recalled memories if passed, demote if failed."""
+        """Apply partial-credit feedback to recalled memories.
+
+        Instead of all-or-nothing, the delta is scaled by the pass rate:
+        - pass_rate=1.0 → full boost_delta
+        - pass_rate=0.0 → full demote_delta
+        - pass_rate=0.6 → net boost of 0.6*boost - 0.4*demote
+
+        Only Mistake, Solution, and Strategy nodes receive feedback.
+        Patterns are excluded because the causal link between recalling
+        a pattern and an eval outcome is too noisy.
+        """
+        if not recalled_memory_ids:
+            return
         for mem_id in recalled_memory_ids:
             label = self._detect_label(mem_id)
-            if not label:
+            if not label or label not in self._EVAL_FEEDBACK_LABELS:
                 continue
-            if all_passed:
-                self.boost_relevance(mem_id, label, delta=boost_delta)
+            if pass_rate >= 0.5:
+                scaled_delta = boost_delta * pass_rate
+                self.boost_relevance(mem_id, label, delta=scaled_delta)
             else:
-                self.demote_relevance(mem_id, label, delta=demote_delta)
+                scaled_delta = demote_delta * (1.0 - pass_rate)
+                self.demote_relevance(mem_id, label, delta=scaled_delta)
+
+    # Derive prefix→label map from _MEMORY_TYPE_TO_LABEL so the two
+    # cannot diverge.  Episode is added manually since it isn't a
+    # relevance-scored memory type (no entry in _MEMORY_TYPE_TO_LABEL).
+    _PREFIX_TO_LABEL: dict[str, str] = {
+        f"{k}-": v for k, v in _MEMORY_TYPE_TO_LABEL.items()
+    }
+    _PREFIX_TO_LABEL["ep-"] = "Episode"
 
     def _detect_label(self, node_id: str) -> str | None:
         """Detect the label of a memory node from its ID prefix."""
-        for prefix, label in [
-            ("pattern-", "Pattern"),
-            ("mistake-", "Mistake"),
-            ("solution-", "Solution"),
-            ("strategy-", "Strategy"),
-        ]:
+        for prefix, label in self._PREFIX_TO_LABEL.items():
             if node_id.startswith(prefix):
                 return label
         return None
@@ -1389,32 +2032,45 @@ class MemoryRepository:
         }
 
         if memory_type == "all":
-            # UNION ALL across every label, ordered by score across the union
+            # UNION ALL across every label, ordered by score across the union.
+            # For Mistakes, also fetch the linked Solution via RESOLVED_BY.
             cypher = """
-                CALL {
+                CALL () {
                     MATCH (p:Pattern)
-                    RETURN p AS n, 'pattern' AS type, p.relevance_score AS score
+                    RETURN p AS n, 'pattern' AS type, p.relevance_score AS score,
+                           null AS resolved_by
                     UNION ALL
                     MATCH (m:Mistake)
-                    RETURN m AS n, 'mistake' AS type, m.relevance_score AS score
+                    OPTIONAL MATCH (m)-[:RESOLVED_BY]->(sol:Solution)
+                    RETURN m AS n, 'mistake' AS type, m.relevance_score AS score,
+                           sol AS resolved_by
                     UNION ALL
                     MATCH (s:Solution)
-                    RETURN s AS n, 'solution' AS type, s.relevance_score AS score
+                    RETURN s AS n, 'solution' AS type, s.relevance_score AS score,
+                           null AS resolved_by
                     UNION ALL
                     MATCH (st:Strategy)
-                    RETURN st AS n, 'strategy' AS type, st.relevance_score AS score
+                    RETURN st AS n, 'strategy' AS type, st.relevance_score AS score,
+                           null AS resolved_by
                 }
-                RETURN n, type, coalesce(score, 0.0) AS score
+                RETURN n, type, coalesce(score, 0.0) AS score, resolved_by
                 ORDER BY score DESC LIMIT $limit
             """
             with self.client.session() as session:
                 result = session.run(cypher, limit=limit)
-                items = []
-                for record in result:
-                    node = dict(record["n"])
-                    node["type"] = record["type"]
-                    items.append(node)
-                return items
+                return self._enrich_memory_rows(result)
+
+        if memory_type == "mistake":
+            cypher = (
+                "MATCH (n:Mistake) "
+                "OPTIONAL MATCH (n)-[:RESOLVED_BY]->(sol:Solution) "
+                "RETURN n, 'mistake' AS type, coalesce(n.relevance_score, 0.0) AS score, "
+                "       sol AS resolved_by "
+                "ORDER BY score DESC LIMIT $limit"
+            )
+            with self.client.session() as session:
+                result = session.run(cypher, limit=limit)
+                return self._enrich_memory_rows(result)
 
         cypher = per_type_cypher.get(memory_type)
         if cypher is None:
@@ -1428,29 +2084,129 @@ class MemoryRepository:
                 items.append(node)
             return items
 
+    @staticmethod
+    def _enrich_memory_rows(result) -> list[dict]:
+        """Build memory list with resolved_by linkage for Mistakes."""
+        items = []
+        for record in result:
+            node = dict(record["n"])
+            node["type"] = record["type"]
+            sol_node = record.get("resolved_by")
+            if sol_node is not None and hasattr(sol_node, "get"):
+                node["resolved_by"] = {
+                    "id": sol_node.get("id"),
+                    "description": sol_node.get("description"),
+                }
+            items.append(node)
+        return items
+
+    def check_duplicate(
+        self,
+        *,
+        memory_type: str,
+        description: str,
+        context: str = "",
+    ) -> dict | None:
+        """Check if a memory is a semantic duplicate of an existing one.
+
+        Read-only — does NOT write or boost anything. Returns a dict
+        with ``id``, ``description``, and ``score`` if a near-duplicate
+        exists above the configured threshold, or ``None`` if no match.
+        """
+        return self.dedup_helper.find_existing_match(
+            memory_type=memory_type,
+            query_text=f"{description}\n{context}",
+            source_feature="",
+            match_cross_feature=True,
+        )
+
     def get_related_memories(
         self, *, feature_name: str, spec_id: str = "", limit: int = 10,
     ) -> list[dict]:
-        """Return all memory nodes related to a feature or spec."""
+        """Return all memory nodes related to a feature.
+
+        For Mistake nodes, the RESOLVED_BY solution (if any) is
+        attached inline as a ``resolved_by`` dict so the agent sees
+        the problem AND the fix in a single recall hit.
+
+        The ``spec_id`` parameter is accepted for backward compatibility
+        but is ignored — memories are never spec-specific.
+        """
         cypher = """
-            CALL {
+            CALL () {
                 MATCH (p:Pattern) WHERE p.source_feature = $feat
-                    OR p.source_spec_id = $spec RETURN p AS n, p.relevance_score AS score
+                    RETURN p AS n, p.relevance_score AS score, null AS solution
                 UNION ALL
                 MATCH (m:Mistake) WHERE m.source_feature = $feat
-                    OR m.source_spec_id = $spec RETURN m AS n, m.relevance_score AS score
+                    OPTIONAL MATCH (m)-[:RESOLVED_BY]->(sol:Solution)
+                    RETURN m AS n, m.relevance_score AS score, sol AS solution
                 UNION ALL
                 MATCH (s:Solution) WHERE s.source_feature = $feat
-                    OR s.source_spec_id = $spec RETURN s AS n, s.relevance_score AS score
+                    RETURN s AS n, s.relevance_score AS score, null AS solution
                 UNION ALL
                 MATCH (st:Strategy) WHERE st.source_feature = $feat
-                    RETURN st AS n, st.relevance_score AS score
+                    RETURN st AS n, st.relevance_score AS score, null AS solution
             }
-            RETURN n ORDER BY score DESC LIMIT $limit
+            RETURN n, solution ORDER BY score DESC LIMIT $limit
         """
-        return self._run_search(
-            cypher, {"feat": feature_name, "spec": spec_id or "", "limit": limit}, "n",
-        )
+        with self.client.session() as session:
+            result = session.run(
+                cypher,
+                feat=feature_name, limit=limit,
+            )
+            memories = []
+            for record in result:
+                mem = dict(record["n"])
+                sol_node = record["solution"]
+                if sol_node is not None:
+                    mem["resolved_by"] = dict(sol_node)
+                memories.append(mem)
+            return memories
+
+    def delete_memory_node(self, memory_id: str) -> int:
+        """Delete a single memory node and its Qdrant vector.
+
+        Returns the number of Neo4j nodes deleted (0 or 1).
+        Encapsulates both the Neo4j DETACH DELETE and the Qdrant
+        point removal so callers don't need to reach into internals.
+        """
+        label = self._detect_label(memory_id)
+        if label is None:
+            return 0
+
+        with self.client.session() as session:
+            result = session.run(
+                f"MATCH (n:{label} {{id: $id}}) DETACH DELETE n RETURN count(n) AS c",
+                id=memory_id,
+            )
+            record = result.single()
+            deleted = record["c"] if record else 0
+
+        if self.vector_repo is not None and deleted:
+            try:
+                from qdrant_client.models import PointIdsList
+
+                point_id = self.vector_repo._to_point_id(memory_id)
+                self.vector_repo._client.client.delete(
+                    collection_name=self.vector_repo._client.collection_name("memories"),
+                    points_selector=PointIdsList(points=[point_id]),
+                )
+            except Exception:
+                pass
+
+        return deleted
+
+    def get_run_by_id(self, run_id: str) -> dict | None:
+        """Fetch a single Run node by its id. Returns None if not found."""
+        with self.client.session() as session:
+            result = session.run(
+                "MATCH (r:Run {id: $id}) RETURN r",
+                id=run_id,
+            )
+            record = result.single()
+            if record is None:
+                return None
+            return dict(record["r"])
 
     # ── Helpers ──────────────────────────────────────────────────────
 
@@ -1461,25 +2217,26 @@ class MemoryRepository:
     ) -> list[dict]:
         """Return all memories recorded during this run, for cross-feature briefing."""
         cypher = """
-            CALL {
+            CALL () {
                 MATCH (p:Pattern) WHERE p.run_id = $run_id
+                    AND ($exclude = '' OR p.source_feature <> $exclude)
                     RETURN p AS n, 'pattern' AS type, p.created_at AS ts
                 UNION ALL
                 MATCH (m:Mistake) WHERE m.run_id = $run_id
+                    AND ($exclude = '' OR m.source_feature <> $exclude)
                     RETURN m AS n, 'mistake' AS type, m.created_at AS ts
                 UNION ALL
                 MATCH (s:Solution) WHERE s.run_id = $run_id
+                    AND ($exclude = '' OR s.source_feature <> $exclude)
                     RETURN s AS n, 'solution' AS type, s.created_at AS ts
                 UNION ALL
                 MATCH (st:Strategy) WHERE st.run_id = $run_id
+                    AND ($exclude = '' OR st.source_feature <> $exclude)
                     RETURN st AS n, 'strategy' AS type, st.created_at AS ts
             }
+            RETURN n, type ORDER BY ts ASC LIMIT $limit
         """
-        params: dict = {"run_id": run_id, "limit": limit}
-        if exclude_feature:
-            cypher += " WHERE n.source_feature <> $exclude"
-            params["exclude"] = exclude_feature
-        cypher += " RETURN n, type ORDER BY ts ASC LIMIT $limit"
+        params: dict = {"run_id": run_id, "limit": limit, "exclude": exclude_feature}
 
         with self.client.session() as session:
             result = session.run(cypher, **params)

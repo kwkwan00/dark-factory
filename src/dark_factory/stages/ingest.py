@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Callable
 import structlog
 from pydantic import BaseModel, Field
 
+from dark_factory.log import trace_methods
 from dark_factory.models.domain import PipelineContext, Priority, Requirement
 from dark_factory.stages.base import Stage
 from dark_factory.stages.dedup import (
@@ -80,6 +81,7 @@ from dark_factory.prompts import get_prompt
 _SPLITTER_SYSTEM_PROMPT = get_prompt("ingest_splitter", "system")
 
 
+@trace_methods
 class IngestStage(Stage):
     name = "ingest"
 
@@ -184,6 +186,23 @@ class IngestStage(Stage):
 
         log.info("ingest_complete", count=len(requirements))
         context.requirements = requirements
+
+        # Metrics
+        try:
+            from dark_factory.metrics.helpers import record_ingest
+
+            dedup = self.last_dedup_result
+            dedup_removed = sum(
+                len(g.member_ids) for g in dedup.groups
+            ) if dedup else 0
+            record_ingest(
+                requirements_count=len(requirements),
+                dedup_kept=len(dedup.requirements) if dedup else 0,
+                dedup_removed=dedup_removed,
+            )
+        except Exception:  # pragma: no cover — defensive
+            pass
+
         return context
 
     def _parse_file(self, path: Path) -> list[Requirement]:

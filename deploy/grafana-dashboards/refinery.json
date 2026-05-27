@@ -1,0 +1,157 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 38,
+  "title": "Dark Factory — Refinery v2",
+  "tags": ["dark-factory", "refinery"],
+  "timezone": "browser",
+  "time": {"from": "now-24h", "to": "now"},
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Convergence rate",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(rate(dark_factory_refinery_convergence_outcome_total{outcome=\"converged\"}[5m])) / clamp_min(sum(rate(dark_factory_refinery_convergence_outcome_total[5m])), 1)",
+          "legendFormat": "converged %"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}}
+    },
+    {
+      "id": 2,
+      "title": "Rounds per requirement (P50 / P95)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(dark_factory_refinery_rounds_per_requirement_bucket[5m])))",
+          "legendFormat": "P50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(dark_factory_refinery_rounds_per_requirement_bucket[5m])))",
+          "legendFormat": "P95"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Terminal outcomes",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(dark_factory_refinery_convergence_outcome_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Judge dimension scores (post-penalty, P50)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (dimension, le) (rate(dark_factory_refinery_judge_scores_bucket[5m])))",
+          "legendFormat": "{{dimension}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"min": 0, "max": 1}}
+    },
+    {
+      "id": 5,
+      "title": "Pre-penalty LLM vs post-penalty (rule impact)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(dark_factory_refinery_judge_scores_raw_llm_bucket[5m])))",
+          "legendFormat": "LLM raw P50"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(dark_factory_refinery_judge_scores_bucket[5m])))",
+          "legendFormat": "post-penalty P50"
+        }
+      ],
+      "fieldConfig": {"defaults": {"min": 0, "max": 1}}
+    },
+    {
+      "id": 6,
+      "title": "Top rule violations (top 10)",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "topk(10, sum by (rule_id, severity, dimension) (rate(dark_factory_refinery_rule_violations_total[1h])))",
+          "format": "table",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Research tier mix",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum by (tier) (rate(dark_factory_refinery_research_tier_calls_total[5m]))",
+          "legendFormat": "tier {{tier}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Internal-first hit ratio",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(rate(dark_factory_refinery_research_internal_sufficient_total[5m])) / clamp_min(sum(rate(dark_factory_refinery_research_calls_total[5m])), 1)",
+          "legendFormat": "skip external %"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1}}
+    },
+    {
+      "id": 9,
+      "title": "Cost per debate by role (P95)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 6, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (role, le) (rate(dark_factory_refinery_cost_usd_bucket[5m])))",
+          "legendFormat": "{{role}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}}
+    },
+    {
+      "id": 10,
+      "title": "Memory write-back atomic failures",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(increase(dark_factory_refinery_memory_write_back_atomic_failures_total[1h]))",
+          "legendFormat": "failures (1h)"
+        }
+      ],
+      "fieldConfig": {"defaults": {"thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": 0}, {"color": "red", "value": 1}]}}}
+    }
+  ]
+}

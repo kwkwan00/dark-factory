@@ -12,9 +12,12 @@ import time
 
 import structlog
 
+from dark_factory.log import trace_methods
+
 log = structlog.get_logger()
 
 
+@trace_methods
 class BackgroundLoopSampler:
     """Periodic sampler thread."""
 

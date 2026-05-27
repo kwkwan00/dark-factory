@@ -46,12 +46,15 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from dark_factory.log import trace_methods
+
 if TYPE_CHECKING:
     from dark_factory.vector.repository import VectorRepository
 
 log = structlog.get_logger()
 
 
+@trace_methods
 class MemoryDedupHelper:
     """Find semantically-similar existing memories before writing new ones.
 

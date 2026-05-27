@@ -15,7 +15,7 @@ def test_openapi_schema_registered(api_client):
     assert resp.status_code == 200
     paths = resp.json()["paths"]
     assert "/api/agent/run" in paths
-    assert "/api/graph/gaps" in paths
+    assert "/api/graph/gaps/{run_id}" in paths
     assert "/api/history" in paths
     assert "/api/memory/search" in paths
     assert "/api/health" in paths
@@ -23,6 +23,13 @@ def test_openapi_schema_registered(api_client):
     assert "/api/watch/stop" in paths
     assert "/api/watch/status" in paths
     assert "/api/upload" in paths
+    assert "/api/refinery" in paths
+    assert "/api/refinery/export" in paths
+    assert "/api/refinery/history" in paths
+    assert "/api/refinery/{result_id}" in paths
+    assert "/api/memory/check-duplicate" in paths
+    assert "/api/graph/requirements/{req_id}" in paths
+    assert "/api/graph/requirements/export" in paths
 
 
 def test_cors_headers_present(api_client):

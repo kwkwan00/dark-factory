@@ -81,8 +81,8 @@ def test_e2e_skips_when_output_dir_missing(tmp_path: Path):
 
 def test_e2e_calls_deep_agent_with_expected_tools_and_browsers(tmp_path: Path):
     """The stage must invoke ``_run_deep_agent`` with the full Read/
-    Write/Edit/Glob/Grep/Bash tool set, the configured max_turns and
-    timeout, and a prompt that mentions every browser in the matrix."""
+    Write/Edit/Glob/Grep/Bash tool set, the configured timeout, and a
+    prompt that mentions every browser in the matrix."""
     (tmp_path / "app").mkdir()
     captured: list[dict] = []
 
@@ -96,7 +96,6 @@ def test_e2e_calls_deep_agent_with_expected_tools_and_browsers(tmp_path: Path):
             {
                 "prompt": prompt,
                 "allowed_tools": allowed_tools,
-                "max_turns": max_turns,
                 "timeout_seconds": timeout_seconds,
             }
         )
@@ -106,7 +105,7 @@ def test_e2e_calls_deep_agent_with_expected_tools_and_browsers(tmp_path: Path):
         "dark_factory.agents.tools._run_deep_agent",
         side_effect=_fake_deep_agent,
     ):
-        stage = E2EValidationStage(max_turns=99, timeout_seconds=2000)
+        stage = E2EValidationStage(timeout_seconds=2000)
         result = stage.run(
             run_id="run-abc",
             output_dir=tmp_path,
@@ -119,9 +118,7 @@ def test_e2e_calls_deep_agent_with_expected_tools_and_browsers(tmp_path: Path):
     assert set(call["allowed_tools"]) == {
         "Read", "Write", "Edit", "Glob", "Grep", "Bash"
     }
-    assert call["max_turns"] == 99
     assert call["timeout_seconds"] == 2000.0
-    # Prompt includes the run id, feature list, all three browsers
     assert "run-abc" in call["prompt"]
     assert "dashboard" in call["prompt"]
     assert "chromium" in call["prompt"]

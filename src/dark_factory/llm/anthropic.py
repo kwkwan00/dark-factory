@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import re
 import time
 from typing import Any, TypeVar
@@ -12,9 +13,49 @@ from pydantic import BaseModel
 
 log = structlog.get_logger()
 
-from dark_factory.llm.base import DEFAULT_LLM_TIMEOUT_SECONDS, LLMClient
+from dark_factory.llm.base import DEFAULT_LLM_TIMEOUT_SECONDS, DEFAULT_MODEL, LLMClient
+from dark_factory.log import trace_methods
 
 T = TypeVar("T", bound=BaseModel)
+
+def _is_transient(exc: Exception) -> bool:
+    """Return True if *exc* is a transient API error that is safe to retry."""
+    http_status = getattr(exc, "status_code", None)
+    return (
+        isinstance(exc, anthropic.RateLimitError)
+        or isinstance(exc, anthropic.APIConnectionError)
+        or isinstance(exc, anthropic.APITimeoutError)
+        or isinstance(exc, anthropic.InternalServerError)
+        or (isinstance(http_status, int) and http_status >= 500)
+    )
+
+
+def _backoff_sleep(attempt: int, exc: Exception) -> None:
+    """Sleep before a retry using exponential backoff with jitter.
+
+    Respects the ``Retry-After`` header when the server sends one (common on
+    429 rate-limit responses). Otherwise uses 2**attempt seconds ± 20% jitter,
+    capped at 30s so a flaky network doesn't stall the pipeline for minutes.
+    """
+    retry_after: float | None = None
+    try:
+        headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+        if raw:
+            retry_after = float(raw)
+    except Exception:
+        pass
+
+    if retry_after is not None:
+        sleep_secs = min(retry_after, 30.0)
+    else:
+        base = 2.0 ** attempt          # 1s on first retry, 2s on second
+        jitter = base * 0.2 * (2 * random.random() - 1)
+        sleep_secs = min(base + jitter, 30.0)
+
+    log.debug("llm_retry_backoff", attempt=attempt + 1, sleep_seconds=round(sleep_secs, 2))
+    time.sleep(sleep_secs)
+
 
 # H6: regex to extract JSON from markdown code blocks or raw text.
 # Still used by ClaudeAgentClient which doesn't have a tool_use equivalent;
@@ -118,6 +159,14 @@ def _record_llm_call(
     except Exception:  # pragma: no cover — defensive
         cost_usd = None
 
+    # Resolve the current pipeline phase for the metric label
+    phase = None
+    try:
+        from dark_factory.agents.tools import get_current_phase
+        phase = get_current_phase() or None
+    except Exception:
+        pass
+
     # Prometheus (always on)
     try:
         from dark_factory.metrics.prometheus import observe_llm_call
@@ -125,6 +174,7 @@ def _record_llm_call(
         observe_llm_call(
             client=client,
             model=model,
+            phase=phase,
             latency_seconds=latency_seconds,
             time_to_first_token_seconds=time_to_first_token_seconds,
             input_tokens=input_tokens,
@@ -150,6 +200,7 @@ def _record_llm_call(
         recorder.record_llm_call(
             client=client,
             model=model,
+            phase=phase,
             prompt_chars=prompt_chars,
             completion_chars=completion_chars,
             system_prompt_chars=system_prompt_chars,
@@ -216,11 +267,12 @@ def _extract_json(raw: str) -> str:
     return text
 
 
+@trace_methods
 class AnthropicClient(LLMClient):
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "claude-sonnet-4-6",
+        model: str = DEFAULT_MODEL,
         max_tokens: int = 32768,
     ) -> None:
         self.client = anthropic.Anthropic(api_key=api_key)
@@ -255,70 +307,100 @@ class AnthropicClient(LLMClient):
         # Use streaming mode — Anthropic requires it when max_tokens is high
         # or requests may exceed the 10-minute non-streaming limit.
         # Iterate text_stream explicitly to guarantee we capture every chunk.
-        started_at = time.time()
-        first_token_at: float | None = None
-        parts: list[str] = []
-        stop_reason: str | None = None
-        input_tokens: int | None = None
-        output_tokens: int | None = None
-        cache_read: int | None = None
-        cache_create: int | None = None
-        error: str | None = None
-        http_status: int | None = None
-        rate_limited = False
+        # Retry once on transient errors (APITimeoutError, APIConnectionError,
+        # RateLimitError, 5xx) with exponential backoff before re-attempting.
+        _run_start = time.time()
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            started_at = time.time()
+            first_token_at: float | None = None
+            parts: list[str] = []
+            stop_reason: str | None = None
+            input_tokens: int | None = None
+            output_tokens: int | None = None
+            cache_read: int | None = None
+            cache_create: int | None = None
+            error: str | None = None
+            http_status: int | None = None
+            rate_limited = False
 
-        try:
-            with self.client.messages.stream(**kwargs) as stream:
-                for text in stream.text_stream:
-                    if first_token_at is None and text:
-                        first_token_at = time.time()
-                    parts.append(text)
-                # Log stop_reason in case of truncation
-                final = stream.get_final_message()
-                stop_reason = final.stop_reason
-                input_tokens = getattr(final.usage, "input_tokens", None)
-                output_tokens = getattr(final.usage, "output_tokens", None)
-                # Prompt caching fields (available on recent Anthropic SDK versions)
-                cache_read = getattr(final.usage, "cache_read_input_tokens", None)
-                cache_create = getattr(final.usage, "cache_creation_input_tokens", None)
-                if stop_reason not in (None, "end_turn"):
+            try:
+                with self.client.messages.stream(**kwargs) as stream:
+                    for text in stream.text_stream:
+                        if first_token_at is None and text:
+                            first_token_at = time.time()
+                        parts.append(text)
+                    # Log stop_reason in case of truncation
+                    final = stream.get_final_message()
+                    stop_reason = final.stop_reason
+                    input_tokens = getattr(final.usage, "input_tokens", None)
+                    output_tokens = getattr(final.usage, "output_tokens", None)
+                    # Prompt caching fields (available on recent Anthropic SDK versions)
+                    cache_read = getattr(final.usage, "cache_read_input_tokens", None)
+                    cache_create = getattr(final.usage, "cache_creation_input_tokens", None)
+                    if stop_reason not in (None, "end_turn"):
+                        log.warning(
+                            "llm_stop_reason",
+                            stop_reason=stop_reason,
+                            output_tokens=output_tokens,
+                            max_tokens=self.max_tokens,
+                        )
+                # Successful — break out of retry loop
+                break
+            except Exception as exc:
+                last_exc = exc
+                error = str(exc)
+                http_status = getattr(exc, "status_code", None)
+                rate_limited = isinstance(exc, anthropic.RateLimitError) or (
+                    http_status == 429
+                )
+                _record_llm_call(
+                    client="anthropic",
+                    model=self.model,
+                    prompt_chars=len(prompt),
+                    system_prompt_chars=len(system) if system else None,
+                    max_tokens_requested=self.max_tokens,
+                    started_at=started_at,
+                    http_status=http_status,
+                    rate_limited=rate_limited,
+                    retry_count=attempt,
+                    error=error,
+                )
+                if not _is_transient(exc):
+                    # Permanent failure — record incident and bail immediately
+                    try:
+                        from dark_factory.metrics.helpers import record_incident
+                        record_incident(
+                            category="llm",
+                            severity="error",
+                            message=f"{type(exc).__name__}: {error}"[:500],
+                            phase="llm_call",
+                        )
+                    except Exception:  # pragma: no cover
+                        pass
+                    raise
+                if attempt < 1:
                     log.warning(
-                        "llm_stop_reason",
-                        stop_reason=stop_reason,
-                        output_tokens=output_tokens,
-                        max_tokens=self.max_tokens,
+                        "llm_complete_retry",
+                        attempt=attempt + 1,
+                        error=error[:200],
+                        rate_limited=rate_limited,
                     )
-        except Exception as exc:
-            error = str(exc)
-            # Extract HTTP status + rate-limit flag from anthropic SDK exceptions
-            http_status = getattr(exc, "status_code", None)
-            rate_limited = isinstance(exc, anthropic.RateLimitError) or (
-                http_status == 429
-            )
-            _record_llm_call(
-                client="anthropic",
-                model=self.model,
-                prompt_chars=len(prompt),
-                system_prompt_chars=len(system) if system else None,
-                max_tokens_requested=self.max_tokens,
-                started_at=started_at,
-                http_status=http_status,
-                rate_limited=rate_limited,
-                error=error,
-            )
-            # Record as an incident too for the Incidents panel.
+                    _backoff_sleep(attempt, exc)
+        else:
+            # Exhausted retries — record incident and re-raise last error
+            assert last_exc is not None
             try:
                 from dark_factory.metrics.helpers import record_incident
-
                 record_incident(
                     category="llm",
                     severity="error",
-                    message=f"{type(exc).__name__}: {error}"[:500],
+                    message=f"complete() failed after 2 attempts: {last_exc}"[:500],
                     phase="llm_call",
                 )
             except Exception:  # pragma: no cover
                 pass
-            raise
+            raise last_exc
 
         completion = "".join(parts)
         ttft: float | None = None
@@ -469,24 +551,7 @@ class AnthropicClient(LLMClient):
                     error=str(exc)[:500],
                 )
 
-                # Classify the error: only retry on transient failures
-                # (rate limits, 5xx server errors, network glitches).
-                # Auth errors, 4xx validation errors, and invalid-request
-                # errors will never succeed on retry — bail immediately
-                # rather than burning a second API call and doubling the
-                # latency on permanent failures.
-                is_transient = (
-                    rate_limited
-                    or isinstance(
-                        exc,
-                        (
-                            anthropic.APIConnectionError,
-                            anthropic.APITimeoutError,
-                            anthropic.InternalServerError,
-                        ),
-                    )
-                    or (isinstance(http_status, int) and http_status >= 500)
-                )
+                is_transient = _is_transient(exc)
                 log.warning(
                     "structured_tool_use_retry",
                     attempt=attempt + 1,
@@ -499,6 +564,8 @@ class AnthropicClient(LLMClient):
                     # Permanent failure — don't retry, re-raise now with
                     # the original exception for the caller's stack.
                     raise
+                if attempt < 1:
+                    _backoff_sleep(attempt, exc)
 
         assert last_error is not None
         raise last_error

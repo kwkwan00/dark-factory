@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import RefreshIcon from "./RefreshIcon";
 import {
   api,
   type EvalRun,
@@ -10,6 +11,8 @@ import {
   type RunFilesResponse,
 } from "../api/client";
 import { useRunEvaluation } from "../hooks/useDashboard";
+import RunCompareTab from "./RunCompareTab";
+import RunTraceability from "./RunTraceability";
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -59,6 +62,7 @@ function statusBadgeClass(status: string): string {
   if (status === "success") return "badge-success";
   if (status === "partial") return "badge-warn";
   if (status === "running") return "badge-info";
+  if (status === "cancelled") return "badge-warn";
   return "badge-error";
 }
 
@@ -281,13 +285,23 @@ function FileExplorer({ runId }: FileExplorerProps) {
           marginBottom: 12,
         }}
       >
-        <div className="card-title" style={{ margin: 0 }}>
-          Output files
-          {summaryLine && (
-            <span style={{ color: "#8b949e", fontWeight: 400, marginLeft: 8, fontSize: 12 }}>
-              — {summaryLine}
-            </span>
-          )}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div className="card-title" style={{ margin: 0 }}>
+            Output files
+            {summaryLine && (
+              <span style={{ color: "#8b949e", fontWeight: 400, marginLeft: 8, fontSize: 12 }}>
+                — {summaryLine}
+              </span>
+            )}
+          </div>
+          <a
+            href={api.runDownloadUrl(runId)}
+            download
+            className="btn btn-secondary"
+            style={{ fontSize: 11, padding: "4px 10px", textDecoration: "none" }}
+          >
+            Download ZIP
+          </a>
         </div>
       </div>
 
@@ -498,8 +512,13 @@ function RunMetrics({ runId }: RunMetricsProps) {
           <div className="card-title" style={{ margin: 0 }}>
             Run {run && <code style={{ fontSize: 13 }}>{run.run_id}</code>}
           </div>
-          <button className="btn btn-secondary" onClick={refresh}>
-            Refresh
+          <button
+            className="btn btn-secondary"
+            onClick={refresh}
+            title="Refresh metrics"
+            style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+          >
+            <RefreshIcon /> Refresh
           </button>
         </div>
 
@@ -1157,8 +1176,10 @@ function RunEvaluations({ runId }: RunEvaluationsProps) {
             <button
               className="btn btn-secondary"
               onClick={() => void refresh()}
+              title="Refresh evaluations"
+              style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
             >
-              Refresh
+              <RefreshIcon /> Refresh
             </button>
           </div>
         </div>
@@ -1260,7 +1281,7 @@ function RunEpisodes({ runId }: RunEpisodesProps) {
       <div
         style={{
           color: "#8b949e",
-          fontSize: 12,
+          fontSize: 13,
           marginBottom: 4,
         }}
       >
@@ -1283,15 +1304,15 @@ function RunEpisodes({ runId }: RunEpisodesProps) {
             <span className={`log-badge ${_outcomeBadgeClass(ep.outcome)}`}>
               {ep.outcome}
             </span>
-            <span style={{ fontSize: 11, color: "#8b949e", fontWeight: 400 }}>
+            <span style={{ fontSize: 13, color: "#8b949e", fontWeight: 400 }}>
               {ep.turns_used} turns · {_formatDuration(ep.duration_seconds)}
             </span>
           </div>
           <p
             style={{
-              fontSize: 12,
+              fontSize: 14,
               color: "#c9d1d9",
-              lineHeight: 1.55,
+              lineHeight: 1.6,
               margin: "0 0 12px",
             }}
           >
@@ -1302,7 +1323,7 @@ function RunEpisodes({ runId }: RunEpisodesProps) {
             <div style={{ marginBottom: 10 }}>
               <div
                 style={{
-                  fontSize: 10,
+                  fontSize: 12,
                   color: "#58a6ff",
                   textTransform: "uppercase",
                   letterSpacing: 0.5,
@@ -1315,7 +1336,7 @@ function RunEpisodes({ runId }: RunEpisodesProps) {
                 style={{
                   margin: 0,
                   paddingLeft: 18,
-                  fontSize: 11,
+                  fontSize: 13,
                   color: "#8b949e",
                   lineHeight: 1.6,
                 }}
@@ -1344,11 +1365,11 @@ function RunEpisodes({ runId }: RunEpisodesProps) {
                 <span
                   key={metric}
                   style={{
-                    fontSize: 10,
+                    fontSize: 12,
                     color: score >= 0.5 ? "#3fb950" : "#f85149",
                     background: "#0d1117",
                     border: "1px solid #30363d",
-                    padding: "2px 6px",
+                    padding: "2px 8px",
                     borderRadius: 4,
                   }}
                 >
@@ -1362,7 +1383,7 @@ function RunEpisodes({ runId }: RunEpisodesProps) {
             style={{
               display: "flex",
               gap: 12,
-              fontSize: 10,
+              fontSize: 12,
               color: "#6e7681",
             }}
           >
@@ -1381,7 +1402,7 @@ function RunEpisodes({ runId }: RunEpisodesProps) {
 // ── Agent Log pane ─────────────────────────────────────────────────────────
 
 import {
-  EVENT_BADGES,
+  resolveBadge,
   formatTimeFromISO,
   formatEventDetails,
   logEntryToProgressEvent,
@@ -1407,27 +1428,24 @@ function AgentLog({ runId }: AgentLogProps) {
     });
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
+  const refresh = useCallback(() => {
     setLoading(true);
     setError(null);
     api
       .metricsRunDetail(runId)
       .then((resp) => {
-        if (cancelled) return;
         setEntries(resp.progress_log ?? []);
+        setLoading(false);
       })
-      .catch((err) => {
-        if (cancelled) return;
-        setError(String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
+      .catch((err: unknown) => {
+        setError(err instanceof Error ? err.message : String(err));
+        setLoading(false);
       });
-    return () => {
-      cancelled = true;
-    };
   }, [runId]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
 
   const filtered = useMemo(() => {
     if (!entries) return [];
@@ -1474,6 +1492,14 @@ function AgentLog({ runId }: AgentLogProps) {
             Agent Log ({filtered.length}
             {filter.trim() ? ` / ${entries.length}` : ""} events)
           </div>
+          <button
+            className="btn btn-secondary"
+            onClick={refresh}
+            title="Refresh agent log"
+            style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
+          >
+            <RefreshIcon /> Refresh
+          </button>
         </div>
         <div className="input-row" style={{ margin: 0 }}>
           <input
@@ -1495,10 +1521,7 @@ function AgentLog({ runId }: AgentLogProps) {
           ) : (
             filtered.map((entry) => {
               const ev = logEntryToProgressEvent(entry);
-              const badge = EVENT_BADGES[entry.event] ?? {
-                label: entry.event.toUpperCase(),
-                color: "#8b949e",
-              };
+              const badge = resolveBadge(ev);
               const hasPayload =
                 entry.payload && Object.keys(entry.payload).length > 0;
               const isExpanded = expandedIds.has(entry.id);
@@ -1575,14 +1598,14 @@ interface RunDetailWindowProps {
   runId: string;
 }
 
-type RunDetailView = "metrics" | "output" | "evaluations" | "episodes" | "agent-log";
+type RunDetailView = "metrics" | "output" | "evaluations" | "episodes" | "agent-log" | "traceability" | "compare";
 
 export default function RunDetailWindow({ runId }: RunDetailWindowProps) {
   // Per-run detail is split into two separate screens so each one can
   // use the full scroll area — stacking both vertically (metrics above
   // the file explorer) pushed the tree out of view for any run with
   // more than a handful of metric cards.
-  const [view, setView] = useState<RunDetailView>("metrics");
+  const [view, setView] = useState<RunDetailView>("agent-log");
 
   // Set the window title so tab bars show the run id.
   useEffect(() => {
@@ -1625,18 +1648,18 @@ export default function RunDetailWindow({ runId }: RunDetailWindowProps) {
           the file-tree explorer for generated artifacts. */}
       <nav className="tab-nav">
         <button
-          className={`tab-btn${view === "metrics" ? " active" : ""}`}
-          onClick={() => setView("metrics")}
-          aria-pressed={view === "metrics"}
-        >
-          Metrics
-        </button>
-        <button
           className={`tab-btn${view === "agent-log" ? " active" : ""}`}
           onClick={() => setView("agent-log")}
           aria-pressed={view === "agent-log"}
         >
           Agent Log
+        </button>
+        <button
+          className={`tab-btn${view === "metrics" ? " active" : ""}`}
+          onClick={() => setView("metrics")}
+          aria-pressed={view === "metrics"}
+        >
+          Metrics
         </button>
         <button
           className={`tab-btn${view === "evaluations" ? " active" : ""}`}
@@ -1646,6 +1669,13 @@ export default function RunDetailWindow({ runId }: RunDetailWindowProps) {
           Evaluations
         </button>
         <button
+          className={`tab-btn${view === "episodes" ? " active" : ""}`}
+          onClick={() => setView("episodes")}
+          aria-pressed={view === "episodes"}
+        >
+          Episodes
+        </button>
+        <button
           className={`tab-btn${view === "output" ? " active" : ""}`}
           onClick={() => setView("output")}
           aria-pressed={view === "output"}
@@ -1653,11 +1683,18 @@ export default function RunDetailWindow({ runId }: RunDetailWindowProps) {
           Output
         </button>
         <button
-          className={`tab-btn${view === "episodes" ? " active" : ""}`}
-          onClick={() => setView("episodes")}
-          aria-pressed={view === "episodes"}
+          className={`tab-btn${view === "compare" ? " active" : ""}`}
+          onClick={() => setView("compare")}
+          aria-pressed={view === "compare"}
         >
-          Episodes
+          Compare
+        </button>
+        <button
+          className={`tab-btn${view === "traceability" ? " active" : ""}`}
+          onClick={() => setView("traceability")}
+          aria-pressed={view === "traceability"}
+        >
+          Traceability
         </button>
       </nav>
 
@@ -1667,6 +1704,8 @@ export default function RunDetailWindow({ runId }: RunDetailWindowProps) {
         {view === "evaluations" && <RunEvaluations runId={runId} />}
         {view === "output" && <FileExplorer runId={runId} />}
         {view === "episodes" && <RunEpisodes runId={runId} />}
+        {view === "traceability" && <RunTraceability runId={runId} />}
+        {view === "compare" && <RunCompareTab runId={runId} />}
       </main>
     </>
   );

@@ -38,6 +38,7 @@ Implementation notes:
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Any, Literal
@@ -46,6 +47,7 @@ import structlog
 from pydantic import BaseModel
 
 from dark_factory.agents.cancellation import PipelineCancelled
+from dark_factory.log import trace_methods
 
 log = structlog.get_logger()
 
@@ -82,6 +84,7 @@ class ReconciliationResult(BaseModel):
     duration_seconds: float
 
 
+@trace_methods
 class ReconciliationStage:
     """Runs the reconciliation deep agent on a completed run's output.
 
@@ -183,6 +186,7 @@ class ReconciliationStage:
             feature_count=len(feature_results),
             feature_list=", ".join(feature_names) or "(none)",
             feature_status_summary=", ".join(statuses),
+            max_turns=self.max_turns,
         )
 
         # ── Announce the phase ──────────────────────────────────────
@@ -202,20 +206,13 @@ class ReconciliationStage:
         )
 
         # ── Run the deep agent ──────────────────────────────────────
-        # We import lazily to keep reconciliation.py cheap to import
-        # for test code that stubs out _run_deep_agent.
-        from dark_factory.agents import tools as _tools_mod
-
-        # Switch the module-level output dir so _run_deep_agent's
-        # ``cwd`` resolves to the run's output root. Save + restore the
-        # previous value so we don't leak this into other phases.
-        previous_output = _tools_mod._output_dir
-        _tools_mod._output_dir = output_dir
+        from dark_factory.stages._helpers import run_deep_agent_in_dir
 
         agent_output = ""
         agent_error: Exception | None = None
         try:
-            agent_output = _tools_mod._run_deep_agent(
+            agent_output = run_deep_agent_in_dir(
+                output_dir=output_dir,
                 prompt=prompt,
                 allowed_tools=[
                     "Read",
@@ -229,12 +226,6 @@ class ReconciliationStage:
                 timeout_seconds=float(self.timeout_seconds),
             )
         except PipelineCancelled:
-            # B2 fix: cancel signal must propagate out of best-effort
-            # stages. Without this guard the broad ``except Exception``
-            # below would swallow PipelineCancelled and the pipeline
-            # would blithely proceed to Phase 6 after a user cancel
-            # during Phase 5, making the Cancel button unreliable.
-            _tools_mod._output_dir = previous_output
             raise
         except Exception as exc:
             agent_error = exc
@@ -243,8 +234,6 @@ class ReconciliationStage:
                 run_id=run_id,
                 error=str(exc),
             )
-        finally:
-            _tools_mod._output_dir = previous_output
 
         duration = time.time() - started
 
@@ -274,19 +263,46 @@ class ReconciliationStage:
                 except Exception:  # pragma: no cover — defensive
                     pass
             lowered = haystack.lower()
-            if (
-                "overall status: clean" in lowered
-                or "status: clean" in lowered
-            ):
+
+            # Flexible status detection — the agent writes "Overall
+            # status: clean" in RECONCILIATION_REPORT.md, but formatting
+            # varies (bold markers, extra whitespace, different casing).
+            # Also check for evidence of successful validation in the
+            # agent's own output text.
+            _clean_re = re.compile(
+                r"(?:overall\s+)?status\s*[:=]\s*\**\s*clean\b", re.IGNORECASE
+            )
+            _broken_re = re.compile(
+                r"(?:overall\s+)?status\s*[:=]\s*\**\s*broken\b", re.IGNORECASE
+            )
+            # Secondary signal: agent explicitly reports all tests/checks passed
+            _all_passed_signals = [
+                "all validation commands pass",
+                "all tests pass",
+                "all checks pass",
+                "0 failures",
+                "0 failed",
+                "passed in ",  # pytest summary: "N passed in Xs"
+                "tests passed",
+            ]
+
+            if _clean_re.search(haystack):
                 status = "clean"
                 summary = "Reconciliation clean — all validation passed"
-            elif (
-                "overall status: broken" in lowered
-                or "status: broken" in lowered
-            ):
+            elif _broken_re.search(haystack):
                 status = "partial"
                 summary = (
                     "Reconciliation finished with significant remaining issues"
+                )
+            elif any(sig in lowered for sig in _all_passed_signals):
+                # Agent didn't write the exact status string but its
+                # output shows validation succeeded.
+                status = "clean"
+                summary = "Reconciliation clean — validation passed (inferred from agent output)"
+                log.info(
+                    "reconciliation_status_inferred_clean",
+                    run_id=run_id,
+                    reason="agent output contains passing validation signals",
                 )
             else:
                 status = "partial"

@@ -171,28 +171,64 @@ def get_current_run_id() -> str:
     return _current_run_id
 
 
+_current_phase: str = ""
+
+
+def set_current_phase(phase: str) -> None:
+    global _current_phase
+    _current_phase = phase
+
+
+def get_current_phase() -> str:
+    return _current_phase
+
+
 def set_eval_config(config: Any) -> None:
     global _eval_config
     _eval_config = config
 
 
 def add_recalled_memory_ids(ids: list[str]) -> None:
-    """Replace (not append) the recalled-memory IDs for this thread.
+    """Replace (not append) the per-eval recalled-memory IDs for this thread.
 
-    C5 fix: each ``recall_memories`` call resets the list so feedback from
-    a subsequent ``evaluate_*`` only applies to the MOST RECENT recall.
-    Previously, IDs accumulated across specs in a thread, causing one
-    spec's eval to boost/demote memories recalled for an unrelated spec.
+    C5 fix: each ``recall_memories`` call resets the per-eval list so
+    feedback from a subsequent ``evaluate_*`` only applies to the MOST
+    RECENT recall.  Previously, IDs accumulated across specs in a
+    thread, causing one spec's eval to boost/demote memories recalled
+    for an unrelated spec.
+
+    Also accumulates into a per-feature set that survives eval clears,
+    used by episode synthesis to record which memories influenced the
+    feature's outcome.
     """
     _thread_local.recalled_memory_ids = list(ids)
+    # Per-feature accumulator — never cleared by eval, only by
+    # clear_feature_recalled_memories() at feature end.
+    existing = getattr(_thread_local, "feature_recalled_memory_ids", None)
+    if existing is None:
+        _thread_local.feature_recalled_memory_ids = set(ids)
+    else:
+        existing.update(ids)
 
 
 def get_recalled_memory_ids() -> list[str]:
+    """Per-eval recalled IDs (for feedback loop)."""
     return getattr(_thread_local, "recalled_memory_ids", [])
 
 
+def get_feature_recalled_memory_ids() -> list[str]:
+    """All memory IDs recalled during this feature (for episode synthesis)."""
+    return sorted(getattr(_thread_local, "feature_recalled_memory_ids", set()))
+
+
 def clear_recalled_memories() -> None:
+    """Clear per-eval recalled IDs (called after each evaluate_*)."""
     _thread_local.recalled_memory_ids = []
+
+
+def clear_feature_recalled_memories() -> None:
+    """Clear per-feature recalled IDs (called at feature end)."""
+    _thread_local.feature_recalled_memory_ids = set()
 
 
 def set_vector_repo(repo: Any) -> None:
@@ -291,6 +327,20 @@ def write_file(file_path: str, content: str) -> str:
         try:
             storage_path = f"{feature}/{file_path}" if feature else file_path
             rs.write_output(storage_path, content)
+        except Exception:
+            pass  # Best-effort — local write already succeeded
+    # Index in Qdrant so semantic code search works for future runs.
+    if _vector_repo is not None:
+        try:
+            from dark_factory.models.domain import CodeArtifact
+            artifact = CodeArtifact(
+                id=f"{feature or 'unknown'}/{file_path}",
+                spec_id="",
+                file_path=file_path,
+                language=Path(file_path).suffix.lstrip(".") or "txt",
+                content=content,
+            )
+            _vector_repo.upsert_code(artifact=artifact)
         except Exception:
             pass  # Best-effort — local write already succeeded
     return str(out)
@@ -464,8 +514,30 @@ def _run_deep_agent(
     )
 
     async def _run() -> str:
+        from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
+
         texts: list[str] = []
+        turn = [0]
         async for message in query(prompt=prompt, options=opts):
+            if isinstance(message, AssistantMessage):
+                turn[0] += 1
+                tool_names = []
+                text_preview = ""
+                for block in message.content:
+                    if isinstance(block, ToolUseBlock):
+                        tool_names.append(block.name)
+                    elif isinstance(block, TextBlock) and block.text:
+                        text_preview = block.text[:150]
+                try:
+                    emit_progress(
+                        "deep_agent_turn",
+                        turn=turn[0],
+                        max_turns=max_turns,
+                        tools=tool_names or None,
+                        text=text_preview or None,
+                    )
+                except Exception:
+                    pass
             if isinstance(message, ResultMessage) and message.result:
                 texts.append(message.result)
         return "\n".join(texts) if texts else "Analysis completed."
@@ -547,6 +619,43 @@ def _run_deep_agent(
         raise
 
 
+def _log_deep_error(label: str, exc: Exception, category: str = "llm", **log_extra: Any) -> str:
+    """Shared error handler for deep-agent/analysis failures.
+
+    Logs, records an incident, and returns a structured error string the
+    LangGraph agent can reason about. Never raises.
+    """
+    log.error(label, error=str(exc), **log_extra)
+    try:
+        from dark_factory.metrics.helpers import record_incident
+
+        record_incident(
+            category=category,
+            severity="error",
+            message=f"{label}: {exc}"[:500],
+            phase="deep_agent",
+            feature=get_current_feature() or None,
+        )
+    except Exception:  # pragma: no cover — defensive
+        pass
+    readable = label.replace("_", " ")
+    extra_str = ""
+    if log_extra:
+        extra_parts = [f"{k}={v}" for k, v in log_extra.items()]
+        extra_str = f" ({', '.join(extra_parts)})"
+    return (
+        f"Error: {readable}{extra_str}: {exc}. "
+        f"This call was best-effort; continue with the rest of the "
+        f"workflow using any partial results you already have."
+    )
+
+
+def _build_context_block(*pairs: tuple[str, str]) -> str:
+    """Build a context block from (label, content) pairs, skipping empty content."""
+    parts = [f"\n\n{label}:\n{content}" for label, content in pairs if content]
+    return "".join(parts)
+
+
 def _safe_tool_deep_agent(
     prompt: str,
     allowed_tools: list[str],
@@ -577,31 +686,35 @@ def _safe_tool_deep_agent(
             timeout_seconds=timeout_seconds,
         )
     except Exception as exc:
-        # The raise site in ``_run_deep_agent`` has already logged
-        # the crash with structured context and recorded an
-        # incident, so we only need to hand the agent a readable
-        # error it can react to. Include the tool list so the
-        # LangGraph agent has enough context to decide whether to
-        # retry with different inputs or skip to the next step.
-        return (
-            f"Error: deep agent (tools={allowed_tools}) failed: {exc}. "
-            f"This call was best-effort; continue with the rest of the "
-            f"workflow using any partial results you already have."
-        )
+        return _log_deep_error("deep_agent_failed", exc, category="subprocess", tools=allowed_tools)
 
 
 # ── Direct API helpers (replacing Claude Agent SDK for @tool calls) ──
 
 
+_deep_model_cache: dict[str, str | None] = {}
+
+
 def _resolve_deep_model(role: str) -> str | None:
-    """Resolve model for a deep agent role from routing config, or None for default."""
+    """Resolve model for a deep agent role from routing config, or None for default.
+
+    Cached per role for the lifetime of the process — config is static within a run.
+    """
+    cached = _deep_model_cache.get(role, _SENTINEL)
+    if cached is not _SENTINEL:
+        return cached
     try:
         from dark_factory.config import load_settings
         settings = load_settings()
-        override = settings.model_routing.resolve(role, settings.llm.model)
-        return override
+        result = settings.model_routing.resolve(role, settings.llm.model)
+        _deep_model_cache[role] = result
+        return result
     except Exception:
+        _deep_model_cache[role] = None
         return None
+
+
+_SENTINEL = object()
 
 
 def _safe_llm_complete(prompt: str, timeout_seconds: float | None = None) -> str:
@@ -620,24 +733,7 @@ def _safe_llm_complete(prompt: str, timeout_seconds: float | None = None) -> str
             prompt, timeout_seconds=timeout_seconds or DEEP_AGENT_TIMEOUT_SECONDS
         )
     except Exception as exc:
-        log.error("deep_analysis_failed", error=str(exc))
-        try:
-            from dark_factory.metrics.helpers import record_incident
-
-            record_incident(
-                category="llm",
-                severity="error",
-                message=f"Deep analysis failed: {exc}",
-                phase="deep_agent",
-                feature=get_current_feature() or None,
-            )
-        except Exception:
-            pass
-        return (
-            f"Error: analysis failed: {exc}. "
-            f"This call was best-effort; continue with the rest of the "
-            f"workflow using any partial results you already have."
-        )
+        return _log_deep_error("deep_analysis_failed", exc)
 
 
 def _safe_agentic_call(
@@ -681,24 +777,7 @@ def _safe_agentic_call(
             on_turn=_on_turn,
         )
     except Exception as exc:
-        log.error("deep_agentic_failed", error=str(exc), tools=allowed_tools)
-        try:
-            from dark_factory.metrics.helpers import record_incident
-
-            record_incident(
-                category="llm",
-                severity="error",
-                message=f"Agentic call failed: {exc}",
-                phase="deep_agent",
-                feature=get_current_feature() or None,
-            )
-        except Exception:
-            pass
-        return (
-            f"Error: agentic call (tools={allowed_tools}) failed: {exc}. "
-            f"This call was best-effort; continue with the rest of the "
-            f"workflow using any partial results you already have."
-        )
+        return _log_deep_error("deep_agentic_failed", exc, tools=allowed_tools)
 
 
 # ── Coder deep agent ─────────────────────────────────────────────────
@@ -724,7 +803,7 @@ def deep_dependency_analysis(spec_ids_json: str, feature_name: str, relevant_mem
     """Spawn a deep agent to analyze the full dependency tree for a set of specs.
     Pass relevant_memories from recall_memories to give the subagent context about
     past dependency issues."""
-    context_block = f"\n\nRelevant memories from past runs:\n{relevant_memories}" if relevant_memories else ""
+    context_block = _build_context_block(("Relevant memories from past runs", relevant_memories))
     prompt = get_prompt("deep_dependency_analysis", "user").format(
         feature_name=feature_name, spec_ids_json=spec_ids_json, context_block=context_block,
     )
@@ -736,11 +815,10 @@ def deep_risk_assessment(feature_name: str, spec_context: str, relevant_memories
     """Spawn a deep agent to assess risks for a feature. Pass relevant_memories
     from recall_memories and eval_history from query_eval_history to give the
     subagent full context about past failures and score trends."""
-    context_block = ""
-    if relevant_memories:
-        context_block += f"\n\nRelevant memories from past runs:\n{relevant_memories}"
-    if eval_history:
-        context_block += f"\n\nEval history for this feature:\n{eval_history}"
+    context_block = _build_context_block(
+        ("Relevant memories from past runs", relevant_memories),
+        ("Eval history for this feature", eval_history),
+    )
     prompt = get_prompt("deep_risk_assessment", "user").format(
         feature_name=feature_name, spec_context=spec_context, context_block=context_block,
     )
@@ -754,7 +832,7 @@ def deep_risk_assessment(feature_name: str, spec_context: str, relevant_memories
 def deep_security_review(code_content: str, spec_context: str, relevant_memories: str = "") -> str:
     """Spawn a deep agent for focused security analysis. Pass relevant_memories
     from recall_memories (especially past security mistakes) for richer context."""
-    context_block = f"\n\nPast security-related memories:\n{relevant_memories}" if relevant_memories else ""
+    context_block = _build_context_block(("Past security-related memories", relevant_memories))
     prompt = get_prompt("deep_security_review", "user").format(
         code_content=code_content, spec_context=spec_context, context_block=context_block,
     )
@@ -765,7 +843,7 @@ def deep_security_review(code_content: str, spec_context: str, relevant_memories
 def deep_performance_review(code_content: str, spec_context: str, relevant_memories: str = "") -> str:
     """Spawn a deep agent for focused performance analysis. Pass relevant_memories
     from recall_memories (especially past performance mistakes) for richer context."""
-    context_block = f"\n\nPast performance-related memories:\n{relevant_memories}" if relevant_memories else ""
+    context_block = _build_context_block(("Past performance-related memories", relevant_memories))
     prompt = get_prompt("deep_performance_review", "user").format(
         code_content=code_content, spec_context=spec_context, context_block=context_block,
     )
@@ -776,7 +854,7 @@ def deep_performance_review(code_content: str, spec_context: str, relevant_memor
 def deep_spec_compliance_review(code_content: str, acceptance_criteria_json: str, eval_history: str = "") -> str:
     """Spawn a deep agent that checks code against each acceptance criterion.
     Pass eval_history from query_eval_history to show which criteria failed before."""
-    context_block = f"\n\nPast eval results for this spec:\n{eval_history}" if eval_history else ""
+    context_block = _build_context_block(("Past eval results for this spec", eval_history))
     prompt = get_prompt("deep_spec_compliance", "user").format(
         code_content=code_content, acceptance_criteria_json=acceptance_criteria_json, context_block=context_block,
     )
@@ -790,7 +868,7 @@ def deep_spec_compliance_review(code_content: str, acceptance_criteria_json: str
 def deep_unit_test_gen(code_content: str, spec_context: str, relevant_memories: str = "") -> str:
     """Spawn a deep agent for unit test generation. Pass relevant_memories from
     recall_memories to inform the subagent about past testing patterns and pitfalls."""
-    context_block = f"\n\nRelevant testing memories:\n{relevant_memories}" if relevant_memories else ""
+    context_block = _build_context_block(("Relevant testing memories", relevant_memories))
     prompt = get_prompt("deep_unit_test_gen", "user").format(
         code_content=code_content, spec_context=spec_context, context_block=context_block,
     )
@@ -801,7 +879,7 @@ def deep_unit_test_gen(code_content: str, spec_context: str, relevant_memories: 
 def deep_integration_test_gen(code_content: str, spec_context: str, relevant_memories: str = "") -> str:
     """Spawn a deep agent for integration test generation. Pass relevant_memories
     from recall_memories to inform about past integration issues."""
-    context_block = f"\n\nRelevant integration memories:\n{relevant_memories}" if relevant_memories else ""
+    context_block = _build_context_block(("Relevant integration memories", relevant_memories))
     prompt = get_prompt("deep_integration_test_gen", "user").format(
         code_content=code_content, spec_context=spec_context, context_block=context_block,
     )
@@ -812,7 +890,7 @@ def deep_integration_test_gen(code_content: str, spec_context: str, relevant_mem
 def deep_edge_case_test_gen(code_content: str, spec_context: str, past_mistakes_json: str = "[]", relevant_memories: str = "") -> str:
     """Spawn a deep agent for adversarial tests. Pass past_mistakes_json from
     search_memory(type='mistake') and relevant_memories from recall_memories."""
-    context_block = f"\n\nAdditional testing memories:\n{relevant_memories}" if relevant_memories else ""
+    context_block = _build_context_block(("Additional testing memories", relevant_memories))
     prompt = get_prompt("deep_edge_case_test_gen", "user").format(
         code_content=code_content, spec_context=spec_context,
         past_mistakes_json=past_mistakes_json, context_block=context_block,
@@ -838,18 +916,35 @@ def recall_memories(feature_name: str, spec_id: str = "") -> str:
 
     started = _time.time()
 
-    # Neo4j structured search (always)
+    # Neo4j structured search — scoped to this feature (always)
     neo4j_results = _memory_repo.get_related_memories(
         feature_name=feature_name, spec_id=spec_id, limit=20,
     )
 
-    # Qdrant semantic search (if available)
+    # Qdrant semantic search — two passes:
+    # 1. Feature-scoped: memories from this feature (high precision)
+    # 2. Cross-feature: semantically similar memories from ANY feature
+    #    (catches patterns like "use parameterised SQL" recorded by
+    #    feature "auth" that also applies to feature "user-profile")
     vector_results: list[dict] = []
     if _vector_repo:
         try:
-            vector_results = _vector_repo.search_memories(
-                query_text=feature_name, source_feature=feature_name, limit=20,
+            feature_scoped = _vector_repo.search_memories(
+                query_text=feature_name, source_feature=feature_name, limit=15,
             )
+            vector_results.extend(feature_scoped)
+        except Exception:
+            pass  # graceful degradation
+        try:
+            cross_feature = _vector_repo.search_memories(
+                query_text=feature_name, limit=10,
+            )
+            # Deduplicate against feature-scoped results
+            seen_ids = {r.get("id") for r in vector_results}
+            for r in cross_feature:
+                if r.get("id") not in seen_ids:
+                    vector_results.append(r)
+                    seen_ids.add(r.get("id"))
         except Exception:
             pass  # graceful degradation
 
@@ -962,6 +1057,9 @@ def _memory_run_id_or_error() -> str | None:
 @tool
 def record_pattern(description: str, context: str) -> str:
     """Record a reusable coding pattern learned during this run.
+    The description must be a general, reusable insight — NOT specific to a
+    particular spec ID. Write it so any future agent working on a similar
+    feature can benefit.
     Example: 'When generating auth modules, always include rate limiting'."""
     if _memory_repo is None:
         return _MEMORY_DISABLED_MSG
@@ -979,6 +1077,8 @@ def record_pattern(description: str, context: str) -> str:
 @tool
 def record_mistake(description: str, error_type: str, trigger_context: str) -> str:
     """Record a mistake found during review or testing.
+    The description must be a general lesson — NOT tied to a specific spec ID.
+    Write it so any future agent can recognize the same mistake pattern.
     Example: 'Using sync I/O in async handler caused test failures'."""
     if _memory_repo is None:
         return _MEMORY_DISABLED_MSG
@@ -996,7 +1096,9 @@ def record_mistake(description: str, error_type: str, trigger_context: str) -> s
 
 @tool
 def record_solution(description: str, mistake_id: str = "", code_snippet: str = "") -> str:
-    """Record a solution. Optionally link to a mistake_id it resolves."""
+    """Record a solution. Optionally link to a mistake_id it resolves.
+    The description must be a general fix — NOT specific to a particular spec.
+    Write it as a reusable approach any agent can apply."""
     if _memory_repo is None:
         return _MEMORY_DISABLED_MSG
     run_id = _memory_run_id_or_error()
@@ -1014,6 +1116,8 @@ def record_solution(description: str, mistake_id: str = "", code_snippet: str = 
 @tool
 def record_strategy(description: str, applicability: str) -> str:
     """Record a planning/execution strategy.
+    The description must be a general strategy — NOT tied to a specific spec.
+    Write it so any future planner can adopt the approach.
     Example: 'For specs with >3 dependencies, query all dep contexts first'."""
     if _memory_repo is None:
         return _MEMORY_DISABLED_MSG
@@ -1043,12 +1147,14 @@ def _auto_persist_eval(results: dict, spec_id: str, eval_type: str) -> None:
         run_id=_current_run_id,
         recalled_memory_ids=list(get_recalled_memory_ids()),
     )
-    all_passed = all(m.get("passed", False) for m in results.values() if isinstance(m, dict))
+    metric_dicts = [m for m in results.values() if isinstance(m, dict)]
+    passed_count = sum(1 for m in metric_dicts if m.get("passed", False))
+    pass_rate = passed_count / len(metric_dicts) if metric_dicts else 0.0
     boost = _eval_config.boost_delta if _eval_config else 0.1
-    demote = _eval_config.demote_delta if _eval_config else 0.05
+    demote = _eval_config.demote_delta if _eval_config else 0.1
     _memory_repo.apply_eval_feedback(
         recalled_memory_ids=list(get_recalled_memory_ids()),
-        all_passed=all_passed,
+        pass_rate=pass_rate,
         boost_delta=boost,
         demote_delta=demote,
     )
@@ -1374,16 +1480,12 @@ _LANGUAGE_MAP: dict[str, str] = {
 
 
 def _detect_language(file_path: str) -> str | None:
-    from pathlib import Path as _P
-
-    suffix = _P(file_path).suffix.lower()
+    suffix = Path(file_path).suffix.lower()
     return _LANGUAGE_MAP.get(suffix)
 
 
 def _is_test_path(file_path: str) -> bool:
-    from pathlib import Path as _P
-
-    p = _P(file_path)
+    p = Path(file_path)
     name = p.name.lower()
     if name.startswith("test_") or name.endswith("_test.py") or name.endswith(".test.ts"):
         return True

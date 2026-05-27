@@ -1,6 +1,9 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import AboutDarkFactory from "./components/AboutDarkFactory";
+import AboutRequirementsRefinery from "./components/AboutRequirementsRefinery";
+import RunCompareWindow from "./components/RunCompareWindow";
 import RunDetailWindow from "./components/RunDetailWindow";
 import "./index.css";
 
@@ -11,11 +14,8 @@ if (!rootElement) {
   throw new Error('Missing #root element in index.html — cannot mount React app');
 }
 
-// The Metrics tab opens per-run detail in a new window via
-// ``window.open("/#/run-detail?run_id=...", "_blank", "popup,...")``.
-// We detect that route here and render the dedicated popup component
-// instead of the full App (keeps the popup lightweight and avoids
-// pulling in the main tab bar / ManufactureContext).
+// Popup windows use hash routes so the same Vite bundle can render
+// lightweight popup components instead of the full App.
 function pickRoot(): JSX.Element {
   const hash = window.location.hash || "";
   if (hash.startsWith("#/run-detail")) {
@@ -23,6 +23,19 @@ function pickRoot(): JSX.Element {
     const params = new URLSearchParams(qs);
     const runId = params.get("run_id") ?? "";
     return <RunDetailWindow runId={runId} />;
+  }
+  if (hash.startsWith("#/run-compare")) {
+    const qs = hash.includes("?") ? hash.split("?", 2)[1] : "";
+    const params = new URLSearchParams(qs);
+    const runA = params.get("run_a") ?? "";
+    const runB = params.get("run_b") ?? "";
+    return <RunCompareWindow runA={runA} runB={runB} />;
+  }
+  if (hash.startsWith("#/about-dark-factory")) {
+    return <AboutDarkFactory />;
+  }
+  if (hash.startsWith("#/about-requirements-refinery")) {
+    return <AboutRequirementsRefinery />;
   }
   return <App />;
 }

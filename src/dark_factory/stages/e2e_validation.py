@@ -38,6 +38,7 @@ Implementation notes:
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Any, Literal
@@ -46,6 +47,7 @@ import structlog
 from pydantic import BaseModel, Field
 
 from dark_factory.agents.cancellation import PipelineCancelled
+from dark_factory.log import trace_methods
 
 log = structlog.get_logger()
 
@@ -102,6 +104,7 @@ class E2EValidationResult(BaseModel):
     duration_seconds: float = 0.0
 
 
+@trace_methods
 class E2EValidationStage:
     """Runs the Playwright deep-agent pass on a completed run's output.
 
@@ -116,12 +119,10 @@ class E2EValidationStage:
     def __init__(
         self,
         *,
-        max_turns: int = 40,
         timeout_seconds: int = 1200,
         browsers: list[str] | None = None,
         browsers_path: str = "/ms-playwright",
     ) -> None:
-        self.max_turns = max(1, max_turns)
         self.timeout_seconds = max(60, timeout_seconds)
         # Filter to the allowed set so an operator typo in
         # ``e2e_browsers`` can't produce a malformed Playwright
@@ -220,7 +221,6 @@ class E2EValidationStage:
             run_id=run_id,
             feature_count=len(feature_results),
             browsers=self.browsers,
-            max_turns=self.max_turns,
             timeout_seconds=self.timeout_seconds,
         )
         log.info(
@@ -228,25 +228,16 @@ class E2EValidationStage:
             run_id=run_id,
             output_dir=str(output_dir),
             browsers=self.browsers,
-            max_turns=self.max_turns,
         )
 
         # ── Run the deep agent ──────────────────────────────────────
-        # Lazy import so test code can stub out ``_run_deep_agent``
-        # without pulling the Claude Agent SDK at module import time.
-        from dark_factory.agents import tools as _tools_mod
-
-        # Swap ``_output_dir`` to the run output so the deep-agent
-        # subprocess's cwd resolves there. Save + restore so we don't
-        # leak into any subsequent pipeline work. Mirrors the
-        # reconciliation stage's pattern.
-        previous_output = _tools_mod._output_dir
-        _tools_mod._output_dir = output_dir
+        from dark_factory.stages._helpers import run_deep_agent_in_dir
 
         agent_output = ""
         agent_error: Exception | None = None
         try:
-            agent_output = _tools_mod._run_deep_agent(
+            agent_output = run_deep_agent_in_dir(
+                output_dir=output_dir,
                 prompt=prompt,
                 allowed_tools=[
                     "Read",
@@ -256,16 +247,9 @@ class E2EValidationStage:
                     "Grep",
                     "Bash",
                 ],
-                max_turns=self.max_turns,
                 timeout_seconds=float(self.timeout_seconds),
             )
         except PipelineCancelled:
-            # B2 fix: cooperative cancel signal must propagate
-            # through best-effort stages. Without this guard, a
-            # Cancel click during Phase 6 E2E validation would get
-            # swallowed by the broad ``except Exception`` below and
-            # the pipeline would return a spurious success state.
-            _tools_mod._output_dir = previous_output
             raise
         except Exception as exc:
             agent_error = exc
@@ -274,8 +258,6 @@ class E2EValidationStage:
                 run_id=run_id,
                 error=str(exc),
             )
-        finally:
-            _tools_mod._output_dir = previous_output
 
         duration = time.time() - started
 
@@ -401,7 +383,6 @@ def _parse_test_counts(report_text: str) -> tuple[int, int, int]:
     """
     if not report_text:
         return (0, 0, 0)
-    import re
 
     passed = 0
     failed = 0
